@@ -1,0 +1,45 @@
+# Archived Documentation
+
+The following legacy implementation and status documents were archived to keep the root clean. Refer to the current guides:
+- User Guide: `../USER_GUIDE.md`
+- Tech Guide: `../TECH_GUIDE.md`
+- Calculation Reference: `../CALCULATION_REFERENCE.md`
+
+Archived files (previously in project root):
+- FINAL_IMPLEMENTATION_REPORT.md
+- FINAL_SUMMARY.md
+- FINAL_VERIFICATION_AUDIT.md
+- IMPLEMENTATION_SUMMARY.md
+- COMPREHENSIVE_VERIFICATION_SUMMARY.md
+- DUAL_CAMERA_IMPLEMENTATION.md
+- DSP_PIPELINE_IMPLEMENTATION.md
+- PTT_IMPLEMENTATION.md
+- SQI_IMPLEMENTATION.md
+- QUICKSTART.md
+- PROJECT_STATUS.md
+- QA_CHECKLIST.md
+- GAPS_CLOSED.md
+- CORE_ACCURACY_IMPLEMENTATION.md
+- EXPORT_IMPLEMENTATION.md
+- FACE_ROI_IMPLEMENTATION.md
+- LAB_MODE_IMPLEMENTATION.md
+- MOTION_ROBUST_PTT_IMPLEMENTATION.md
+- SIMULATION_MODE_IMPLEMENTATION.md
+- SMART_COACH_IMPLEMENTATION.md
+- TIMESTAMP_SYNC_IMPLEMENTATION.md
+- STEP3_SUMMARY.md
+- NOD_AND_BREATHE_TEST.md
+- PRODUCTION_HARDENING_VERIFICATION.md
+- PROTOCOL_A_QUICK_TEST.md
+- QUICK_TEST_SCRIPT.md
+- VERIFICATION_MATRIX.md
+
+Additional archived items:
+- CLINICIAN_GRADE_EXPORT_IMPLEMENTATION.md
+- DEFINITION_OF_DONE.md
+
+Archived reports (moved from verification-reports/):
+- reports/VERIFICATION_MATRIX.md
+- reports/diagnostics.md
+
+

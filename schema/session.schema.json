@@ -1,0 +1,108 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "VivoPulse Session Metadata (Clinician Grade)",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "export_type",
+    "exported_at_iso",
+    "device",
+    "app",
+    "session",
+    "camera",
+    "ptt",
+    "quality",
+    "processing_params"
+  ],
+  "properties": {
+    "schema_version": { "type": "string" },
+    "export_type": { "type": "string" },
+    "exported_at_iso": { "type": "string" },
+    "device": {
+      "type": "object",
+      "required": ["manufacturer", "model", "android_api"],
+      "properties": {
+        "manufacturer": { "type": "string" },
+        "model": { "type": "string" },
+        "android_api": { "type": "string" }
+      }
+    },
+    "app": {
+      "type": "object",
+      "required": ["version", "name"],
+      "properties": {
+        "version": { "type": "string" },
+        "name": { "type": "string" }
+      }
+    },
+    "session": {
+      "type": "object",
+      "required": ["id", "start_ts_iso", "end_ts_iso", "duration_s"],
+      "properties": {
+        "id": { "type": "string" },
+        "start_ts_iso": { "type": "string" },
+        "end_ts_iso": { "type": "string" },
+        "duration_s": { "type": "number", "minimum": 0 }
+      }
+    },
+    "camera": {
+      "type": "object",
+      "required": ["fps_face", "fps_finger"],
+      "properties": {
+        "fps_face": { "type": "number", "minimum": 0 },
+        "fps_finger": { "type": "number", "minimum": 0 },
+        "drift_ms_per_second": { "type": "number" }
+      }
+    },
+    "ptt": {
+      "type": "object",
+      "required": ["ptt_ms_mean", "ptt_ms_sd", "corr_score"],
+      "properties": {
+        "ptt_ms_mean": { "type": "number" },
+        "ptt_ms_sd": { "type": "number", "minimum": 0 },
+        "corr_score": { "type": "number", "minimum": 0, "maximum": 1 },
+        "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "quality": { "type": "string" }
+      }
+    },
+    "quality": {
+      "type": "object",
+      "required": ["sqi_face", "sqi_finger", "sqi_combined"],
+      "properties": {
+        "sqi_face": { "type": "number", "minimum": 0, "maximum": 100 },
+        "sqi_finger": { "type": "number", "minimum": 0, "maximum": 100 },
+        "sqi_combined": { "type": "number", "minimum": 0, "maximum": 100 }
+      }
+    },
+    "processing_params": {
+      "type": "object",
+      "required": ["filters", "fs"],
+      "properties": {
+        "filters": { "type": "string" },
+        "fs": { "type": "number" },
+        "roi_face": { "type": "string" },
+        "roi_finger": { "type": "string" }
+      }
+    },
+    "three_a_state": {
+      "type": "object",
+      "properties": {
+        "ae_locked_at_s": { "type": ["number", "null"] },
+        "awb_locked_at_s": { "type": ["number", "null"] },
+        "af_mode": { "type": "string" }
+      }
+    },
+    "thermal_events": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "time_s": { "type": "number" },
+          "state": { "type": "string" }
+        }
+      }
+    }
+  },
+  "additionalProperties": true
+}
+

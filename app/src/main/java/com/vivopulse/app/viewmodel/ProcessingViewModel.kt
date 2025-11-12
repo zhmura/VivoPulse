@@ -1,0 +1,469 @@
+package com.vivopulse.app.viewmodel
+
+import android.content.Context
+import android.util.Log
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import com.vivopulse.app.util.ErrorHandler
+import com.vivopulse.app.viewmodel.SharedRecordingState
+import com.vivopulse.feature.capture.RecordingResult
+import com.vivopulse.feature.capture.model.Source
+import com.vivopulse.feature.processing.ProcessedSeries
+import com.vivopulse.feature.processing.PttCalculator
+import com.vivopulse.feature.processing.PttResult
+import com.vivopulse.feature.processing.QualityAssessment
+import com.vivopulse.feature.processing.QualityReport
+import com.vivopulse.feature.processing.RawSeriesBuffer
+import com.vivopulse.feature.processing.SessionSummary
+import com.vivopulse.feature.processing.SignalPipeline
+import com.vivopulse.feature.processing.wave.WaveFeatures
+import com.vivopulse.feature.processing.simulation.SimulatedFrameSource
+import com.vivopulse.feature.processing.simulation.SimulationConfig
+import com.vivopulse.feature.processing.timestamp.TimestampedValue
+import com.vivopulse.feature.processing.ptt.HeartRate
+import com.vivopulse.feature.processing.ptt.PeakDetect
+import com.vivopulse.feature.processing.biomarker.BiomarkerComputer
+import com.vivopulse.feature.processing.biomarker.BiomarkerPanel
+import com.vivopulse.io.DataExporter
+import com.vivopulse.io.model.SessionMetadata
+import com.vivopulse.io.model.SignalDataPoint
+import com.vivopulse.io.model.ExportExtras
+import com.vivopulse.signal.DspFunctions
+import com.vivopulse.signal.PerformanceMetrics
+import com.vivopulse.signal.PerformanceReport
+import com.vivopulse.signal.SignalQuality
+import com.vivopulse.app.trend.VascularTrendStore
+import com.vivopulse.app.trend.VascularTrendSummary
+import dagger.hilt.android.lifecycle.HiltViewModel
+import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.util.UUID
+import javax.inject.Inject
+
+/**
+ * ViewModel for signal processing screen.
+ */
+@HiltViewModel
+class ProcessingViewModel @Inject constructor(
+    @ApplicationContext private val context: Context
+) : ViewModel() {
+    
+    private val tag = "ProcessingViewModel"
+    private val signalPipeline = SignalPipeline(targetSampleRateHz = 100.0)
+    
+    private val _processedSeries = MutableStateFlow<ProcessedSeries?>(null)
+    val processedSeries: StateFlow<ProcessedSeries?> = _processedSeries.asStateFlow()
+    
+    private val _isProcessing = MutableStateFlow(false)
+    val isProcessing: StateFlow<Boolean> = _isProcessing.asStateFlow()
+    
+    private val _showRawSignal = MutableStateFlow(false)
+    val showRawSignal: StateFlow<Boolean> = _showRawSignal.asStateFlow()
+    
+    private val _pttResult = MutableStateFlow<PttResult?>(null)
+    val pttResult: StateFlow<PttResult?> = _pttResult.asStateFlow()
+    
+    private val _qualityReport = MutableStateFlow<QualityReport?>(null)
+    val qualityReport: StateFlow<QualityReport?> = _qualityReport.asStateFlow()
+    
+    private val _waveProfile = MutableStateFlow<WaveFeatures.VascularWaveProfile?>(null)
+    val waveProfile: StateFlow<WaveFeatures.VascularWaveProfile?> = _waveProfile.asStateFlow()
+
+    private val _wavePatternHint = MutableStateFlow<String?>(null)
+    val wavePatternHint: StateFlow<String?> = _wavePatternHint.asStateFlow()
+
+    private val _vascularTrend = MutableStateFlow<VascularTrendSummary?>(null)
+    val vascularTrend: StateFlow<VascularTrendSummary?> = _vascularTrend.asStateFlow()
+
+    private val _sessionSummary = MutableStateFlow<SessionSummary?>(null)
+    val sessionSummary: StateFlow<SessionSummary?> = _sessionSummary.asStateFlow()
+
+    private val _biomarkers = MutableStateFlow<BiomarkerPanel?>(null)
+    val biomarkers: StateFlow<BiomarkerPanel?> = _biomarkers.asStateFlow()
+
+    private val _exportPath = MutableStateFlow<String?>(null)
+    val exportPath: StateFlow<String?> = _exportPath.asStateFlow()
+    
+    private val _isExporting = MutableStateFlow(false)
+    val isExporting: StateFlow<Boolean> = _isExporting.asStateFlow()
+    
+    private val _simulationConfig = MutableStateFlow(SimulationConfig.realistic())
+    val simulationConfig: StateFlow<SimulationConfig> = _simulationConfig.asStateFlow()
+    
+    private val _performanceReport = MutableStateFlow<PerformanceReport?>(null)
+    val performanceReport: StateFlow<PerformanceReport?> = _performanceReport.asStateFlow()
+    
+    private val dataExporter = DataExporter(context)
+    private val performanceMetrics = PerformanceMetrics()
+    private val trendStore = VascularTrendStore(context)
+    
+    /**
+     * Process recorded frames.
+     * 
+     * Uses real frames if available, otherwise falls back to synthetic data.
+     */
+    fun processFrames() {
+        viewModelScope.launch {
+            _isProcessing.value = true
+            performanceMetrics.reset()
+            performanceMetrics.recordStart()
+            
+            try {
+                val startTime = System.currentTimeMillis()
+                
+                // Check for real recording
+                val recordingResult = SharedRecordingState.lastRecordingResult.value
+                
+                val processedSeries = withContext(Dispatchers.Default) {
+                    if (recordingResult != null && recordingResult.frames.isNotEmpty()) {
+                        // Process real frames
+                        processRealFrames(recordingResult)
+                    } else {
+                        // Fallback to synthetic data
+                        generateSyntheticData()
+                    }
+                }
+                
+                val processingTime = System.currentTimeMillis() - startTime
+                performanceMetrics.recordProcessingTime(processingTime)
+                
+                _processedSeries.value = processedSeries
+                
+                // Compute PTT
+                if (processedSeries.isValid) {
+                    val ptt = withContext(Dispatchers.Default) {
+                        PttCalculator.computePtt(processedSeries)
+                    }
+                    _pttResult.value = ptt
+                    
+                    // Assess quality and generate suggestions
+                    val quality = withContext(Dispatchers.Default) {
+                        QualityAssessment.assessQuality(
+                            processedSeries = processedSeries,
+                            pttResult = ptt,
+                            faceMotionScore = null // TODO: Add actual motion tracking
+                        )
+                    }
+                    _qualityReport.value = quality
+
+                    // Compute vascular wave profile (finger primary)
+                    val profile = withContext(Dispatchers.Default) {
+                        WaveFeatures.computeProfile(processedSeries)
+                    }
+                    _waveProfile.value = profile
+
+                    // Compute HR & HRV (finger-primary)
+                    val hrResult = withContext(Dispatchers.Default) {
+                        val peaks = PeakDetect.detectPeaks(processedSeries.fingerSignal, processedSeries.sampleRateHz)
+                        HeartRate.computeHeartRate(peaks)
+                    }
+
+                    // Biomarker panel (gated by quality)
+                    _biomarkers.value = withContext(Dispatchers.Default) {
+                        BiomarkerComputer.compute(
+                            series = processedSeries,
+                            quality = quality,
+                            hrBpm = hrResult.hrBpm
+                        )
+                    }
+
+                    // Compute wave pattern hint under high confidence and good SQI
+                    val hint = computeWavePatternHint(profile, quality)
+                    _wavePatternHint.value = hint
+
+                    // Update trend store and compute personal Vascular Trend Index
+                    _vascularTrend.value = trendStore.maybeRecordAndSummarize(
+                        pttMs = ptt.pttMs,
+                        pttConfidencePercent = quality.pttConfidence,
+                        combinedSqi = quality.combinedScore,
+                        profile = profile
+                    )
+
+                    // Build and expose session summary
+                    _sessionSummary.value = SessionSummary(
+                        pttResult = ptt,
+                        pttOutput = null, // Not using PttEngine in this flow
+                        waveProfile = profile,
+                        heartRate = hrResult,
+                        faceSQI = quality.faceSQI,
+                        fingerSQI = quality.fingerSQI,
+                        combinedSQI = quality.combinedScore,
+                        wavePatternHint = hint
+                    )
+                    
+                    // Generate performance report
+                    _performanceReport.value = performanceMetrics.getReport()
+                }
+            } catch (e: OutOfMemoryError) {
+                Log.e(tag, "Out of memory during processing", e)
+                ErrorHandler.handleProcessingError(context, e)
+            } catch (e: Exception) {
+                Log.e(tag, "Processing failed", e)
+                ErrorHandler.handleProcessingError(context, e)
+            } finally {
+                _isProcessing.value = false
+            }
+        }
+    }
+
+    private fun computeWavePatternHint(
+        profile: WaveFeatures.VascularWaveProfile,
+        quality: QualityReport
+    ): String? {
+        // Gate on high quality
+        if (quality.combinedScore < 70.0 || quality.pttConfidence < 70.0) return null
+        val rise = profile.meanRiseTimeMs ?: return null
+        val refl = profile.meanReflectionRatio ?: return null
+        // Heuristic, non-diagnostic: shorter rise + lower reflection => more_elastic_like
+        return when {
+            rise <= 120.0 && refl <= 0.90 -> "more_elastic_like"
+            rise >= 180.0 && refl >= 1.05 -> "more_stiff_like"
+            else -> "uncertain"
+        }
+    }
+    
+    /**
+     * Toggle between raw and filtered signal display.
+     */
+    fun toggleRawFiltered() {
+        _showRawSignal.value = !_showRawSignal.value
+    }
+    
+    /**
+     * Export session data to ZIP file.
+     */
+    fun exportData() {
+        val series = _processedSeries.value
+        val ptt = _pttResult.value
+        val quality = _qualityReport.value
+        
+        if (series == null || ptt == null || quality == null) {
+            ErrorHandler.showError(context, "No data to export")
+            return
+        }
+        
+        // Check storage availability
+        if (!ErrorHandler.hasSufficientStorage(context, requiredMB = 10)) {
+            ErrorHandler.showError(context, "Insufficient storage space. Please free up at least 10 MB.")
+            return
+        }
+        
+        viewModelScope.launch {
+            _isExporting.value = true
+            _exportPath.value = null
+            
+            try {
+                val path = withContext(Dispatchers.IO) {
+                    // Create metadata
+                    val metadata = SessionMetadata(
+                        appVersion = "1.0.0",
+                        deviceManufacturer = android.os.Build.MANUFACTURER,
+                        deviceModel = android.os.Build.MODEL,
+                        androidVersion = android.os.Build.VERSION.RELEASE,
+                        sessionId = UUID.randomUUID().toString(),
+                        startTimestamp = System.currentTimeMillis() - (series.getDurationSeconds() * 1000).toLong(),
+                        endTimestamp = System.currentTimeMillis(),
+                        durationSeconds = series.getDurationSeconds(),
+                        sampleRateHz = series.sampleRateHz,
+                        sampleCount = series.getSampleCount(),
+                        faceSQI = quality.faceSQI.score,
+                        fingerSQI = quality.fingerSQI.score,
+                        combinedSQI = quality.combinedScore,
+                        pttMs = ptt.pttMs,
+                        pttCorrelation = ptt.correlationScore,
+                        pttStabilityMs = ptt.stabilityMs,
+                        pttConfidence = quality.pttConfidence,
+                        pttQuality = ptt.getQuality().name,
+                        faceFps = 30f, // TODO: Get from actual capture
+                        fingerFps = 30f,
+                        driftMsPerSecond = 0.0 // TODO: Get from actual capture
+                    )
+                    
+                    // Find peaks for marking
+                    val facePeaks = SignalQuality.findPeaks(
+                        series.faceSignal,
+                        minDistance = (series.sampleRateHz * 0.4).toInt()
+                    ).toSet()
+                    
+                    val fingerPeaks = SignalQuality.findPeaks(
+                        series.fingerSignal,
+                        minDistance = (series.sampleRateHz * 0.4).toInt()
+                    ).toSet()
+                    
+                    // Create signal data points
+                    val faceData = series.timeMillis.indices.map { i ->
+                        SignalDataPoint(
+                            timeMs = series.timeMillis[i],
+                            rawValue = series.rawFaceSignal.getOrNull(i) ?: 0.0,
+                            filteredValue = series.faceSignal[i],
+                            isPeak = i in facePeaks
+                        )
+                    }
+                    
+                    val fingerData = series.timeMillis.indices.map { i ->
+                        SignalDataPoint(
+                            timeMs = series.timeMillis[i],
+                            rawValue = series.rawFingerSignal.getOrNull(i) ?: 0.0,
+                            filteredValue = series.fingerSignal[i],
+                            isPeak = i in fingerPeaks
+                        )
+                    }
+                    
+                    // Build extras
+                    val extras = ExportExtras(
+                        vascularWaveProfile = _waveProfile.value?.let { wp ->
+                            mapOf(
+                                "meanRiseTimeMs" to wp.meanRiseTimeMs,
+                                "meanPeakTimeMs" to wp.meanPeakTimeMs,
+                                "meanReflectionRatio" to wp.meanReflectionRatio,
+                                "dicroticPresenceScore" to wp.dicroticPresenceScore
+                            )
+                        },
+                        vascularTrendSummary = _vascularTrend.value?.let { vt ->
+                            mapOf(
+                                "index" to vt.index,
+                                "deltaPttMs" to vt.deltaPttMs,
+                                "deltaRiseTimeMs" to vt.deltaRiseTimeMs,
+                                "deltaReflectionRatio" to vt.deltaReflectionRatio
+                            )
+                        },
+                        biomarkerPanel = _biomarkers.value?.let { bm ->
+                            mapOf(
+                                "hrBpm" to bm.hrBpm,
+                                "rmssdMs" to bm.rmssdMs,
+                                "sdnnMs" to bm.sdnnMs,
+                                "respiratoryModulationDetected" to bm.respiratoryModulationDetected
+                            )
+                        },
+                        reactivityProtocol = null // Optionally set from protocol screen context if available
+                    )
+                    
+                    // Export
+                    dataExporter.exportSession(metadata, faceData, fingerData, extras)
+                }
+                
+                _exportPath.value = path
+            } catch (e: Exception) {
+                Log.e(tag, "Export failed", e)
+                ErrorHandler.handleStorageError(context, e)
+            } finally {
+                _isExporting.value = false
+            }
+        }
+    }
+    
+    /**
+     * Clear export path (after showing toast).
+     */
+    fun clearExportPath() {
+        _exportPath.value = null
+    }
+    
+    /**
+     * Update simulation configuration.
+     */
+    fun updateSimulationConfig(config: SimulationConfig) {
+        _simulationConfig.value = config
+    }
+    
+    /**
+     * Process real captured frames.
+     * 
+     * Extracts luma time series from frames and processes through pipeline.
+     */
+    private fun processRealFrames(recordingResult: RecordingResult): ProcessedSeries {
+        // Separate face and finger frames
+        val faceFrames = recordingResult.frames.filter { it.source == Source.FACE && it.hasLuma() }
+        val fingerFrames = recordingResult.frames.filter { it.source == Source.FINGER && it.hasLuma() }
+        
+        if (faceFrames.isEmpty() || fingerFrames.isEmpty()) {
+            // No luma data available, fall back to synthetic
+            return generateSyntheticData()
+        }
+        
+        // Build time series from luma values
+        val faceData = faceFrames.map { frame ->
+            TimestampedValue(
+                timestampNs = frame.timestampNs,
+                value = frame.faceLuma ?: 0.0
+            )
+        }
+        
+        val fingerData = fingerFrames.map { frame ->
+            TimestampedValue(
+                timestampNs = frame.timestampNs,
+                value = frame.fingerLuma ?: 0.0
+            )
+        }
+        
+        val rawBuffer = RawSeriesBuffer(faceData, fingerData)
+        
+        // Process through pipeline
+        return signalPipeline.process(rawBuffer)
+    }
+    
+    /**
+     * Generate synthetic PPG data using simulated frame source.
+     * 
+     * Uses current simulation configuration.
+     */
+    private fun generateSyntheticData(): ProcessedSeries {
+        // Use simulated frame source with current config
+        val simulator = SimulatedFrameSource(_simulationConfig.value)
+        val rawBuffer = simulator.generateSignals()
+        
+        // Process through same pipeline as real data
+        return signalPipeline.process(rawBuffer)
+    }
+    
+    /**
+     * Generate synthetic PPG data (legacy method for backwards compatibility).
+     * 
+     * TODO: Remove once luma extraction is implemented.
+     */
+    private fun generateSyntheticDataLegacy(): ProcessedSeries {
+        val duration = 10.0 // 10 seconds
+        val originalRate = 30.0
+        val numSamples = (duration * originalRate).toInt()
+        
+        // Generate realistic PPG signals with noise and drift
+        val baseFreq = 1.2 // 72 BPM
+        val facePPG = DspFunctions.generateSineWave(baseFreq, duration, originalRate, amplitude = 0.8)
+        val fingerPPG = DspFunctions.generateSineWave(baseFreq + 0.1, duration, originalRate, amplitude = 0.7)
+        
+        // Add noise
+        val noise1 = DspFunctions.generateSineWave(15.0, duration, originalRate, amplitude = 0.2)
+        val noise2 = DspFunctions.generateSineWave(12.0, duration, originalRate, amplitude = 0.15)
+        
+        // Add drift
+        val noisyFace = facePPG.zip(noise1) { s, n -> s + n }.toDoubleArray()
+        val noisyFinger = fingerPPG.zip(noise2) { s, n -> s + n }.toDoubleArray()
+        
+        val driftedFace = DspFunctions.addLinearDrift(noisyFace, driftRate = 0.03)
+        val driftedFinger = DspFunctions.addLinearDrift(noisyFinger, driftRate = 0.025)
+        
+        // Create timestamped values
+        val faceData = (0 until numSamples).map { i ->
+            val t = i / originalRate
+            val timestampNs = (t * 1_000_000_000).toLong()
+            TimestampedValue(timestampNs, driftedFace[i])
+        }
+        
+        val fingerData = (0 until numSamples).map { i ->
+            val t = i / originalRate
+            val timestampNs = (t * 1_000_000_000).toLong()
+            TimestampedValue(timestampNs, driftedFinger[i])
+        }
+        
+        val rawBuffer = RawSeriesBuffer(faceData, fingerData)
+        
+        // Process through pipeline
+        return signalPipeline.process(rawBuffer)
+    }
+}
+

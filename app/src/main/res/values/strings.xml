@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">VivoPulse</string>
+    
+    <!-- Navigation -->
+    <string name="nav_capture">Capture</string>
+    <string name="nav_processing">Processing</string>
+    <string name="nav_results">Results</string>
+    
+    <!-- Device Support -->
+    <string name="device_not_supported_title">Device Not Supported</string>
+    <string name="device_not_supported_message">VivoPulse is currently only available on selected devices for optimal performance.</string>
+    <string name="device_supported_models">Supported devices:\n• Google Pixel 6, 7, 8 series\n• Samsung Galaxy S22, S23, S24 series</string>
+    
+    <!-- Simulated Mode -->
+    <string name="simulated_mode_enabled">⚠️ Simulated Mode Active</string>
+    <string name="simulated_mode_toggle">Enable Simulated Mode</string>
+    <string name="simulated_mode_description">Generate synthetic PPG signals for testing</string>
+    
+    <!-- Debug Menu -->
+    <string name="debug_menu">Debug Menu</string>
+    <string name="debug_menu_close">Close</string>
+    
+    <!-- Camera Capture -->
+    <string name="camera_permission_required">Camera Permission Required</string>
+    <string name="camera_permission_rationale">VivoPulse needs camera access to capture PPG signals from face and finger</string>
+    <string name="grant_permission">Grant Permission</string>
+    <string name="front_camera">Face (Front)</string>
+    <string name="back_camera">Finger (Back)</string>
+    <string name="torch_on">Torch On</string>
+    <string name="torch_off">Torch Off</string>
+    <string name="start_recording">Start</string>
+    <string name="stop_recording">Stop</string>
+    <string name="recording_duration" formatted="false">Recording: %02d:%02d</string>
+    <string name="process_frames">Process Captured Frames</string>
+    <string name="concurrent_camera_support">Concurrent Cameras: %s</string>
+</resources>
+
+
