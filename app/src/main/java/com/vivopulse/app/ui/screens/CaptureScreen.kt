@@ -67,6 +67,22 @@ fun CaptureScreen(
             cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
         }
     }
+
+    // Re-check permission on resume to handle revocation in settings
+    DisposableEffect(lifecycleOwner) {
+        val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+            if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME) {
+                cameraPermissionGranted = ContextCompat.checkSelfPermission(
+                    context,
+                    Manifest.permission.CAMERA
+                ) == PackageManager.PERMISSION_GRANTED
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+        }
+    }
     
     val isRecording by viewModel.isRecording.collectAsState()
     val torchEnabled by viewModel.torchEnabled.collectAsState()

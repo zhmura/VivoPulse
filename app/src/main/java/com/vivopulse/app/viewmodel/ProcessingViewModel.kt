@@ -122,7 +122,8 @@ class ProcessingViewModel @Inject constructor(
                 val processedSeries = withContext(Dispatchers.Default) {
                     if (recordingResult != null && recordingResult.frames.isNotEmpty()) {
                         // Process real frames
-                        processRealFrames(recordingResult)
+                        val signals = SharedRecordingState.lastProcessedSignals.value
+                        processRealFrames(recordingResult, signals)
                     } else {
                         // Fallback to synthetic data
                         generateSyntheticData()
@@ -376,7 +377,10 @@ class ProcessingViewModel @Inject constructor(
      * 
      * Extracts luma time series from frames and processes through pipeline.
      */
-    private fun processRealFrames(recordingResult: RecordingResult): ProcessedSeries {
+    private fun processRealFrames(
+        recordingResult: RecordingResult,
+        preProcessedSignals: List<com.vivopulse.signal.ProcessedSignal>? = null
+    ): ProcessedSeries {
         // Separate face and finger frames
         val faceFrames = recordingResult.frames.filter { it.source == Source.FACE && it.hasLuma() }
         val fingerFrames = recordingResult.frames.filter { it.source == Source.FINGER && it.hasLuma() }
@@ -403,8 +407,8 @@ class ProcessingViewModel @Inject constructor(
         
         val rawBuffer = RawSeriesBuffer(faceData, fingerData)
         
-        // Process through pipeline
-        return signalPipeline.process(rawBuffer)
+        // Process through pipeline with pre-processed signals
+        return signalPipeline.process(rawBuffer, preProcessedSignals)
     }
     
     /**

@@ -27,12 +27,17 @@ object SharedRecordingState {
     private val _lastRecordingResult = MutableStateFlow<RecordingResult?>(null)
     val lastRecordingResult: StateFlow<RecordingResult?> = _lastRecordingResult.asStateFlow()
     
-    fun setRecordingResult(result: RecordingResult) {
+    private val _lastProcessedSignals = MutableStateFlow<List<com.vivopulse.signal.ProcessedSignal>?>(null)
+    val lastProcessedSignals: StateFlow<List<com.vivopulse.signal.ProcessedSignal>?> = _lastProcessedSignals.asStateFlow()
+    
+    fun setRecordingResult(result: RecordingResult, signals: List<com.vivopulse.signal.ProcessedSignal>) {
         _lastRecordingResult.value = result
+        _lastProcessedSignals.value = signals
     }
     
     fun clearRecordingResult() {
         _lastRecordingResult.value = null
+        _lastProcessedSignals.value = null
     }
 }
 
@@ -108,6 +113,14 @@ class CaptureViewModel @Inject constructor(
                         Log.w(tag, "Torch auto-disabled after ${maxTorchMs / 1000}s for safety")
                     }
                 }
+                
+                // Smart Coach Tips
+                // In a real app, we'd pull these stats from the processing pipeline.
+                // For now, we'll simulate the check or use placeholders if we can't access the pipeline directly here.
+                // Assuming cameraController has access to some stats or we add them.
+                
+                // Let's add a placeholder for the coach logic
+                // updateSmartCoachTips() // Removed as it's now driven by pipeline
             }
         }
         
@@ -147,6 +160,7 @@ class CaptureViewModel @Inject constructor(
         _recordingDuration.value = 0L
         _isRecording.value = true
         driftMonitor.reset()
+        recordedSignals.clear() // Clear previous signals
         cameraController.startRecording()
     }
 
@@ -159,7 +173,7 @@ class CaptureViewModel @Inject constructor(
         _recordingDuration.value = 0L
         
         // Share recording result with other ViewModels
-        SharedRecordingState.setRecordingResult(result)
+        SharedRecordingState.setRecordingResult(result, recordedSignals.toList())
     }
 
     fun toggleTorch() {
@@ -171,6 +185,65 @@ class CaptureViewModel @Inject constructor(
 
     fun isConcurrentCameraSupported(): Boolean {
         return cameraController.isConcurrentCameraSupported()
+    }
+    
+    // Processing Pipeline
+    private val processingPipeline = com.vivopulse.feature.processing.DefaultProcessingPipeline()
+    
+    init {
+        // Start pipeline
+        viewModelScope.launch {
+            processingPipeline.process(cameraController.rawFrameFlow)
+                .collect { result ->
+                    updateSmartCoachTips(result)
+                    
+                    if (_isRecording.value) {
+                        recordedSignals.add(result)
+                    }
+                }
+        }
+        
+        // ... existing init code ...
+        startPeriodicUpdates()
+    }
+    
+    private val recordedSignals = mutableListOf<com.vivopulse.signal.ProcessedSignal>()
+
+    private fun updateSmartCoachTips(result: com.vivopulse.signal.ProcessedSignal) {
+        // Real-time feedback based on pipeline results
+        val tips = mutableListOf<String>()
+        
+        // Motion checks
+        if (result.faceMotionRms > 1.5) {
+            tips.add("Hold phone steady")
+        }
+        
+        // Saturation/Contact checks
+        if (result.fingerSaturationPct > 0.8) {
+            tips.add("Press lighter on back camera")
+        } else if (result.fingerSaturationPct < 0.1 && result.fingerSqi < 50) {
+            tips.add("Cover back camera fully")
+        }
+        
+        // Signal Quality
+        if (result.faceSqi < 50 && result.faceMotionRms < 1.0) {
+            tips.add("Improve lighting on face")
+        }
+        
+        // GoodSync status
+        if (result.goodSync) {
+            // Maybe show a "Good Signal" indicator?
+            // For now, just clear warnings if good
+            if (tips.isEmpty()) {
+                _statusBanner.value = null
+            }
+        }
+        
+        if (tips.isNotEmpty()) {
+            _statusBanner.value = tips.first() // Show highest priority tip
+        } else if (_statusBanner.value?.contains("Hold") == true || _statusBanner.value?.contains("Press") == true) {
+            _statusBanner.value = null // Clear old tips
+        }
     }
 
     override fun onCleared() {

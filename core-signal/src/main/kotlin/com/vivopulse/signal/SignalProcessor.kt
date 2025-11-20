@@ -20,7 +20,15 @@ data class ProcessedSignal(
     val heartRate: Float,
     val signalQuality: Float,
     val timestamp: Long,
-    val processedData: FloatArray
+    val processedData: FloatArray,
+    // New Robustness Metrics
+    val faceMotionRms: Double = 0.0,
+    val fingerSaturationPct: Double = 0.0,
+    val snrDb: Double = 0.0,
+    val faceSqi: Int = 100,
+    val fingerSqi: Int = 100,
+    val goodSync: Boolean = false,
+    val consensusPtt: Double? = null
 ) {
     override fun equals(other: Any?): Boolean {
         if (this === other) return true

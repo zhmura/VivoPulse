@@ -154,6 +154,12 @@ fun ResultScreen(
                             MetricRow("Windows Analyzed", "${ptt.windowCount}")
                         }
                         
+                        // GoodSync Stats (Placeholder for now, assuming ptt object has these fields or we add them)
+                        // For now, we'll just show a placeholder if we can't modify PttResult easily.
+                        // Ideally: MetricRow("GoodSync Windows", "${ptt.goodSyncCount} (${String.format("%.0f", ptt.goodSyncPct)}%)")
+                        Spacer(modifier = Modifier.height(8.dp))
+                        MetricRow("GoodSync Share", "N/A (Pending)") // Placeholder until we wire up the data
+                        
                         Spacer(modifier = Modifier.height(16.dp))
                         
                         // Status messages

@@ -64,6 +64,12 @@ class ThreeALockManager {
                 focusDistance
             )
             
+            // Anti-flicker: Set to AUTO (will adapt to 50/60Hz)
+            setCaptureRequestOption(
+                CaptureRequest.CONTROL_AE_ANTIBANDING_MODE,
+                CameraMetadata.CONTROL_AE_ANTIBANDING_MODE_AUTO
+            )
+            
             // AE/AWB: Initially unlocked
             setCaptureRequestOption(CaptureRequest.CONTROL_AE_LOCK, false)
             setCaptureRequestOption(CaptureRequest.CONTROL_AWB_LOCK, false)
@@ -74,7 +80,7 @@ class ThreeALockManager {
         _afState.value = LockState.FIXED
         _isFullyLocked.value = false
         
-        Log.d(tag, "Applied initial 3A config for $cameraRole: AF=fixed, AE/AWB=unlocked")
+        Log.d(tag, "Applied initial 3A config for $cameraRole: AF=fixed, AE/AWB=unlocked, anti-flicker=AUTO")
     }
     
     /**

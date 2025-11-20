@@ -3,70 +3,59 @@ package com.vivopulse.feature.capture
 import android.content.Context
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
-import com.vivopulse.feature.capture.device.CaptureMode
-import com.vivopulse.feature.capture.device.DeviceProbe
-import org.junit.Assert.*
+import com.vivopulse.feature.capture.camera.DeviceProbe
 import org.junit.Test
 import org.junit.runner.RunWith
+import org.junit.Assert.*
 
+/**
+ * Tests for DeviceProbe camera capability detection.
+ */
 @RunWith(AndroidJUnit4::class)
 class DeviceProbeTests {
     
     @Test
-    fun deviceProbe_returnsValidMode() {
+    fun testDeviceProbe_returnsCapabilities() {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val probe = DeviceProbe(context)
         
-        val capabilities = probe.probeCapabilities()
+        val capabilities = probe.probe()
         
-        assertNotNull("Capabilities should not be null", capabilities)
-        assertTrue("Mode should be one of valid modes", 
-            capabilities.mode in listOf(
-                CaptureMode.CONCURRENT,
-                CaptureMode.DOWNGRADED_RES,
-                CaptureMode.SEQUENTIAL,
-                CaptureMode.UNSUPPORTED
-            ))
-        assertNotNull("Message should be provided", capabilities.message)
+        // Basic assertions
+        assertNotNull(capabilities)
+        assertNotNull(capabilities.deviceInfo)
+        assertNotNull(capabilities.recommendedMode)
+        
+        // Log for manual inspection
+        println("Device: ${capabilities.deviceInfo}")
+        println("Concurrent support: ${capabilities.hasConcurrentSupport}")
+        println("Recommended mode: ${capabilities.recommendedMode}")
     }
     
     @Test
-    fun deviceProbe_exportsCapabilitiesJson() {
+    fun testDeviceProbe_findsCameras() {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val probe = DeviceProbe(context)
         
-        val path = probe.exportCapabilities()
+        val capabilities = probe.probe()
         
-        // Export may fail in test environment, but shouldn't crash
-        if (path != null) {
-            assertTrue("Export path should exist", path.isNotEmpty())
-            assertTrue("Should be JSON file", path.endsWith(".json"))
+        // Most devices should have at least one camera
+        assertTrue(capabilities.frontCameraId != null || capabilities.backCameraId != null)
+    }
+    
+    @Test
+    fun testDeviceProbe_checksResolutions() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val probe = DeviceProbe(context)
+        
+        val capabilities = probe.probe()
+        
+        // If cameras exist, they should have resolutions
+        if (capabilities.frontCameraId != null) {
+            assertNotNull(capabilities.maxFrontResolution)
+        }
+        if (capabilities.backCameraId != null) {
+            assertNotNull(capabilities.maxBackResolution)
         }
     }
-    
-    @Test
-    fun fallbackStrategy_progressesThroughLevels() {
-        val context = ApplicationProvider.getApplicationContext<Context>()
-        val strategy = FallbackCaptureStrategy(context)
-        
-        // Initial state
-        assertEquals(FallbackCaptureStrategy.FallbackLevel.NONE, strategy.getCurrentLevel())
-        
-        // First fallback
-        val fallback1 = strategy.getNextFallback()
-        assertNotNull("First fallback should exist", fallback1)
-        assertEquals(CaptureMode.DOWNGRADED_RES, fallback1?.mode)
-        
-        // Second fallback
-        val fallback2 = strategy.getNextFallback()
-        assertNotNull("Second fallback should exist", fallback2)
-        assertEquals(CaptureMode.SEQUENTIAL, fallback2?.mode)
-        
-        // Third fallback
-        val fallback3 = strategy.getNextFallback()
-        assertNull("Third fallback should be null (exhausted)", fallback3)
-    }
 }
-
-
-

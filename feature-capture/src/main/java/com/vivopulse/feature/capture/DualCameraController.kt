@@ -42,7 +42,8 @@ class DualCameraController(
     private var frontCamera: Camera? = null
     private var backCamera: Camera? = null
     
-    private val executor: Executor = ContextCompat.getMainExecutor(context)
+    // Use a background executor for image analysis to avoid blocking the main thread
+    private val executor: java.util.concurrent.ExecutorService = java.util.concurrent.Executors.newSingleThreadExecutor()
     
     // Frame streams
     private val _frontFrames = MutableSharedFlow<Frame>(
@@ -104,6 +105,32 @@ class DualCameraController(
     )
     val fingerWave: SharedFlow<Double> = _fingerWave.asSharedFlow()
     
+    // Raw frame stream for processing pipeline
+    private val _rawFrameFlow = MutableSharedFlow<com.vivopulse.signal.RawFrameData>(
+        replay = 0,
+        extraBufferCapacity = 5,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST
+    )
+    val rawFrameFlow: SharedFlow<com.vivopulse.signal.RawFrameData> = _rawFrameFlow.asSharedFlow()
+    
+    // Device capabilities and camera mode
+    private val deviceProbe = com.vivopulse.feature.capture.camera.DeviceProbe(context)
+    private var deviceCapabilities: com.vivopulse.feature.capture.camera.DeviceCapabilities? = null
+    private val _cameraMode = MutableStateFlow<com.vivopulse.feature.capture.camera.CameraMode>(
+        com.vivopulse.feature.capture.camera.CameraMode.CONCURRENT
+    )
+    val cameraMode: StateFlow<com.vivopulse.feature.capture.camera.CameraMode> = _cameraMode.asStateFlow()
+    
+    // Retry state for session failures
+    private var retryCount = 0
+    private val maxRetries = 3
+    private var currentResolutionIndex = 0
+    private val resolutionFallbacks = listOf(
+        Size(720, 1280),
+        Size(640, 480),
+        Size(480, 640)
+    )
+    
     // Recording state
     private var isRecording = false
     private var recordingStartTime = 0L
@@ -132,14 +159,62 @@ class DualCameraController(
             true // Assume supported
         }
     }
+
+    private var thermalListener: android.os.PowerManager.OnThermalStatusChangedListener? = null
+
+    @SuppressLint("NewApi") // Guarded by SDK check
+    private fun setupThermalMonitoring() {
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+            val powerManager = context.getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
+            thermalListener = android.os.PowerManager.OnThermalStatusChangedListener { status ->
+                when (status) {
+                    android.os.PowerManager.THERMAL_STATUS_MODERATE -> {
+                        Log.w(tag, "Thermal status: MODERATE. Reducing processing.")
+                        _statusBanner.value = "Device is warm. Adjusting performance."
+                    }
+                    android.os.PowerManager.THERMAL_STATUS_SEVERE,
+                    android.os.PowerManager.THERMAL_STATUS_CRITICAL,
+                    android.os.PowerManager.THERMAL_STATUS_EMERGENCY,
+                    android.os.PowerManager.THERMAL_STATUS_SHUTDOWN -> {
+                        Log.e(tag, "Thermal status: CRITICAL ($status). Disabling torch and stopping recording.")
+                        _statusBanner.value = "Device overheating! Stopping capture for safety."
+                        if (torchEnabled) {
+                            setTorchEnabled(false)
+                        }
+                        if (isRecording) {
+                            stopRecording()
+                        }
+                    }
+                    else -> {
+                        // Normal or Light status, clear warning if it was thermal-related
+                        if (_statusBanner.value?.contains("Device") == true) {
+                            _statusBanner.value = null
+                        }
+                    }
+                }
+            }
+            powerManager.addThermalStatusListener(executor, thermalListener!!)
+        }
+    }
     
     /**
-     * Initialize camera provider.
+     * Initialize camera provider and probe device capabilities.
      */
     suspend fun initialize() {
         val providerFuture = ProcessCameraProvider.getInstance(context)
         cameraProvider = providerFuture.get()
-        Log.d(tag, "Camera provider initialized. Concurrent support: ${isConcurrentCameraSupported()}")
+        
+        // Probe device capabilities
+        deviceCapabilities = deviceProbe.probe()
+        _cameraMode.value = deviceCapabilities?.recommendedMode 
+            ?: com.vivopulse.feature.capture.camera.CameraMode.SAFE_MODE_SEQUENTIAL
+        
+        setupThermalMonitoring()
+        
+        Log.d(tag, "Camera provider initialized")
+        Log.d(tag, "Device: ${deviceCapabilities?.deviceInfo}")
+        Log.d(tag, "Concurrent support: ${deviceCapabilities?.hasConcurrentSupport}")
+        Log.d(tag, "Recommended mode: ${_cameraMode.value}")
     }
     
     /**
@@ -160,119 +235,117 @@ class DualCameraController(
         provider.unbindAll()
         
         try {
-            val concurrentSupported = isConcurrentCameraSupported()
-            if (!concurrentSupported) {
-                _statusBanner.value = "Safe Mode: concurrent cameras not supported. Using sequential preview."
-            } else {
-                _statusBanner.value = null
-            }
-            
-            // Front camera (FACE)
-            val frontPreview = Preview.Builder()
-                .setTargetResolution(Size(720, 1280))
-                .build()
-                .also {
-                    it.setSurfaceProvider(frontPreviewView.surfaceProvider)
+            // Update status banner based on camera mode
+            when (_cameraMode.value) {
+                com.vivopulse.feature.capture.camera.CameraMode.CONCURRENT -> {
+                    _statusBanner.value = null // Clear banner for normal operation
                 }
-            
-            val frontImageAnalysis = createImageAnalysis(Source.FACE)
-            
-            frontCamera = try {
-                provider.bindToLifecycle(
-                    lifecycleOwner,
-                    CameraSelector.DEFAULT_FRONT_CAMERA,
-                    frontPreview,
-                    frontImageAnalysis
-                )
-            } catch (e: Exception) {
-                Log.w(tag, "Front camera bind failed at 720p, retrying lower resolution", e)
-                // Retry with a lower resolution
-                val lowPreview = Preview.Builder()
-                    .setTargetResolution(Size(640, 480))
-                    .build()
-                    .also { it.setSurfaceProvider(frontPreviewView.surfaceProvider) }
-                val lowAnalysis = ImageAnalysis.Builder()
-                    .setTargetResolution(Size(640, 480))
-                    .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                    .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
-                    .build().also { it.setAnalyzer(executor) { img -> processFrame(img, Source.FACE) } }
-                provider.bindToLifecycle(
-                    lifecycleOwner,
-                    CameraSelector.DEFAULT_FRONT_CAMERA,
-                    lowPreview,
-                    lowAnalysis
-                )
-            }
-            
-            Log.d(tag, "Front camera bound successfully")
-            
-            // Back camera (FINGER) with torch support
-            val backPreview = Preview.Builder()
-                .setTargetResolution(Size(720, 1280))
-                .build()
-                .also {
-                    it.setSurfaceProvider(backPreviewView.surfaceProvider)
+                com.vivopulse.feature.capture.camera.CameraMode.SAFE_MODE_SEQUENTIAL -> {
+                    _statusBanner.value = "Safe Mode: Sequential camera operation"
                 }
-            
-            val backImageAnalysis = createImageAnalysis(Source.FINGER)
-            
-            backCamera = try {
-                provider.bindToLifecycle(
-                    lifecycleOwner,
-                    CameraSelector.DEFAULT_BACK_CAMERA,
-                    backPreview,
-                    backImageAnalysis
-                )
-            } catch (e: Exception) {
-                Log.w(tag, "Back camera bind failed at 720p, attempting fallback", e)
-                if (!concurrentSupported) {
-                    // Sequential fallback: unbind front and bind only back at lower res
-                    provider.unbindAll()
-                    val lowPreview = Preview.Builder()
-                        .setTargetResolution(Size(640, 480))
-                        .build()
-                        .also { it.setSurfaceProvider(backPreviewView.surfaceProvider) }
-                    val lowAnalysis = ImageAnalysis.Builder()
-                        .setTargetResolution(Size(640, 480))
-                        .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                        .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
-                        .build().also { it.setAnalyzer(executor) { img -> processFrame(img, Source.FINGER) } }
-                    _statusBanner.value = "Safe Mode: showing finger camera only (sequential)."
-                    provider.bindToLifecycle(
-                        lifecycleOwner,
-                        CameraSelector.DEFAULT_BACK_CAMERA,
-                        lowPreview,
-                        lowAnalysis
-                    )
-                } else {
-                    // Retry back camera at lower resolution while keeping front if present
-                    val lowPreview = Preview.Builder()
-                        .setTargetResolution(Size(640, 480))
-                        .build()
-                        .also { it.setSurfaceProvider(backPreviewView.surfaceProvider) }
-                    val lowAnalysis = ImageAnalysis.Builder()
-                        .setTargetResolution(Size(640, 480))
-                        .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                        .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
-                        .build().also { it.setAnalyzer(executor) { img -> processFrame(img, Source.FINGER) } }
-                    provider.bindToLifecycle(
-                        lifecycleOwner,
-                        CameraSelector.DEFAULT_BACK_CAMERA,
-                        lowPreview,
-                        lowAnalysis
-                    )
+                com.vivopulse.feature.capture.camera.CameraMode.SAFE_MODE_REDUCED -> {
+                    _statusBanner.value = "Safe Mode: Reduced resolution"
                 }
             }
             
-            Log.d(tag, "Back camera bound successfully")
-            
-            // Apply torch state if enabled
-            if (torchEnabled) {
-                backCamera?.cameraControl?.enableTorch(true)
-            }
+            // Attempt to start cameras with current configuration
+            startCamerasWithFallback(lifecycleOwner, frontPreviewView, backPreviewView, provider)
             
         } catch (e: Exception) {
             Log.e(tag, "Error starting cameras", e)
+            handleCameraStartFailure(lifecycleOwner, frontPreviewView, backPreviewView)
+        }
+    }
+    
+    
+    /**
+     * Start cameras with progressive fallback logic.
+     */
+    @SuppressLint("RestrictedApi")
+    private fun startCamerasWithFallback(
+        lifecycleOwner: LifecycleOwner,
+        frontPreviewView: PreviewView,
+        backPreviewView: PreviewView,
+        provider: ProcessCameraProvider
+    ) {
+        val bindingHelper = com.vivopulse.feature.capture.camera.CameraBindingHelper(
+            tag = tag,
+            executor = executor,
+            processFrame = ::processFrame
+        )
+        
+        val result = bindingHelper.bindCamerasWithFallback(
+            provider = provider,
+            lifecycleOwner = lifecycleOwner,
+            frontPreviewView = frontPreviewView,
+            backPreviewView = backPreviewView,
+            currentMode = _cameraMode.value,
+            resolutionIndex = currentResolutionIndex
+        )
+        
+        if (result != null) {
+            frontCamera = result.first
+            backCamera = result.second
+            
+            // Apply torch if enabled
+            if (torchEnabled && backCamera != null) {
+                backCamera?.cameraControl?.enableTorch(true)
+            }
+            
+            Log.d(tag, "Cameras started successfully in mode ${_cameraMode.value}")
+        } else {
+            // Binding failed, trigger fallback handling
+            throw Exception("Camera binding failed at resolution index $currentResolutionIndex")
+        }
+    }
+    
+    /**
+     * Handle camera start failure with progressive fallback.
+     */
+    @SuppressLint("RestrictedApi")
+    private fun handleCameraStartFailure(
+        lifecycleOwner: LifecycleOwner,
+        frontPreviewView: PreviewView,
+        backPreviewView: PreviewView
+    ) {
+        retryCount++
+        
+        if (retryCount > maxRetries) {
+            _statusBanner.value = "Camera error. Please restart the app."
+            Log.e(tag, "Max retries exceeded, giving up")
+            return
+        }
+        
+        // Progressive fallback strategy
+        when {
+            // Try next resolution in current mode
+            currentResolutionIndex < resolutionFallbacks.size - 1 -> {
+                currentResolutionIndex++
+                _cameraMode.value = com.vivopulse.feature.capture.camera.CameraMode.SAFE_MODE_REDUCED
+                Log.w(tag, "Retrying with reduced resolution (index $currentResolutionIndex)")
+            }
+            // Switch to sequential mode
+            _cameraMode.value != com.vivopulse.feature.capture.camera.CameraMode.SAFE_MODE_SEQUENTIAL -> {
+                _cameraMode.value = com.vivopulse.feature.capture.camera.CameraMode.SAFE_MODE_SEQUENTIAL
+                currentResolutionIndex = 0 // Reset resolution
+                Log.w(tag, "Switching to sequential mode")
+            }
+            // Already in sequential mode, try next resolution
+            else -> {
+                currentResolutionIndex++
+                if (currentResolutionIndex >= resolutionFallbacks.size) {
+                    _statusBanner.value = "Camera initialization failed. Please restart."
+                    return
+                }
+                Log.w(tag, "Sequential mode: trying resolution index $currentResolutionIndex")
+            }
+        }
+        
+        // Retry with new configuration
+        try {
+            startCamera(lifecycleOwner, frontPreviewView, backPreviewView)
+        } catch (e: Exception) {
+            Log.e(tag, "Retry failed", e)
             _statusBanner.value = "Camera error. Tap to retry."
         }
     }
@@ -325,11 +398,17 @@ class DualCameraController(
             var faceLuma: Double? = null
             var fingerLuma: Double? = null
             
+            // Prepare RawFrameData components
+            var rawYPlane: ByteArray? = null
+            var faceRoiData: com.vivopulse.signal.Roi? = null
+            var fingerRoiData: com.vivopulse.signal.Roi? = null
+            
             if (source == Source.FACE) {
                 // Process face ROI
                 try {
                     val yData = ByteArray(yBuffer.remaining())
                     yBuffer.get(yData)
+                    rawYPlane = yData // Keep reference for RawFrameData
                     
                     faceRoiTracker.processFrame(
                         yPlane = yData,
@@ -350,6 +429,14 @@ class DualCameraController(
                             image.height
                         )
                         faceLuma?.let { _faceWave.tryEmit(it) }
+                        
+                        // Map to shared Roi
+                        faceRoiData = com.vivopulse.signal.Roi(
+                            currentRoi.rect.left,
+                            currentRoi.rect.top,
+                            currentRoi.rect.right,
+                            currentRoi.rect.bottom
+                        )
                     }
                 } catch (e: Exception) {
                     Log.e(tag, "Error processing face ROI", e)
@@ -357,6 +444,28 @@ class DualCameraController(
             } else {
                 // Extract luma from finger (center region)
                 try {
+                    // For finger, we also need the Y data for RawFrameData
+                    val yData = ByteArray(yBuffer.remaining())
+                    yBuffer.get(yData)
+                    rawYPlane = yData
+                    
+                    // Calculate Finger ROI
+                    val fRoi = com.vivopulse.feature.capture.roi.FingerRoiDetector.detectOptimalFingerRoi(
+                        yBuffer, // Note: this might advance position if not careful, but detectOptimalFingerRoi takes ByteBuffer
+                        rowStride,
+                        image.width,
+                        image.height
+                    )
+                    
+                    fingerRoiData = com.vivopulse.signal.Roi(
+                        fRoi.left, fRoi.top, fRoi.right, fRoi.bottom
+                    )
+                    
+                    // We can use the calculated ROI for extraction too, or keep using LumaExtractor's center logic
+                    // LumaExtractor.extractCenterRegionLuma uses a fixed center.
+                    // Ideally we sync them. For now, let's stick to LumaExtractor for the wave, 
+                    // but pass the detected ROI to the pipeline.
+                    yBuffer.rewind()
                     fingerLuma = LumaExtractor.extractCenterRegionLuma(
                         yBuffer,
                         rowStride,
@@ -367,6 +476,19 @@ class DualCameraController(
                 } catch (e: Exception) {
                     Log.e(tag, "Error extracting finger luma", e)
                 }
+            }
+            
+            // Emit RawFrameData if we have the plane
+            if (rawYPlane != null) {
+                val rawFrame = com.vivopulse.signal.RawFrameData(
+                    timestampNs = image.timestamp,
+                    width = image.width,
+                    height = image.height,
+                    yPlane = rawYPlane,
+                    faceRoi = faceRoiData,
+                    fingerRoi = fingerRoiData
+                )
+                _rawFrameFlow.tryEmit(rawFrame)
             }
             
             // Do not store full YUV planes to avoid high memory usage; luma metrics suffice for processing
@@ -505,6 +627,11 @@ class DualCameraController(
             recordedFrames.clear()
         }
         faceRoiTracker.release()
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q && thermalListener != null) {
+             val powerManager = context.getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
+             powerManager.removeThermalStatusListener(thermalListener!!)
+        }
+        executor.shutdown()
         Log.d(tag, "Camera resources released")
     }
 }
