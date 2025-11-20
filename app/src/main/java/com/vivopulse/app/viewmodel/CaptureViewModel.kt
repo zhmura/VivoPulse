@@ -77,6 +77,10 @@ class CaptureViewModel @Inject constructor(
     
     // Face ROI
     val faceRoi: StateFlow<FaceRoi?> = cameraController.faceRoi
+    
+    // Status banner for smart coach tips
+    private val _statusBanner = MutableStateFlow<String?>(null)
+    val statusBanner: StateFlow<String?> = _statusBanner.asStateFlow()
 
     private val _lastRecordingResult = MutableStateFlow<RecordingResult?>(null)
     val lastRecordingResult: StateFlow<RecordingResult?> = _lastRecordingResult.asStateFlow()
@@ -202,9 +206,6 @@ class CaptureViewModel @Inject constructor(
                     }
                 }
         }
-        
-        // ... existing init code ...
-        startPeriodicUpdates()
     }
     
     private val recordedSignals = mutableListOf<com.vivopulse.signal.ProcessedSignal>()
