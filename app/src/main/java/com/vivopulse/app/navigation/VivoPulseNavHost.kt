@@ -9,6 +9,7 @@ import com.vivopulse.app.ui.screens.CaptureScreen
 import com.vivopulse.app.ui.screens.ProcessingScreen
 import com.vivopulse.app.ui.screens.ResultScreen
 import com.vivopulse.app.ui.screens.ReactivityProtocolScreen
+import com.vivopulse.app.ui.screens.SequentialPreviewScreen
 
 sealed class Screen(val route: String) {
     object Capture : Screen("capture")
