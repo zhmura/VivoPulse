@@ -50,6 +50,7 @@ import kotlin.time.Duration.Companion.milliseconds
 fun CaptureScreen(
     onNavigateToProcessing: () -> Unit,
     onNavigateToReactivity: () -> Unit,
+    onNavigateToSequentialPreview: () -> Unit,
     viewModel: CaptureViewModel = hiltViewModel()
 ) {
     val context = LocalContext.current
@@ -184,79 +185,56 @@ fun CaptureScreen(
                     }
                 }
             } else {
-                // Main camera UI with full-height previews and bottom sheet controls
                 val sequentialModeActive = cameraMode == CameraMode.SAFE_MODE_SEQUENTIAL
                 var frontPreviewView by remember { mutableStateOf<PreviewView?>(null) }
                 var backPreviewView by remember { mutableStateOf<PreviewView?>(null) }
 
-                // Start cameras when preview views are ready
-                LaunchedEffect(frontPreviewView, backPreviewView, cameraPermissionGranted, sequentialPrimary, cameraMode) {
-                    if (cameraPermissionGranted && frontPreviewView != null && backPreviewView != null) {
-                        android.util.Log.d(
-                            "CaptureScreen",
-                            "Starting camera: permission=$cameraPermissionGranted, front=${frontPreviewView != null}, back=${backPreviewView != null}, mode=$cameraMode, sequential=$sequentialPrimary"
-                        )
-                        viewModel.getCameraController().startCamera(
-                            lifecycleOwner = lifecycleOwner,
-                            frontPreviewView = frontPreviewView!!,
-                            backPreviewView = backPreviewView!!
-                        )
-                    } else {
-                        android.util.Log.w(
-                            "CaptureScreen",
-                            "Cannot start camera: permission=$cameraPermissionGranted, front=${frontPreviewView != null}, back=${backPreviewView != null}"
-                        )
-                    }
-                }
-
-                // Rolling buffers for live waveforms (used for small overlays)
-                val faceWave = remember { mutableStateListOf<Double>() }
-                val fingerWave = remember { mutableStateListOf<Double>() }
-                val maxSamples = 300
-                LaunchedEffect(Unit) {
-                    controller.faceWave.collect { v ->
-                        faceWave.add(v)
-                        if (faceWave.size > maxSamples) {
-                            repeat(faceWave.size - maxSamples) { faceWave.removeAt(0) }
-                        }
-                    }
-                }
-                LaunchedEffect(Unit) {
-                    controller.fingerWave.collect { v ->
-                        fingerWave.add(v)
-                        if (fingerWave.size > maxSamples) {
-                            repeat(fingerWave.size - maxSamples) { fingerWave.removeAt(0) }
-                        }
-                    }
-                }
-
                 val controlsScroll = rememberScrollState()
 
                 Box(modifier = Modifier.fillMaxSize()) {
-                    // PREVIEW AREA (background)
-                    if (sequentialModeActive) {
-                        // Sequential mode: single full-screen preview (face OR finger)
-                        val isFacePrimary = sequentialPrimary == SequentialPrimary.FACE
-                        val title = if (isFacePrimary) "Face (Front)" else "Finger (Back)"
-                        val waveform = if (isFacePrimary) faceWave else fingerWave
-
-                        CameraPreviewCard(
-                            title = title,
-                            modifier = Modifier
-                                .fillMaxSize()
-                                .padding(horizontal = 8.dp, vertical = 8.dp),
-                            showRoiOverlay = isFacePrimary,
-                            faceRoi = faceRoi,
-                            showTorchIndicator = !isFacePrimary && torchEnabled,
-                            waveform = waveform
-                        ) { previewView ->
-                            if (isFacePrimary) {
-                                frontPreviewView = previewView
-                            } else {
-                                backPreviewView = previewView
+                    // PREVIEW AREA (background) only for concurrent mode
+                    if (!sequentialModeActive) {
+                        // Rolling buffers for live waveforms
+                        val faceWave = remember { mutableStateListOf<Double>() }
+                        val fingerWave = remember { mutableStateListOf<Double>() }
+                        val maxSamples = 300
+                        LaunchedEffect(Unit) {
+                            controller.faceWave.collect { v ->
+                                faceWave.add(v)
+                                if (faceWave.size > maxSamples) {
+                                    repeat(faceWave.size - maxSamples) { faceWave.removeAt(0) }
+                                }
                             }
                         }
-                    } else {
+                        LaunchedEffect(Unit) {
+                            controller.fingerWave.collect { v ->
+                                fingerWave.add(v)
+                                if (fingerWave.size > maxSamples) {
+                                    repeat(fingerWave.size - maxSamples) { fingerWave.removeAt(0) }
+                                }
+                            }
+                        }
+
+                        // Start cameras when preview views are ready
+                        LaunchedEffect(
+                            frontPreviewView,
+                            backPreviewView,
+                            cameraPermissionGranted,
+                            cameraMode
+                        ) {
+                            if (cameraPermissionGranted && frontPreviewView != null && backPreviewView != null) {
+                                android.util.Log.d(
+                                    "CaptureScreen",
+                                    "Starting concurrent camera: permission=$cameraPermissionGranted"
+                                )
+                                viewModel.getCameraController().startCamera(
+                                    lifecycleOwner = lifecycleOwner,
+                                    frontPreviewView = frontPreviewView!!,
+                                    backPreviewView = backPreviewView!!
+                                )
+                            }
+                        }
+
                         // Concurrent mode: two previews, each taking half height
                         Column(
                             modifier = Modifier
@@ -367,16 +345,19 @@ fun CaptureScreen(
                                 )
                             }
 
-                            // Quality indicators
-                            qualityState?.let {
-                                QualityIndicatorsSection(
-                                    state = it,
-                                    modifier = Modifier.fillMaxWidth()
-                                )
+                            // Quality indicators (for concurrent mode only)
+                            if (!sequentialModeActive) {
+                                qualityState?.let {
+                                    QualityIndicatorsSection(
+                                        state = it,
+                                        modifier = Modifier.fillMaxWidth()
+                                    )
+                                }
                             }
 
-                            // Recording stats (if available)
-                            lastResult?.let { result ->
+                            // Recording stats (if available, concurrent only)
+                            if (!sequentialModeActive) {
+                                lastResult?.let { result ->
                                 Card(
                                     modifier = Modifier.fillMaxWidth(),
                                     colors = CardDefaults.cardColors(
@@ -408,7 +389,7 @@ fun CaptureScreen(
                             }
 
                             // Recording timer
-                            if (isRecording) {
+                            if (isRecording && !sequentialModeActive) {
                                 val seconds = (recordingDuration / 1000).toInt()
                                 Text(
                                     text = String.format("Recording: %02d:%02d", seconds / 60, seconds % 60),
@@ -438,14 +419,18 @@ fun CaptureScreen(
 
                                 Button(
                                     onClick = {
-                                        if (isRecording) {
-                                            viewModel.stopRecording()
+                                        if (sequentialModeActive) {
+                                            onNavigateToSequentialPreview()
                                         } else {
-                                            viewModel.startRecording()
+                                            if (isRecording) {
+                                                viewModel.stopRecording()
+                                            } else {
+                                                viewModel.startRecording()
+                                            }
                                         }
                                     },
                                     modifier = Modifier.weight(1f),
-                                    colors = if (isRecording) {
+                                    colors = if (!sequentialModeActive && isRecording) {
                                         ButtonDefaults.buttonColors(
                                             containerColor = MaterialTheme.colorScheme.error
                                         )
@@ -454,11 +439,17 @@ fun CaptureScreen(
                                     }
                                 ) {
                                     Icon(
-                                        imageVector = if (isRecording) Icons.Default.Stop else Icons.Default.FiberManualRecord,
-                                        contentDescription = if (isRecording) "Stop" else "Start"
+                                        imageVector = if (!sequentialModeActive && isRecording) Icons.Default.Stop else Icons.Default.FiberManualRecord,
+                                        contentDescription = if (!sequentialModeActive && isRecording) "Stop" else "Start"
                                     )
                                     Spacer(modifier = Modifier.width(4.dp))
-                                    Text(if (isRecording) "Stop" else "Start")
+                                    Text(
+                                        when {
+                                            sequentialModeActive -> "Open Preview"
+                                            isRecording -> "Stop"
+                                            else -> "Start"
+                                        }
+                                    )
                                 }
                             }
 

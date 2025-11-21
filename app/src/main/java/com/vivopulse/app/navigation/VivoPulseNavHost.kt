@@ -15,6 +15,7 @@ sealed class Screen(val route: String) {
     object Processing : Screen("processing")
     object Result : Screen("result")
     object Reactivity : Screen("reactivity")
+    object SequentialPreview : Screen("sequential_preview")
 }
 
 @Composable
@@ -35,6 +36,9 @@ fun VivoPulseNavHost(
                 },
                 onNavigateToReactivity = {
                     navController.navigate(Screen.Reactivity.route)
+                },
+                onNavigateToSequentialPreview = {
+                    navController.navigate(Screen.SequentialPreview.route)
                 }
             )
         }
@@ -62,6 +66,12 @@ fun VivoPulseNavHost(
             ReactivityProtocolScreen(
                 onNavigateBack = { navController.popBackStack() },
                 onNavigateToCapture = { navController.navigate(Screen.Capture.route) }
+            )
+        }
+
+        composable(Screen.SequentialPreview.route) {
+            SequentialPreviewScreen(
+                onNavigateBack = { navController.popBackStack() }
             )
         }
     }
