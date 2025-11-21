@@ -9,14 +9,11 @@ import com.vivopulse.app.ui.screens.CaptureScreen
 import com.vivopulse.app.ui.screens.ProcessingScreen
 import com.vivopulse.app.ui.screens.ResultScreen
 import com.vivopulse.app.ui.screens.ReactivityProtocolScreen
-import com.vivopulse.app.ui.screens.SequentialPreviewScreen
-
 sealed class Screen(val route: String) {
     object Capture : Screen("capture")
     object Processing : Screen("processing")
     object Result : Screen("result")
     object Reactivity : Screen("reactivity")
-    object SequentialPreview : Screen("sequential_preview")
 }
 
 @Composable
@@ -37,9 +34,6 @@ fun VivoPulseNavHost(
                 },
                 onNavigateToReactivity = {
                     navController.navigate(Screen.Reactivity.route)
-                },
-                onNavigateToSequentialPreview = {
-                    navController.navigate(Screen.SequentialPreview.route)
                 }
             )
         }
@@ -67,12 +61,6 @@ fun VivoPulseNavHost(
             ReactivityProtocolScreen(
                 onNavigateBack = { navController.popBackStack() },
                 onNavigateToCapture = { navController.navigate(Screen.Capture.route) }
-            )
-        }
-
-        composable(Screen.SequentialPreview.route) {
-            SequentialPreviewScreen(
-                onNavigateBack = { navController.popBackStack() }
             )
         }
     }
