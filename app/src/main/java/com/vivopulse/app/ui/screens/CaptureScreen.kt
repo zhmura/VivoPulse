@@ -228,11 +228,14 @@ fun CaptureScreen(
                     
                     LaunchedEffect(frontPreviewView, backPreviewView, cameraPermissionGranted, sequentialPrimary) {
                         if (cameraPermissionGranted && frontPreviewView != null && backPreviewView != null) {
+                            android.util.Log.d("CaptureScreen", "Starting camera - mode: $cameraMode, sequential: $sequentialPrimary, front: ${frontPreviewView != null}, back: ${backPreviewView != null}")
                             viewModel.getCameraController().startCamera(
                                 lifecycleOwner = lifecycleOwner,
                                 frontPreviewView = frontPreviewView!!,
                                 backPreviewView = backPreviewView!!
                             )
+                        } else {
+                            android.util.Log.w("CaptureScreen", "Cannot start camera - permission: $cameraPermissionGranted, front: ${frontPreviewView != null}, back: ${backPreviewView != null}")
                         }
                     }
                     
@@ -470,6 +473,35 @@ fun CameraPreviewCard(
                     },
                     modifier = Modifier.fillMaxSize()
                 )
+                
+                // Waveform overlay
+                if (waveform != null && waveform.isNotEmpty()) {
+                    Canvas(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .padding(8.dp)
+                    ) {
+                        val path = Path()
+                        val w = size.width
+                        val h = size.height
+                        val data = waveform
+                        val minV = data.minOrNull() ?: 0.0
+                        val maxV = data.maxOrNull() ?: 1.0
+                        val range = (maxV - minV).let { if (it < 1e-9) 1.0 else it }
+                        val count = data.size
+                        for (i in data.indices) {
+                            val x = (i.toFloat() / (count - 1).coerceAtLeast(1)) * w
+                            val yNorm = ((data[i] - minV) / range).toFloat()
+                            val y = h - (yNorm * h * 0.4f + h * 0.05f)
+                            if (i == 0) path.moveTo(x, y) else path.lineTo(x, y)
+                        }
+                        drawPath(
+                            path = path,
+                            color = Color(0xFF80DEEA),
+                            style = Stroke(width = 2f)
+                        )
+                    }
+                }
             }
         }
     }

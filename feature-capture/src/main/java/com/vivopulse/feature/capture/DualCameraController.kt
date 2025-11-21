@@ -406,7 +406,10 @@ class DualCameraController(
     @SuppressLint("UnsafeOptInUsageError")
     private fun processFrame(imageProxy: ImageProxy, source: Source) {
         try {
-            val image = imageProxy.image ?: return
+            val image = imageProxy.image ?: run {
+                Log.w(tag, "processFrame: image is null for ${source.name}")
+                return
+            }
 
             val tracker = if (source == Source.FACE) frontFpsTracker else backFpsTracker
             tracker.onFrameReceived(image.timestamp)
@@ -516,8 +519,11 @@ class DualCameraController(
             if (isRecording && recordedFrames.size < maxRecordedFrames) {
                 synchronized(recordedFrames) {
                     recordedFrames.add(frame.deepCopy())
+                    if (recordedFrames.size == 1) {
+                        Log.d(tag, "Recording: First frame captured from ${source.name}")
+                    }
                     if (recordedFrames.size % 30 == 0) {
-                        Log.d(tag, "Recording: ${recordedFrames.size} frames captured")
+                        Log.d(tag, "Recording: ${recordedFrames.size} frames captured (${source.name})")
                     }
                 }
             }
@@ -555,7 +561,7 @@ class DualCameraController(
         recordingStartTime = System.currentTimeMillis()
         isRecording = true
         
-        Log.d(tag, "Recording started")
+        Log.d(tag, "Recording started - mode: ${_cameraMode.value}, sequential primary: $sequentialPrimary")
     }
     
     /**
