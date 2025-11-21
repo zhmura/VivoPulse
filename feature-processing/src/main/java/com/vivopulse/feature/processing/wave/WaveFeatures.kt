@@ -91,6 +91,7 @@ object WaveFeatures {
             val peak = peakIndices[i]
             if (peak <= prevPeak + 2) continue
             val beatStart = prevPeak
+            @Suppress("UNUSED_VARIABLE")
             val beatEnd = peak
 
             // Find pre-peak minimum between start and peak (pre-systolic trough)

@@ -35,7 +35,7 @@ class DeviceProbe(private val context: Context) {
         try {
             // Get concurrent camera IDs (API 28+)
             val concurrentCameraIds = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                cameraManager.concurrentCameraIds?.toList() ?: emptyList()
+                cameraManager.concurrentCameraIds.toList()
             } else {
                 emptyList()
             }
@@ -281,6 +281,7 @@ enum class CaptureMode {
     SEQUENTIAL,        // Sequential capture (safe mode)
     UNSUPPORTED        // Device cannot run app
 }
+
 
 
 

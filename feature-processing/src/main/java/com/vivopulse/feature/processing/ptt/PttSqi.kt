@@ -32,7 +32,7 @@ object PttSqi {
     fun computeChannelSqi(
         filteredSignal: DoubleArray,
         rawSignal: DoubleArray,
-        fsHz: Double,
+        @Suppress("UNUSED_PARAMETER") fsHz: Double,
         peakResult: PeakDetectResult,
         motionPenalty: Double = 100.0
     ): ChannelSqiResult {

@@ -16,7 +16,7 @@ class FpsTracker(private val source: Source) {
     private val logIntervalMs = 5000L // Log every 5 seconds
 
     @Synchronized
-    fun onFrameReceived(timestampNs: Long) {
+    fun onFrameReceived(@Suppress("UNUSED_PARAMETER") timestampNs: Long) {
         totalFramesReceived++
         val currentTime = System.currentTimeMillis()
         frameTimestamps.addLast(currentTime)

@@ -25,9 +25,9 @@ fun ProtocolWizard(
     protocol: Protocol,
     currentPhaseIndex: Int,
     phaseElapsedS: Int,
-    phaseRemainingS: Int,
+    @Suppress("UNUSED_PARAMETER") phaseRemainingS: Int,
     totalElapsedS: Int,
-    totalRemainingS: Int,
+    @Suppress("UNUSED_PARAMETER") totalRemainingS: Int,
     isComplete: Boolean,
     modifier: Modifier = Modifier
 ) {

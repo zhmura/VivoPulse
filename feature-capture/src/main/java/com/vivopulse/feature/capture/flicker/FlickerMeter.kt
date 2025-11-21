@@ -125,7 +125,7 @@ class FlickerMeter(
         val omega = 2.0 * PI * k / n
         val coeff = 2.0 * cos(omega)
         
-        var s0 = 0.0
+        var s0: Double
         var s1 = 0.0
         var s2 = 0.0
         
@@ -166,6 +166,7 @@ enum class AntiFlickerMode {
     HZ_50,
     HZ_60
 }
+
 
 
 

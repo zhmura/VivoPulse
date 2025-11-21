@@ -27,7 +27,7 @@ object EnhancedSQI {
     fun computeBandSNR(
         signal: DoubleArray,
         rawSignal: DoubleArray,
-        sampleRateHz: Double
+        @Suppress("UNUSED_PARAMETER") sampleRateHz: Double
     ): Double {
         if (signal.isEmpty() || rawSignal.isEmpty()) return 0.0
         

@@ -27,6 +27,7 @@ import com.vivopulse.feature.capture.model.SessionStats
 import com.vivopulse.feature.capture.roi.FaceRoi
 import com.vivopulse.feature.capture.roi.FaceRoiTracker
 import com.vivopulse.feature.capture.util.FpsTracker
+import com.vivopulse.feature.capture.util.BufferPool
 import com.vivopulse.signal.SignalSample
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.flow.*
@@ -156,6 +157,12 @@ class DualCameraController(
     private var fingerRoiRect: Rect? = null
     private var fingerFrameCounter = 0
     
+    // Buffer pool for memory efficiency (eliminates per-frame allocations)
+    private val yPlaneBufferPool = BufferPool(
+        bufferSize = 720 * 1280, // Max expected Y plane size
+        poolSize = 10
+    )
+    
     // Torch state
     private var torchEnabled = false
     
@@ -247,8 +254,11 @@ class DualCameraController(
     ) {
         val provider = cameraProvider ?: run {
             Log.e(tag, "Camera provider not initialized")
+            _statusBanner.value = "Camera initialization failed. Restart app."
             return
         }
+        
+        Log.d(tag, "Starting camera with mode: ${_cameraMode.value}, sequential primary: $sequentialPrimary")
         
         // Unbind all use cases before rebinding
         provider.unbindAll()
@@ -375,6 +385,7 @@ class DualCameraController(
     /**
      * Create ImageAnalysis use case for frame capture.
      */
+    @Suppress("DEPRECATION")
     @SuppressLint("UnsafeOptInUsageError")
     private fun createImageAnalysis(source: Source): ImageAnalysis {
         return ImageAnalysis.Builder()
@@ -418,8 +429,8 @@ class DualCameraController(
                 try {
                     val planeCopy = yPlane.buffer.duplicate().apply { position(0) }
                     val planeSize = planeCopy.remaining()
-                    val frameBytes = ensureFaceBuffer(planeSize)
-                    planeCopy.get(frameBytes, 0, planeSize)
+                    val frameBytes = yPlaneBufferPool.acquire()
+                    planeCopy.get(frameBytes, 0, minOf(planeSize, frameBytes.size))
 
                     faceRoiTracker.processFrame(
                         yPlane = frameBytes,
@@ -440,8 +451,11 @@ class DualCameraController(
                         )
                         val motionBuffer = yPlane.buffer.duplicate().apply { position(0) }
                         faceMotionRms = computeFaceMotionRms(motionBuffer, rowStride, currentRoi)
-                        faceLuma?.let { _faceWave.tryEmit(it) }
+                        faceLuma.let { _faceWave.tryEmit(it) }
                     }
+                    
+                    // Return buffer to pool
+                    yPlaneBufferPool.release(frameBytes)
                 } catch (e: Exception) {
                     Log.e(tag, "Error processing face channel", e)
                 }
@@ -472,7 +486,7 @@ class DualCameraController(
                     val satBuffer = yPlane.buffer.duplicate().apply { position(0) }
                     fingerSaturationPct = computeSaturationPct(satBuffer, roi, rowStride)
 
-                    fingerLuma?.let { _fingerWave.tryEmit(it) }
+                    fingerLuma.let { _fingerWave.tryEmit(it) }
                 } catch (e: Exception) {
                     Log.e(tag, "Error processing finger channel", e)
                 }
@@ -502,6 +516,9 @@ class DualCameraController(
             if (isRecording && recordedFrames.size < maxRecordedFrames) {
                 synchronized(recordedFrames) {
                     recordedFrames.add(frame.deepCopy())
+                    if (recordedFrames.size % 30 == 0) {
+                        Log.d(tag, "Recording: ${recordedFrames.size} frames captured")
+                    }
                 }
             }
 
@@ -721,12 +738,13 @@ class DualCameraController(
             recordedFrames.clear()
         }
         faceRoiTracker.release()
+        yPlaneBufferPool.clear()
         if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q && thermalListener != null) {
-            val powerManager = context.getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
-            powerManager.removeThermalStatusListener(thermalListener!!)
+             val powerManager = context.getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
+             powerManager.removeThermalStatusListener(thermalListener!!)
         }
         analyzerExecutor.shutdown()
-        Log.d(tag, "Camera resources released")
+        Log.d(tag, "Camera resources released. Pool stats: ${yPlaneBufferPool.getStats()}")
     }
 }
 

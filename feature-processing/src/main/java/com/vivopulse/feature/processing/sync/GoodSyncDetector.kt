@@ -27,11 +27,11 @@ class GoodSyncDetector {
         face: DoubleArray,
         finger: DoubleArray,
         fsHz: Double,
-        imuTrace: Any?, // Placeholder for ImuTrace
+        @Suppress("UNUSED_PARAMETER") imuTrace: Any?,
         roiStats: RoiStats,
-        stepMs: Int = 1000,
-        winMs: Int = 8000,
-        minSegmentMs: Int = 5000
+        @Suppress("UNUSED_PARAMETER") stepMs: Int = 1000,
+        @Suppress("UNUSED_PARAMETER") winMs: Int = 8000,
+        @Suppress("UNUSED_PARAMETER") minSegmentMs: Int = 5000
     ): List<GoodSyncSegment> {
         
         // Calculate SQIs
@@ -86,13 +86,7 @@ class GoodSyncDetector {
             // If this function is called per window, it returns a list of 1 segment if good.
             // But the signature implies it takes the WHOLE signal and does the rolling window itself.
             
-            // Let's implement the rolling window logic here.
-            val segments = mutableListOf<GoodSyncSegment>()
-            val n = face.size
-            val winSamples = (winMs * fsHz / 1000).toInt()
-            val stepSamples = (stepMs * fsHz / 1000).toInt()
-            
-            // We need time-varying stats for a full signal.
+            // Single-window detector: input is already the window
             // But roiStats is passed as a SINGLE object.
             // This implies the input `face` and `finger` ARE the window.
             // So we just return 1 segment if good.
@@ -113,13 +107,11 @@ class GoodSyncDetector {
      * Detects good windows over a longer session by analyzing sub-windows.
      */
     fun detectSessionSegments(
-        fullFace: DoubleArray,
-        fullFinger: DoubleArray,
-        fsHz: Double,
-        // We need stats per window...
-        // This suggests we need a pipeline that runs this incrementally.
-        // For now, let's stick to the single-window detector above as a building block.
+        @Suppress("UNUSED_PARAMETER") fullFace: DoubleArray,
+        @Suppress("UNUSED_PARAMETER") fullFinger: DoubleArray,
+        @Suppress("UNUSED_PARAMETER") fsHz: Double
     ): List<GoodSyncSegment> {
+        // Placeholder for session-level segmentation
         return emptyList()
     }
 }

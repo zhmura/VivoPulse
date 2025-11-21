@@ -11,9 +11,14 @@ import androidx.camera.view.PreviewView
 import androidx.compose.foundation.background
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
+import androidx.compose.material3.AssistChip
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -23,6 +28,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
@@ -39,7 +45,7 @@ import com.vivopulse.feature.processing.realtime.RealTimeQualityState
 import kotlinx.coroutines.flow.collectLatest
 import kotlin.time.Duration.Companion.milliseconds
 
-@OptIn(ExperimentalMaterial3Api::class, ExperimentalCamera2Interop::class)
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun CaptureScreen(
     onNavigateToProcessing: () -> Unit,
@@ -258,21 +264,17 @@ fun CaptureScreen(
                     // Start cameras when both preview views are ready
                     LaunchedEffect(frontPreviewView, backPreviewView, cameraPermissionGranted, sequentialPrimary) {
                         if (cameraPermissionGranted && frontPreviewView != null && backPreviewView != null) {
+                            android.util.Log.d("CaptureScreen", "Starting camera: permission=$cameraPermissionGranted, front=${frontPreviewView != null}, back=${backPreviewView != null}, sequential=$sequentialPrimary")
                             viewModel.getCameraController().startCamera(
                                 lifecycleOwner = lifecycleOwner,
                                 frontPreviewView = frontPreviewView!!,
                                 backPreviewView = backPreviewView!!
                             )
+                        } else {
+                            android.util.Log.w("CaptureScreen", "Cannot start camera: permission=$cameraPermissionGranted, front=${frontPreviewView != null}, back=${backPreviewView != null}")
                         }
                     }
                     
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .weight(1f)
-                            .padding(8.dp),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
                     // Rolling buffers for live waveforms
                     val faceWave = remember { mutableStateListOf<Double>() }
                     val fingerWave = remember { mutableStateListOf<Double>() }
@@ -294,13 +296,24 @@ fun CaptureScreen(
                         }
                     }
                     
+                    // Dual camera previews - take most of the screen
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .weight(1f, fill = true)
+                            .padding(horizontal = 8.dp, vertical = 4.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
                         // Front camera preview (Face) with ROI overlay
                         CameraPreviewCard(
                             title = "Face (Front)",
-                        modifier = Modifier.weight(1f),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .weight(1f, fill = true)
+                                .heightIn(min = 200.dp),
                             showRoiOverlay = true,
-                        faceRoi = faceRoi,
-                        waveform = faceWave
+                            faceRoi = faceRoi,
+                            waveform = faceWave
                         ) { previewView ->
                             frontPreviewView = previewView
                         }
@@ -308,71 +321,58 @@ fun CaptureScreen(
                         // Back camera preview (Finger)
                         CameraPreviewCard(
                             title = "Finger (Back)",
-                            modifier = Modifier.weight(1f),
-                        showTorchIndicator = torchEnabled,
-                        waveform = fingerWave
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .weight(1f, fill = true)
+                                .heightIn(min = 200.dp),
+                            showTorchIndicator = torchEnabled,
+                            waveform = fingerWave
                         ) { previewView ->
                             backPreviewView = previewView
                         }
                     }
                     
-                    qualityState?.let {
-                        QualityIndicatorsSection(
-                            state = it,
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(horizontal = 8.dp)
-                        )
-                        Spacer(modifier = Modifier.height(8.dp))
-                    }
-                    
-                    // Recording stats
-                    if (lastResult != null) {
-                        Card(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(8.dp),
-                            colors = CardDefaults.cardColors(
-                                containerColor = MaterialTheme.colorScheme.secondaryContainer
+                    // Bottom controls section - compact
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(MaterialTheme.colorScheme.surface)
+                    ) {
+                        qualityState?.let {
+                            QualityIndicatorsSection(
+                                state = it,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 8.dp, vertical = 4.dp)
                             )
-                        ) {
-                            Column(modifier = Modifier.padding(12.dp)) {
-                                Text(
-                                    text = "Last Recording:",
-                                    style = MaterialTheme.typography.titleSmall,
-                                    color = MaterialTheme.colorScheme.onSecondaryContainer
+                        }
+                        
+                        // Recording stats - compact
+                        if (lastResult != null) {
+                            Card(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 8.dp, vertical = 4.dp),
+                                colors = CardDefaults.cardColors(
+                                    containerColor = MaterialTheme.colorScheme.secondaryContainer
                                 )
-                                Spacer(modifier = Modifier.height(4.dp))
-                                Text(
-                                    text = "Captured ${lastResult!!.frames.size} frames " +
-                                            "(Face: ${lastResult!!.stats.faceStats.framesReceived}, " +
-                                            "Finger: ${lastResult!!.stats.fingerStats.framesReceived})",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSecondaryContainer
-                                )
-                                Text(
-                                    text = "Avg FPS - Face: ${String.format("%.1f", lastResult!!.stats.faceStats.averageFps)}, " +
-                                            "Finger: ${String.format("%.1f", lastResult!!.stats.fingerStats.averageFps)}",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSecondaryContainer
-                                )
-                                if (lastResult!!.stats.totalDropped > 0) {
+                            ) {
+                                Column(modifier = Modifier.padding(8.dp)) {
                                     Text(
-                                        text = "⚠️ Dropped ${lastResult!!.stats.totalDropped} frames",
+                                        text = "Captured ${lastResult!!.frames.size} frames (Face: ${lastResult!!.stats.faceStats.framesReceived}, Finger: ${lastResult!!.stats.fingerStats.framesReceived})",
                                         style = MaterialTheme.typography.bodySmall,
-                                        color = MaterialTheme.colorScheme.error
+                                        color = MaterialTheme.colorScheme.onSecondaryContainer
                                     )
                                 }
                             }
                         }
-                    }
-                    
-                    // Controls
-                    Card(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(8.dp)
-                    ) {
+                        
+                        // Controls - compact
+                        Card(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 8.dp, vertical = 4.dp)
+                        ) {
                         Column(
                             modifier = Modifier.padding(16.dp),
                             horizontalAlignment = Alignment.CenterHorizontally
@@ -480,6 +480,7 @@ fun CaptureScreen(
                             }
                         }
                     }
+                    }
                 }
             }
             
@@ -505,7 +506,7 @@ fun CameraPreviewCard(
     onPreviewViewCreated: (PreviewView) -> Unit = {}
 ) {
     Card(
-        modifier = modifier.fillMaxHeight(),
+        modifier = modifier,
         elevation = CardDefaults.cardElevation(defaultElevation = 4.dp)
     ) {
         Column(modifier = Modifier.fillMaxSize()) {
@@ -553,7 +554,8 @@ fun CameraPreviewCard(
                                 
                                 // Add preview
                                 val preview = PreviewView(context).apply {
-                                    scaleType = PreviewView.ScaleType.FILL_CENTER
+                                    scaleType = PreviewView.ScaleType.FIT_CENTER
+                                    implementationMode = PreviewView.ImplementationMode.COMPATIBLE
                                     layoutParams = ViewGroup.LayoutParams(
                                         ViewGroup.LayoutParams.MATCH_PARENT,
                                         ViewGroup.LayoutParams.MATCH_PARENT
@@ -574,12 +576,14 @@ fun CameraPreviewCard(
                             }
                         } else {
                             PreviewView(context).apply {
-                                scaleType = PreviewView.ScaleType.FILL_CENTER
+                                scaleType = PreviewView.ScaleType.FIT_CENTER
+                                implementationMode = PreviewView.ImplementationMode.COMPATIBLE
                                 onPreviewViewCreated(this)
                             }
                         }
                     },
                     update = { view ->
+                        @Suppress("USELESS_IS_CHECK")
                         if (showRoiOverlay && view is FrameLayout && view.childCount > 1) {
                             val overlay = view.getChildAt(1) as? RoiOverlayView
                             overlay?.updateRoi(faceRoi)

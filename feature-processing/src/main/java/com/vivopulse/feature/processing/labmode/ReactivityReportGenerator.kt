@@ -67,7 +67,7 @@ class ReactivityReportGenerator(private val context: Context) {
             appendLine("| Phase | PTT (ms) | PTT SD (ms) | HR (bpm) | Correlation |")
             appendLine("|-------|----------|-------------|----------|-------------|")
             
-            for ((phaseId, metrics) in analysis.phaseMetrics.toList().sortedBy { 
+            for ((@Suppress("UNUSED_VARIABLE") phaseId, metrics) in analysis.phaseMetrics.toList().sortedBy { 
                 // Sort by phase order (assuming IDs are in order or use a custom comparator)
                 it.first
             }) {

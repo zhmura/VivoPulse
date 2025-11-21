@@ -18,8 +18,8 @@ class FingerSaturationIndex {
      */
     fun computeSaturationPct(
         lumaBuffer: ByteArray,
-        width: Int,
-        height: Int,
+        @Suppress("UNUSED_PARAMETER") width: Int,
+        @Suppress("UNUSED_PARAMETER") height: Int,
         threshold: Int = 250
     ): Double {
         var saturatedCount = 0

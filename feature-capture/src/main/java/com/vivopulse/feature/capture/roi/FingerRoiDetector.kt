@@ -27,8 +27,8 @@ object FingerRoiDetector {
      * @return Optimal ROI for finger, or null if detection fails
      */
     fun detectFingerRoi(
-        yPlane: ByteBuffer,
-        rowStride: Int,
+        @Suppress("UNUSED_PARAMETER") yPlane: ByteBuffer,
+        @Suppress("UNUSED_PARAMETER") rowStride: Int,
         width: Int,
         height: Int
     ): Rect? {

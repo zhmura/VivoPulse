@@ -31,6 +31,7 @@ fun ResultScreen(
     val pttResult by viewModel.pttResult.collectAsState()
     val processedSeries by viewModel.processedSeries.collectAsState()
     val qualityReport by viewModel.qualityReport.collectAsState()
+    @Suppress("UNUSED_VARIABLE")
     val waveProfile by viewModel.waveProfile.collectAsState()
     val wavePatternHint by viewModel.wavePatternHint.collectAsState()
     val vascularTrend by viewModel.vascularTrend.collectAsState()

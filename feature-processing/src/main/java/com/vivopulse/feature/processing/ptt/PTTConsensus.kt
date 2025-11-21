@@ -17,7 +17,7 @@ class PTTConsensus {
         face: DoubleArray,
         finger: DoubleArray,
         fsHz: Double,
-        segment: Window
+        @Suppress("UNUSED_PARAMETER") segment: Window
     ): ConsensusPtt {
         // Method A: XCorr lag
         // We can reuse SyncMetrics logic but we need just the lag

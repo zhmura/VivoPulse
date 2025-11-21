@@ -12,6 +12,37 @@ tasks.register("clean", Delete::class) {
     delete(rootProject.buildDir)
 }
 
+// Convenience tasks for app module
+tasks.register("assembleApp") {
+    group = "build"
+    description = "Assemble debug APK for app module"
+    dependsOn(":app:assembleDebug")
+}
+
+tasks.register("buildApp") {
+    group = "build"
+    description = "Build and test app module"
+    dependsOn(":app:assembleDebug", "testDebugUnitTest")
+}
+
+tasks.register("installApp") {
+    group = "install"
+    description = "Install debug APK on connected device"
+    dependsOn(":app:installDebug")
+}
+
+tasks.register("buildAndInstall") {
+    group = "install"
+    description = "Build, test, and install debug APK"
+    dependsOn("buildApp", "installApp")
+}
+
+tasks.register("quickBuild") {
+    group = "build"
+    description = "Quick build without tests"
+    dependsOn(":app:assembleDebug")
+}
+
 // Generate verification artifacts (matrix, diagnostics placeholder)
 tasks.register("packageVerificationArtifacts") {
     group = "verification"

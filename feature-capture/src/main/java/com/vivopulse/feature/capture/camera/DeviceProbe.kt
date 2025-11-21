@@ -172,7 +172,7 @@ class DeviceProbe(private val context: Context) {
     /**
      * Check 3A capabilities for both cameras.
      */
-    private fun check3ACapabilities(frontId: String?, backId: String?): Triple<Boolean, Boolean, Boolean> {
+    private fun check3ACapabilities(frontId: String?, @Suppress("UNUSED_PARAMETER") backId: String?): Triple<Boolean, Boolean, Boolean> {
         var antiFlicker = false
         var aeLock = false
         var awbLock = false

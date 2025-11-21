@@ -22,8 +22,8 @@ class FaceMotionIndex {
     fun computeMotionRms(
         currentFrame: ByteArray,
         previousFrame: ByteArray,
-        width: Int,
-        height: Int
+        @Suppress("UNUSED_PARAMETER") width: Int,
+        @Suppress("UNUSED_PARAMETER") height: Int
     ): Double {
         if (currentFrame.size != previousFrame.size) return 0.0
         

@@ -76,7 +76,7 @@ class AutoRetryManager {
     private fun triggerRetry(
         faceSQI: Double,
         fingerSQI: Double,
-        combinedSQI: Double,
+        @Suppress("UNUSED_PARAMETER") combinedSQI: Double,
         correlation: Double
     ) {
         if (_shouldRetry.value) return // Already triggered
@@ -103,9 +103,9 @@ class AutoRetryManager {
      */
     private fun generateTips(
         reason: RetryReason,
-        faceSQI: Double,
-        fingerSQI: Double,
-        correlation: Double
+        @Suppress("UNUSED_PARAMETER") faceSQI: Double,
+        @Suppress("UNUSED_PARAMETER") fingerSQI: Double,
+        @Suppress("UNUSED_PARAMETER") correlation: Double
     ): List<String> {
         return when (reason) {
             RetryReason.POOR_FACE_QUALITY -> listOf(

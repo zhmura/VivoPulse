@@ -20,6 +20,7 @@ import com.vivopulse.feature.capture.model.Source
  * 3. Retry with YUV-only (no preview)
  * 4. Fall back to sequential mode
  */
+@Suppress("DEPRECATION")
 @SuppressLint("RestrictedApi")
 internal class CameraBindingHelper(
     private val tag: String,
