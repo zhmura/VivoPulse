@@ -99,8 +99,9 @@ class FaceRoiTracker(
         rotation: Int
     ) {
         try {
-            // Convert Y plane to InputImage for ML Kit
-            val buffer = ByteBuffer.wrap(yPlane)
+            // Convert Y plane to InputImage for ML Kit (copy to avoid buffer reuse issues)
+            val detectionBytes = yPlane.copyOf()
+            val buffer = ByteBuffer.wrap(detectionBytes)
             val image = InputImage.fromByteBuffer(
                 buffer,
                 width,
@@ -118,10 +119,7 @@ class FaceRoiTracker(
                     handleLostFace()
                 }
             
-            // Store frame for optical flow
-            lastFrameData = yPlane
-            lastFrameWidth = width
-            lastFrameHeight = height
+            storeLastFrame(yPlane, width, height)
             
         } catch (e: Exception) {
             Log.e(tag, "Error processing frame", e)
@@ -304,7 +302,7 @@ class FaceRoiTracker(
             }
             
             // Store current frame for next tracking
-            lastFrameData = yPlane
+            storeLastFrame(yPlane, width, height)
             
         } catch (e: Exception) {
             Log.e(tag, "Error tracking ROI", e)
@@ -395,6 +393,15 @@ class FaceRoiTracker(
         }
         
         _roiState.value = faceRoi
+    }
+
+    private fun storeLastFrame(data: ByteArray, width: Int, height: Int) {
+        if (lastFrameData == null || lastFrameData!!.size != data.size) {
+            lastFrameData = ByteArray(data.size)
+        }
+        System.arraycopy(data, 0, lastFrameData!!, 0, data.size)
+        lastFrameWidth = width
+        lastFrameHeight = height
     }
     
     /**

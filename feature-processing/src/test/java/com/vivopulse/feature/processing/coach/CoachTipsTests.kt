@@ -11,8 +11,8 @@ class CoachTipsTests {
         val coach = SmartCaptureCoach()
         
         // Simulate low light: low luma variance
-        val lowLumas = List(15) { 50.0 + (Math.random() - 0.5) * 2.0 } // Variance ~1
-        val fingerLumas = List(15) { 120.0 + (Math.random() - 0.5) * 10.0 }
+        val lowLumas = wave(base = 50.0, amplitude = 1.0)
+        val fingerLumas = wave(base = 120.0, amplitude = 5.0)
         
         coach.update(
             faceLumas = lowLumas,
@@ -36,8 +36,8 @@ class CoachTipsTests {
     fun `motion scenario applies penalty and shows tip`() {
         val coach = SmartCaptureCoach()
         
-        val faceLumas = List(15) { 150.0 + (Math.random() - 0.5) * 40.0 } // Good variance
-        val fingerLumas = List(15) { 120.0 + (Math.random() - 0.5) * 30.0 }
+        val faceLumas = wave(base = 150.0, amplitude = 20.0) // Good variance
+        val fingerLumas = wave(base = 120.0, amplitude = 15.0)
         
         coach.update(
             faceLumas = faceLumas,
@@ -59,8 +59,8 @@ class CoachTipsTests {
     fun `saturation scenario shows pressure tip`() {
         val coach = SmartCaptureCoach()
         
-        val faceLumas = List(15) { 150.0 + (Math.random() - 0.5) * 40.0 }
-        val fingerLumas = List(15) { 240.0 + (Math.random() - 0.5) * 5.0 } // High, saturating
+        val faceLumas = wave(base = 150.0, amplitude = 20.0)
+        val fingerLumas = wave(base = 240.0, amplitude = 2.0) // High, saturating
         
         coach.update(
             faceLumas = faceLumas,
@@ -81,8 +81,8 @@ class CoachTipsTests {
     fun `good conditions enable start recording after 2 seconds`() {
         val coach = SmartCaptureCoach()
         
-        val goodFaceLumas = List(15) { 150.0 + (Math.random() - 0.5) * 40.0 }
-        val goodFingerLumas = List(15) { 120.0 + (Math.random() - 0.5) * 30.0 }
+        val goodFaceLumas = wave(base = 150.0, amplitude = 25.0)
+        val goodFingerLumas = wave(base = 120.0, amplitude = 20.0)
         
         // First update
         coach.update(
@@ -108,7 +108,10 @@ class CoachTipsTests {
         
         assertTrue("Should enable after 2s of good quality", coach.canStartRecording.value)
     }
+
+    private fun wave(base: Double, amplitude: Double, size: Int = 30, freq: Double = 0.2): List<Double> {
+        return List(size) { idx ->
+            base + amplitude * kotlin.math.sin(idx * freq)
+        }
+    }
 }
-
-
-

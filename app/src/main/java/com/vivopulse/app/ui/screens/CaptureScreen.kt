@@ -14,6 +14,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -29,7 +30,12 @@ import androidx.hilt.navigation.compose.hiltViewModel
 import com.vivopulse.app.util.DeviceWhitelist
 import com.vivopulse.app.util.FeatureFlags
 import com.vivopulse.app.viewmodel.CaptureViewModel
+import com.vivopulse.feature.capture.camera.CameraMode
+import com.vivopulse.feature.capture.camera.SequentialPrimary
 import com.vivopulse.feature.capture.roi.RoiOverlayView
+import com.vivopulse.feature.processing.realtime.ChannelQualityIndicator
+import com.vivopulse.feature.processing.realtime.QualityStatus
+import com.vivopulse.feature.processing.realtime.RealTimeQualityState
 import kotlinx.coroutines.flow.collectLatest
 import kotlin.time.Duration.Companion.milliseconds
 
@@ -92,6 +98,9 @@ fun CaptureScreen(
     val isDriftValid by viewModel.isDriftValid.collectAsState()
     val faceRoi by viewModel.faceRoi.collectAsState()
     val lastResult by viewModel.lastRecordingResult.collectAsState()
+    val cameraMode by viewModel.cameraMode.collectAsState()
+    val sequentialPrimary by viewModel.sequentialPrimary.collectAsState()
+    val qualityState by viewModel.qualityState.collectAsState()
     val controller = viewModel.getCameraController()
     val statusBanner by controller.statusBanner.collectAsState(initial = null)
     
@@ -211,6 +220,18 @@ fun CaptureScreen(
                         }
                     }
                     
+                    val sequentialModeActive = cameraMode == CameraMode.SAFE_MODE_SEQUENTIAL
+                    if (sequentialModeActive) {
+                        SequentialModeCard(
+                            selected = sequentialPrimary,
+                            enabled = !isRecording,
+                            onSelectionChanged = { viewModel.setSequentialPrimary(it) },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 8.dp, vertical = 4.dp)
+                        )
+                    }
+                    
                     // Simulated mode banner
                     if (FeatureFlags.isSimulatedModeEnabled()) {
                         Card(
@@ -235,7 +256,7 @@ fun CaptureScreen(
                     var backPreviewView by remember { mutableStateOf<PreviewView?>(null) }
                     
                     // Start cameras when both preview views are ready
-                    LaunchedEffect(frontPreviewView, backPreviewView, cameraPermissionGranted) {
+                    LaunchedEffect(frontPreviewView, backPreviewView, cameraPermissionGranted, sequentialPrimary) {
                         if (cameraPermissionGranted && frontPreviewView != null && backPreviewView != null) {
                             viewModel.getCameraController().startCamera(
                                 lifecycleOwner = lifecycleOwner,
@@ -293,6 +314,16 @@ fun CaptureScreen(
                         ) { previewView ->
                             backPreviewView = previewView
                         }
+                    }
+                    
+                    qualityState?.let {
+                        QualityIndicatorsSection(
+                            state = it,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 8.dp)
+                        )
+                        Spacer(modifier = Modifier.height(8.dp))
                     }
                     
                     // Recording stats
@@ -358,6 +389,7 @@ fun CaptureScreen(
                             }
                             
                             // Control buttons
+                            val torchButtonEnabled = !isRecording && !(sequentialModeActive && sequentialPrimary == SequentialPrimary.FACE)
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
                                 horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -366,7 +398,7 @@ fun CaptureScreen(
                                 OutlinedButton(
                                     onClick = { viewModel.toggleTorch() },
                                     modifier = Modifier.weight(1f),
-                                    enabled = !isRecording
+                                    enabled = torchButtonEnabled
                                 ) {
                                     Icon(
                                         imageVector = if (torchEnabled) Icons.Default.FlashlightOn 
@@ -403,6 +435,15 @@ fun CaptureScreen(
                                     Spacer(modifier = Modifier.width(4.dp))
                                     Text(if (isRecording) "Stop" else "Start")
                                 }
+                            }
+                            
+                            if (!torchButtonEnabled && sequentialModeActive && sequentialPrimary == SequentialPrimary.FACE) {
+                                Spacer(modifier = Modifier.height(4.dp))
+                                Text(
+                                    text = "Torch is unavailable when using the face camera.",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
                             }
                             
                             Spacer(modifier = Modifier.height(8.dp))
@@ -575,6 +616,171 @@ fun CameraPreviewCard(
                         )
                     }
                 }
+            }
+        }
+    }
+}
+
+@Composable
+private fun QualityIndicatorsSection(
+    state: RealTimeQualityState,
+    modifier: Modifier = Modifier
+) {
+    Column(modifier = modifier) {
+        state.tip?.let {
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer)
+            ) {
+                Text(
+                    text = it,
+                    modifier = Modifier.padding(12.dp),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSecondaryContainer
+                )
+            }
+            Spacer(modifier = Modifier.height(8.dp))
+        }
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            ChannelQualityCard(
+                title = "Face channel",
+                indicator = state.face,
+                modifier = Modifier.weight(1f)
+            )
+            ChannelQualityCard(
+                title = "Finger channel",
+                indicator = state.finger,
+                modifier = Modifier.weight(1f)
+            )
+        }
+    }
+}
+
+@Composable
+private fun ChannelQualityCard(
+    title: String,
+    indicator: ChannelQualityIndicator,
+    modifier: Modifier = Modifier
+) {
+    val colors = MaterialTheme.colorScheme
+    val statusColor = statusColor(indicator.status, colors)
+    Card(modifier = modifier) {
+        Column(modifier = Modifier.padding(12.dp)) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(12.dp)
+                        .background(statusColor, shape = MaterialTheme.shapes.small)
+                )
+                Text(title, style = MaterialTheme.typography.titleSmall)
+            }
+            Spacer(modifier = Modifier.height(8.dp))
+            indicator.snrDb?.let {
+                QualityMetricRow("SNR", "${String.format("%.1f", it)} dB")
+            }
+            indicator.motionRmsPx?.let {
+                QualityMetricRow("Motion", "${String.format("%.2f", it)} px")
+            }
+            indicator.saturationPct?.let {
+                QualityMetricRow("Saturation", "${String.format("%.1f", it * 100)} %")
+            }
+            indicator.hrEstimateBpm?.let {
+                QualityMetricRow("HR", "${String.format("%.0f", it)} bpm")
+            }
+            indicator.acDcRatio?.let {
+                QualityMetricRow("AC/DC", String.format("%.2f", it))
+            }
+            Spacer(modifier = Modifier.height(8.dp))
+            Canvas(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(40.dp)
+            ) {
+                val sparkline = indicator.sparkline
+                if (sparkline.size >= 2) {
+                    val path = Path()
+                    sparkline.forEachIndexed { index, value ->
+                        val x = (index.toFloat() / (sparkline.size - 1)) * size.width
+                        val y = size.height - (value.toFloat() * size.height)
+                        if (index == 0) {
+                            path.moveTo(x, y)
+                        } else {
+                            path.lineTo(x, y)
+                        }
+                    }
+                    drawPath(path, statusColor, style = Stroke(width = 2.dp.toPx()))
+                }
+            }
+            if (indicator.diagnostics.isNotEmpty()) {
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    text = indicator.diagnostics.first(),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = colors.onSurfaceVariant
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun QualityMetricRow(label: String, value: String) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween
+    ) {
+        Text(label, style = MaterialTheme.typography.bodySmall)
+        Text(value, style = MaterialTheme.typography.bodySmall)
+    }
+}
+
+private fun statusColor(status: QualityStatus, colors: ColorScheme): Color {
+    return when (status) {
+        QualityStatus.GREEN -> colors.primary
+        QualityStatus.YELLOW -> colors.tertiary
+        QualityStatus.RED -> colors.error
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun SequentialModeCard(
+    selected: SequentialPrimary,
+    enabled: Boolean,
+    onSelectionChanged: (SequentialPrimary) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Card(modifier = modifier) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Text("Sequential capture order", style = MaterialTheme.typography.titleMedium)
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(
+                text = "Choose which channel you measure first on devices that cannot stream both cameras.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Spacer(modifier = Modifier.height(12.dp))
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                FilterChip(
+                    selected = selected == SequentialPrimary.FINGER,
+                    onClick = { onSelectionChanged(SequentialPrimary.FINGER) },
+                    enabled = enabled,
+                    label = { Text("Finger first") }
+                )
+                FilterChip(
+                    selected = selected == SequentialPrimary.FACE,
+                    onClick = { onSelectionChanged(SequentialPrimary.FACE) },
+                    enabled = enabled,
+                    label = { Text("Face first") }
+                )
             }
         }
     }

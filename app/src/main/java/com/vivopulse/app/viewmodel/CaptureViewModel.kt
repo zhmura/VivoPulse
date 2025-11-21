@@ -1,20 +1,34 @@
 package com.vivopulse.app.viewmodel
 
 import android.app.Application
+import android.os.Debug
+import android.util.Log
 import androidx.camera.camera2.interop.ExperimentalCamera2Interop
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
-import android.util.Log
+import com.vivopulse.app.reporting.QualityIndicatorReporter
 import com.vivopulse.app.util.ErrorHandler
 import com.vivopulse.feature.capture.DualCameraController
+import com.vivopulse.feature.capture.camera.CameraMode
+import com.vivopulse.feature.capture.camera.SequentialPrimary
 import com.vivopulse.feature.capture.RecordingResult
 import com.vivopulse.feature.capture.model.Frame
 import com.vivopulse.feature.capture.roi.FaceRoi
+import com.vivopulse.feature.processing.realtime.QualityStatus
+import com.vivopulse.feature.processing.realtime.RealTimeQualityEngine
+import com.vivopulse.feature.processing.realtime.RealTimeQualityState
 import com.vivopulse.feature.processing.timestamp.DriftMonitor
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import javax.inject.Inject
 
 /**
@@ -78,9 +92,19 @@ class CaptureViewModel @Inject constructor(
     // Face ROI
     val faceRoi: StateFlow<FaceRoi?> = cameraController.faceRoi
     
+    private val qualityEngine = RealTimeQualityEngine()
+    private val _qualityState = MutableStateFlow<RealTimeQualityState?>(null)
+    val qualityState: StateFlow<RealTimeQualityState?> = _qualityState.asStateFlow()
+    private val qualityReporter = QualityIndicatorReporter(File(application.filesDir, "quality_reports"))
+    private val tipsLog = mutableListOf<String>()
+    private val tipTimestampFormat = SimpleDateFormat("HH:mm:ss", Locale.US)
+    private val recordedSignals = mutableListOf<com.vivopulse.signal.ProcessedSignal>()
+    
     // Status banner for smart coach tips
     private val _statusBanner = MutableStateFlow<String?>(null)
     val statusBanner: StateFlow<String?> = _statusBanner.asStateFlow()
+    val cameraMode: StateFlow<CameraMode> = cameraController.cameraMode
+    val sequentialPrimary: StateFlow<SequentialPrimary> = cameraController.sequentialPrimary
 
     private val _lastRecordingResult = MutableStateFlow<RecordingResult?>(null)
     val lastRecordingResult: StateFlow<RecordingResult?> = _lastRecordingResult.asStateFlow()
@@ -153,6 +177,48 @@ class CaptureViewModel @Inject constructor(
                 _isDriftValid.value = valid
             }
         }
+        
+        observeSignalSamples()
+        startMemoryGuard()
+    }
+
+    private fun observeSignalSamples() {
+        viewModelScope.launch(Dispatchers.Default) {
+            cameraController.signalSamples.collect { sample ->
+                val state = qualityEngine.addSample(sample) ?: return@collect
+                _qualityState.value = state
+                qualityReporter.record(state)
+                state.tip?.let {
+                    Log.d(tag, "Quality tip: $it")
+                    tipsLog.add("${tipTimestampFormat.format(Date())} – $it")
+                }
+                if (_isRecording.value) {
+                    recordedSignals.add(state.toProcessedSignal())
+                }
+            }
+        }
+    }
+
+    private fun startMemoryGuard() {
+        viewModelScope.launch(Dispatchers.Default) {
+            var lastAlloc = Debug.getNativeHeapAllocatedSize()
+            var lastGc = Debug.getRuntimeStats()["art.gc.gc-count"]?.toLongOrNull() ?: 0L
+            while (isActive) {
+                delay(1000)
+                val currentAlloc = Debug.getNativeHeapAllocatedSize()
+                val runtimeStats = Debug.getRuntimeStats()
+                val currentGc = runtimeStats["art.gc.gc-count"]?.toLongOrNull() ?: lastGc
+
+                if (currentAlloc - lastAlloc > 20L * 1024 * 1024) {
+                    Log.w(tag, "Memory spike detected: +${(currentAlloc - lastAlloc) / (1024 * 1024)} MB")
+                }
+                if (currentGc > lastGc) {
+                    Log.d(tag, "GC count increased by ${currentGc - lastGc}")
+                }
+                lastAlloc = currentAlloc
+                lastGc = currentGc
+            }
+        }
     }
 
     fun getCameraController(): DualCameraController = cameraController
@@ -164,7 +230,9 @@ class CaptureViewModel @Inject constructor(
         _recordingDuration.value = 0L
         _isRecording.value = true
         driftMonitor.reset()
-        recordedSignals.clear() // Clear previous signals
+        recordedSignals.clear()
+        tipsLog.clear()
+        qualityReporter.reset()
         cameraController.startRecording()
     }
 
@@ -178,6 +246,8 @@ class CaptureViewModel @Inject constructor(
         
         // Share recording result with other ViewModels
         SharedRecordingState.setRecordingResult(result, recordedSignals.toList())
+        qualityReporter.writeReport(tipsLog.toList())
+        tipsLog.clear()
     }
 
     fun toggleTorch() {
@@ -186,67 +256,63 @@ class CaptureViewModel @Inject constructor(
         cameraController.setTorchEnabled(newState)
         torchEnabledAt = if (newState) System.currentTimeMillis() else null
     }
+    
+    fun setSequentialPrimary(primary: SequentialPrimary) {
+        if (primary == SequentialPrimary.FACE && _torchEnabled.value) {
+            _torchEnabled.value = false
+            torchEnabledAt = null
+        }
+        cameraController.setSequentialPrimary(primary)
+    }
 
     fun isConcurrentCameraSupported(): Boolean {
         return cameraController.isConcurrentCameraSupported()
     }
     
-    // Processing Pipeline
-    private val processingPipeline = com.vivopulse.feature.processing.DefaultProcessingPipeline()
-    
-    init {
-        // Start pipeline
-        viewModelScope.launch {
-            processingPipeline.process(cameraController.rawFrameFlow)
-                .collect { result ->
-                    updateSmartCoachTips(result)
-                    
-                    if (_isRecording.value) {
-                        recordedSignals.add(result)
-                    }
-                }
-        }
+    private fun RealTimeQualityState.toProcessedSignal(): com.vivopulse.signal.ProcessedSignal {
+        val hrCandidates = listOfNotNull(face.hrEstimateBpm, finger.hrEstimateBpm)
+        val heartRate = if (hrCandidates.isNotEmpty()) hrCandidates.average() else 0.0
+        val snrValues = listOfNotNull(face.snrDb, finger.snrDb)
+        val snrAverage = if (snrValues.isNotEmpty()) snrValues.average() else 0.0
+        val processedData = floatArrayOf(
+            face.sparkline.lastOrNull()?.toFloat() ?: 0f,
+            finger.sparkline.lastOrNull()?.toFloat() ?: 0f
+        )
+        return com.vivopulse.signal.ProcessedSignal(
+            heartRate = heartRate.toFloat(),
+            signalQuality = averageQuality(face.status, finger.status),
+            timestamp = updatedAtMs,
+            processedData = processedData,
+            faceMotionRms = face.motionRmsPx ?: 0.0,
+            fingerSaturationPct = finger.saturationPct ?: 0.0,
+            snrDb = snrAverage,
+            faceSqi = statusToScore(face.status),
+            fingerSqi = statusToScore(finger.status),
+            goodSync = hrAgreementDeltaBpm?.let { it <= 5.0 } ?: false,
+            consensusPtt = null
+        )
     }
-    
-    private val recordedSignals = mutableListOf<com.vivopulse.signal.ProcessedSignal>()
 
-    private fun updateSmartCoachTips(result: com.vivopulse.signal.ProcessedSignal) {
-        // Real-time feedback based on pipeline results
-        val tips = mutableListOf<String>()
-        
-        // Motion checks
-        if (result.faceMotionRms > 1.5) {
-            tips.add("Hold phone steady")
-        }
-        
-        // Saturation/Contact checks
-        if (result.fingerSaturationPct > 0.8) {
-            tips.add("Press lighter on back camera")
-        } else if (result.fingerSaturationPct < 0.1 && result.fingerSqi < 50) {
-            tips.add("Cover back camera fully")
-        }
-        
-        // Signal Quality
-        if (result.faceSqi < 50 && result.faceMotionRms < 1.0) {
-            tips.add("Improve lighting on face")
-        }
-        
-        // GoodSync status
-        if (result.goodSync) {
-            // Maybe show a "Good Signal" indicator?
-            // For now, just clear warnings if good
-            if (tips.isEmpty()) {
-                _statusBanner.value = null
+    private fun averageQuality(vararg statuses: QualityStatus): Float {
+        if (statuses.isEmpty()) return 0f
+        val score = statuses.map {
+            when (it) {
+                QualityStatus.GREEN -> 1.0
+                QualityStatus.YELLOW -> 0.6
+                QualityStatus.RED -> 0.2
             }
-        }
-        
-        if (tips.isNotEmpty()) {
-            _statusBanner.value = tips.first() // Show highest priority tip
-        } else if (_statusBanner.value?.contains("Hold") == true || _statusBanner.value?.contains("Press") == true) {
-            _statusBanner.value = null // Clear old tips
-        }
+        }.average()
+        return score.toFloat()
     }
 
+    private fun statusToScore(status: QualityStatus): Int {
+        return when (status) {
+            QualityStatus.GREEN -> 90
+            QualityStatus.YELLOW -> 60
+            QualityStatus.RED -> 20
+        }
+    }
+    
     override fun onCleared() {
         super.onCleared()
         cameraController.release()

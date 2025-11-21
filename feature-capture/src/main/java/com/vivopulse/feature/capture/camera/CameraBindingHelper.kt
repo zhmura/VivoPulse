@@ -38,6 +38,7 @@ internal class CameraBindingHelper(
         frontPreviewView: PreviewView,
         backPreviewView: PreviewView,
         currentMode: CameraMode,
+        sequentialPrimary: SequentialPrimary,
         resolutionIndex: Int
     ): Pair<androidx.camera.core.Camera?, androidx.camera.core.Camera?>? {
         
@@ -49,7 +50,14 @@ internal class CameraBindingHelper(
                 bindConcurrent(provider, lifecycleOwner, frontPreviewView, backPreviewView, resolution)
             }
             CameraMode.SAFE_MODE_SEQUENTIAL -> {
-                bindSequential(provider, lifecycleOwner, frontPreviewView, backPreviewView, resolution)
+                bindSequential(
+                    provider = provider,
+                    lifecycleOwner = lifecycleOwner,
+                    frontPreviewView = frontPreviewView,
+                    backPreviewView = backPreviewView,
+                    sequentialPrimary = sequentialPrimary,
+                    resolution = resolution
+                )
             }
         }
     }
@@ -122,31 +130,44 @@ internal class CameraBindingHelper(
         lifecycleOwner: LifecycleOwner,
         frontPreviewView: PreviewView,
         backPreviewView: PreviewView,
+        sequentialPrimary: SequentialPrimary,
         resolution: Size
     ): Pair<androidx.camera.core.Camera?, androidx.camera.core.Camera?>? {
         return try {
-            // In sequential mode, prioritize back camera (finger PPG)
-            val backPreview = Preview.Builder()
+            val useFace = sequentialPrimary == SequentialPrimary.FACE
+            val previewView = if (useFace) frontPreviewView else backPreviewView
+            val cameraSelector = if (useFace) {
+                CameraSelector.DEFAULT_FRONT_CAMERA
+            } else {
+                CameraSelector.DEFAULT_BACK_CAMERA
+            }
+            val source = if (useFace) Source.FACE else Source.FINGER
+
+            val preview = Preview.Builder()
                 .setTargetResolution(resolution)
                 .build()
-                .also { it.setSurfaceProvider(backPreviewView.surfaceProvider) }
+                .also { it.setSurfaceProvider(previewView.surfaceProvider) }
             
-            val backAnalysis = ImageAnalysis.Builder()
+            val analysis = ImageAnalysis.Builder()
                 .setTargetResolution(resolution)
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                 .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
                 .build()
-                .also { it.setAnalyzer(executor) { img -> processFrame(img, Source.FINGER) } }
+                .also { it.setAnalyzer(executor) { img -> processFrame(img, source) } }
             
-            val backCamera = provider.bindToLifecycle(
+            val camera = provider.bindToLifecycle(
                 lifecycleOwner,
-                CameraSelector.DEFAULT_BACK_CAMERA,
-                backPreview,
-                backAnalysis
+                cameraSelector,
+                preview,
+                analysis
             )
             
-            Log.d(tag, "Sequential binding successful (back camera only) at $resolution")
-            Pair(null, backCamera)
+            Log.d(tag, "Sequential binding successful (${sequentialPrimary.name.lowercase()}) at $resolution")
+            return if (useFace) {
+                Pair(camera, null)
+            } else {
+                Pair(null, camera)
+            }
             
         } catch (e: Exception) {
             Log.w(tag, "Sequential binding failed at $resolution", e)

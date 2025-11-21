@@ -10,21 +10,30 @@ import android.util.Size
 import androidx.camera.camera2.interop.Camera2CameraInfo
 import androidx.camera.camera2.interop.Camera2Interop
 import androidx.camera.camera2.interop.ExperimentalCamera2Interop
-import androidx.camera.core.*
+import androidx.camera.core.Camera
+import androidx.camera.core.CameraSelector
+import androidx.camera.core.ImageAnalysis
+import androidx.camera.core.ImageProxy
+import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleOwner
+import com.vivopulse.feature.capture.analysis.SafeImageAnalyzer
+import com.vivopulse.feature.capture.camera.SequentialPrimary
 import com.vivopulse.feature.capture.model.Frame
 import com.vivopulse.feature.capture.model.Source
 import com.vivopulse.feature.capture.model.SessionStats
 import com.vivopulse.feature.capture.roi.FaceRoi
 import com.vivopulse.feature.capture.roi.FaceRoiTracker
 import com.vivopulse.feature.capture.util.FpsTracker
+import com.vivopulse.signal.SignalSample
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.flow.*
 import java.nio.ByteBuffer
-import java.util.concurrent.Executor
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+import kotlin.math.sqrt
 import android.graphics.Rect
 
 /**
@@ -43,7 +52,9 @@ class DualCameraController(
     private var backCamera: Camera? = null
     
     // Use a background executor for image analysis to avoid blocking the main thread
-    private val executor: java.util.concurrent.ExecutorService = java.util.concurrent.Executors.newSingleThreadExecutor()
+    private val analyzerExecutor: ExecutorService = Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "VivoPulseAnalyzer").apply { priority = Thread.NORM_PRIORITY }
+    }
     
     // Frame streams
     private val _frontFrames = MutableSharedFlow<Frame>(
@@ -105,13 +116,13 @@ class DualCameraController(
     )
     val fingerWave: SharedFlow<Double> = _fingerWave.asSharedFlow()
     
-    // Raw frame stream for processing pipeline
-    private val _rawFrameFlow = MutableSharedFlow<com.vivopulse.signal.RawFrameData>(
+    // Lightweight signal samples for real-time quality analysis
+    private val _signalSamples = MutableSharedFlow<SignalSample>(
         replay = 0,
         extraBufferCapacity = 5,
         onBufferOverflow = BufferOverflow.DROP_OLDEST
     )
-    val rawFrameFlow: SharedFlow<com.vivopulse.signal.RawFrameData> = _rawFrameFlow.asSharedFlow()
+    val signalSamples: SharedFlow<SignalSample> = _signalSamples.asSharedFlow()
     
     // Device capabilities and camera mode
     private val deviceProbe = com.vivopulse.feature.capture.camera.DeviceProbe(context)
@@ -120,6 +131,9 @@ class DualCameraController(
         com.vivopulse.feature.capture.camera.CameraMode.CONCURRENT
     )
     val cameraMode: StateFlow<com.vivopulse.feature.capture.camera.CameraMode> = _cameraMode.asStateFlow()
+    
+    private val _sequentialPrimary = MutableStateFlow(SequentialPrimary.FINGER)
+    val sequentialPrimary: StateFlow<SequentialPrimary> = _sequentialPrimary.asStateFlow()
     
     // Retry state for session failures
     private var retryCount = 0
@@ -136,6 +150,11 @@ class DualCameraController(
     private var recordingStartTime = 0L
     private val recordedFrames = mutableListOf<Frame>()
     private val maxRecordedFrames = 3600 // ~60s at 30fps per camera
+    private var faceFrameBuffer: ByteArray? = null
+    private var facePatchBuffer: ByteArray? = null
+    private var previousFacePatch: ByteArray? = null
+    private var fingerRoiRect: Rect? = null
+    private var fingerFrameCounter = 0
     
     // Torch state
     private var torchEnabled = false
@@ -193,7 +212,7 @@ class DualCameraController(
                     }
                 }
             }
-            powerManager.addThermalStatusListener(executor, thermalListener!!)
+            powerManager.addThermalStatusListener(analyzerExecutor, thermalListener!!)
         }
     }
     
@@ -233,6 +252,8 @@ class DualCameraController(
         
         // Unbind all use cases before rebinding
         provider.unbindAll()
+        fingerFrameCounter = 0
+        fingerRoiRect = null
         
         try {
             // Update status banner based on camera mode
@@ -270,7 +291,7 @@ class DualCameraController(
     ) {
         val bindingHelper = com.vivopulse.feature.capture.camera.CameraBindingHelper(
             tag = tag,
-            executor = executor,
+            executor = analyzerExecutor,
             processFrame = ::processFrame
         )
         
@@ -280,6 +301,7 @@ class DualCameraController(
             frontPreviewView = frontPreviewView,
             backPreviewView = backPreviewView,
             currentMode = _cameraMode.value,
+            sequentialPrimary = _sequentialPrimary.value,
             resolutionIndex = currentResolutionIndex
         )
         
@@ -361,9 +383,9 @@ class DualCameraController(
             .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
             .build()
             .also { analysis ->
-                analysis.setAnalyzer(executor) { imageProxy ->
+                analysis.setAnalyzer(analyzerExecutor, SafeImageAnalyzer { imageProxy ->
                     processFrame(imageProxy, source)
-                }
+                })
             }
     }
     
@@ -373,160 +395,128 @@ class DualCameraController(
     @SuppressLint("UnsafeOptInUsageError")
     private fun processFrame(imageProxy: ImageProxy, source: Source) {
         try {
-            val image = imageProxy.image
-            if (image == null) {
-                imageProxy.close()
-                return
-            }
-            
+            val image = imageProxy.image ?: return
+
             val tracker = if (source == Source.FACE) frontFpsTracker else backFpsTracker
             tracker.onFrameReceived(image.timestamp)
-            
-            // Emit timestamps for drift monitoring
+
             if (source == Source.FACE) {
                 _frontTimestamps.tryEmit(image.timestamp)
             } else {
                 _backTimestamps.tryEmit(image.timestamp)
             }
-            
-            // Extract Y plane for processing
+
             val yPlane = image.planes[0]
-            val yBuffer = yPlane.buffer.duplicate() // Duplicate to preserve position
             val rowStride = yPlane.rowStride
-            
-            // Extract luma based on source
+
             var faceLuma: Double? = null
             var fingerLuma: Double? = null
-            
-            // Prepare RawFrameData components
-            var rawYPlane: ByteArray? = null
-            var faceRoiData: com.vivopulse.signal.Roi? = null
-            var fingerRoiData: com.vivopulse.signal.Roi? = null
-            
+            var faceMotionRms: Double? = null
+            var fingerSaturationPct: Double? = null
+
             if (source == Source.FACE) {
-                // Process face ROI
                 try {
-                    val yData = ByteArray(yBuffer.remaining())
-                    yBuffer.get(yData)
-                    rawYPlane = yData // Keep reference for RawFrameData
-                    
+                    val planeCopy = yPlane.buffer.duplicate().apply { position(0) }
+                    val planeSize = planeCopy.remaining()
+                    val frameBytes = ensureFaceBuffer(planeSize)
+                    planeCopy.get(frameBytes, 0, planeSize)
+
                     faceRoiTracker.processFrame(
-                        yPlane = yData,
+                        yPlane = frameBytes,
                         width = image.width,
                         height = image.height,
                         rotation = 0
                     )
-                    
-                    // Extract luma from ROI if available
-                    val currentRoi = faceRoi.value
-                    if (currentRoi != null && currentRoi.isValid()) {
-                        yBuffer.rewind()
+
+                    val currentRoi = faceRoi.value?.rect
+                    if (currentRoi != null && !currentRoi.isEmpty) {
+                        val roiBuffer = yPlane.buffer.duplicate().apply { position(0) }
                         faceLuma = LumaExtractor.extractAverageLuma(
-                            yBuffer,
-                            currentRoi.rect,
+                            roiBuffer,
+                            currentRoi,
                             rowStride,
                             image.width,
                             image.height
                         )
+                        val motionBuffer = yPlane.buffer.duplicate().apply { position(0) }
+                        faceMotionRms = computeFaceMotionRms(motionBuffer, rowStride, currentRoi)
                         faceLuma?.let { _faceWave.tryEmit(it) }
-                        
-                        // Map to shared Roi
-                        faceRoiData = com.vivopulse.signal.Roi(
-                            currentRoi.rect.left,
-                            currentRoi.rect.top,
-                            currentRoi.rect.right,
-                            currentRoi.rect.bottom
-                        )
                     }
                 } catch (e: Exception) {
-                    Log.e(tag, "Error processing face ROI", e)
+                    Log.e(tag, "Error processing face channel", e)
                 }
             } else {
-                // Extract luma from finger (center region)
                 try {
-                    // For finger, we also need the Y data for RawFrameData
-                    val yData = ByteArray(yBuffer.remaining())
-                    yBuffer.get(yData)
-                    rawYPlane = yData
-                    
-                    // Calculate Finger ROI
-                    val fRoi = com.vivopulse.feature.capture.roi.FingerRoiDetector.detectOptimalFingerRoi(
-                        yBuffer, // Note: this might advance position if not careful, but detectOptimalFingerRoi takes ByteBuffer
+                    fingerFrameCounter++
+                    val roi = if (fingerRoiRect == null || fingerFrameCounter % 30 == 0) {
+                        val roiBuffer = yPlane.buffer.duplicate().apply { position(0) }
+                        com.vivopulse.feature.capture.roi.FingerRoiDetector.detectOptimalFingerRoi(
+                            roiBuffer,
+                            rowStride,
+                            image.width,
+                            image.height
+                        ).also { fingerRoiRect = it }
+                    } else {
+                        fingerRoiRect!!
+                    }
+
+                    val lumaBuffer = yPlane.buffer.duplicate().apply { position(0) }
+                    fingerLuma = LumaExtractor.extractAverageLuma(
+                        lumaBuffer,
+                        roi,
                         rowStride,
                         image.width,
                         image.height
                     )
-                    
-                    fingerRoiData = com.vivopulse.signal.Roi(
-                        fRoi.left, fRoi.top, fRoi.right, fRoi.bottom
-                    )
-                    
-                    // We can use the calculated ROI for extraction too, or keep using LumaExtractor's center logic
-                    // LumaExtractor.extractCenterRegionLuma uses a fixed center.
-                    // Ideally we sync them. For now, let's stick to LumaExtractor for the wave, 
-                    // but pass the detected ROI to the pipeline.
-                    yBuffer.rewind()
-                    fingerLuma = LumaExtractor.extractCenterRegionLuma(
-                        yBuffer,
-                        rowStride,
-                        image.width,
-                        image.height
-                    )
+
+                    val satBuffer = yPlane.buffer.duplicate().apply { position(0) }
+                    fingerSaturationPct = computeSaturationPct(satBuffer, roi, rowStride)
+
                     fingerLuma?.let { _fingerWave.tryEmit(it) }
                 } catch (e: Exception) {
-                    Log.e(tag, "Error extracting finger luma", e)
+                    Log.e(tag, "Error processing finger channel", e)
                 }
             }
-            
-            // Emit RawFrameData if we have the plane
-            if (rawYPlane != null) {
-                val rawFrame = com.vivopulse.signal.RawFrameData(
-                    timestampNs = image.timestamp,
-                    width = image.width,
-                    height = image.height,
-                    yPlane = rawYPlane,
-                    faceRoi = faceRoiData,
-                    fingerRoi = fingerRoiData
-                )
-                _rawFrameFlow.tryEmit(rawFrame)
-            }
-            
-            // Do not store full YUV planes to avoid high memory usage; luma metrics suffice for processing
-            val planes = emptyList<ByteBuffer>()
-            
+
             val frame = Frame(
                 source = source,
                 timestampNs = image.timestamp,
                 width = image.width,
                 height = image.height,
-                yuvPlanes = planes,
+                yuvPlanes = emptyList(),
                 faceLuma = faceLuma,
                 fingerLuma = fingerLuma
             )
-            
-            // Emit frame to flow
+
             val flowEmitted = if (source == Source.FACE) {
                 _frontFrames.tryEmit(frame)
             } else {
                 _backFrames.tryEmit(frame)
             }
-            
+
             if (!flowEmitted) {
                 tracker.onFrameDropped()
                 Log.w(tag, "Frame dropped for ${source.name}, buffer full")
             }
-            
-            // Store frame if recording
+
             if (isRecording && recordedFrames.size < maxRecordedFrames) {
                 synchronized(recordedFrames) {
                     recordedFrames.add(frame.deepCopy())
                 }
             }
-            
+
+            _signalSamples.tryEmit(
+                SignalSample(
+                    timestampNs = image.timestamp,
+                    faceMeanLuma = faceLuma,
+                    fingerMeanLuma = fingerLuma,
+                    faceMotionRmsPx = faceMotionRms,
+                    fingerSaturationPct = fingerSaturationPct,
+                    torchEnabled = torchEnabled
+                )
+            )
         } catch (e: Exception) {
             Log.e(tag, "Error processing frame from ${source.name}", e)
-        } finally {
-            imageProxy.close()
         }
     }
     
@@ -603,6 +593,24 @@ class DualCameraController(
     }
     
     /**
+     * Configure which channel should run first when only one camera can operate.
+     */
+    fun setSequentialPrimary(primary: SequentialPrimary) {
+        if (_sequentialPrimary.value == primary) return
+        _sequentialPrimary.value = primary
+        if (primary == SequentialPrimary.FACE && torchEnabled) {
+            setTorchEnabled(false)
+        }
+        if (_cameraMode.value == com.vivopulse.feature.capture.camera.CameraMode.SAFE_MODE_SEQUENTIAL) {
+            _statusBanner.value = if (primary == SequentialPrimary.FACE) {
+                "Sequential mode: capturing face first"
+            } else {
+                "Sequential mode: capturing finger first"
+            }
+        }
+    }
+    
+    /**
      * Get current recording state.
      */
     fun isRecording(): Boolean = isRecording
@@ -612,6 +620,92 @@ class DualCameraController(
      */
     fun getCurrentFps(): Pair<Float, Float> {
         return Pair(frontFpsTracker.getCurrentFps(), backFpsTracker.getCurrentFps())
+    }
+    
+    private fun ensureFaceBuffer(requiredSize: Int): ByteArray {
+        val existing = faceFrameBuffer
+        if (existing == null || existing.size < requiredSize) {
+            faceFrameBuffer = ByteArray(requiredSize)
+        }
+        return faceFrameBuffer!!
+    }
+    
+    private fun computeFaceMotionRms(
+        buffer: ByteBuffer,
+        rowStride: Int,
+        roi: Rect,
+        step: Int = 4
+    ): Double? {
+        if (roi.isEmpty) return null
+        val width = roi.width().coerceAtLeast(1)
+        val height = roi.height().coerceAtLeast(1)
+        val sampledWidth = (width / step).coerceAtLeast(1)
+        val sampledHeight = (height / step).coerceAtLeast(1)
+        val sampleCount = sampledWidth * sampledHeight
+        
+        if (sampleCount <= 0) return null
+        if (facePatchBuffer == null || facePatchBuffer!!.size < sampleCount) {
+            facePatchBuffer = ByteArray(sampleCount)
+        }
+        
+        val currentPatch = facePatchBuffer!!
+        var index = 0
+        var y = roi.top
+        while (y < roi.bottom) {
+            val base = y * rowStride
+            var x = roi.left
+            while (x < roi.right) {
+                val value = buffer.get(base + x).toInt() and 0xFF
+                currentPatch[index++] = value.toByte()
+                x += step
+            }
+            y += step
+        }
+        
+        val previous = previousFacePatch
+        val motion = if (previous != null && previous.size == index) {
+            var sum = 0.0
+            for (i in 0 until index) {
+                val diff = (currentPatch[i].toInt() and 0xFF) - (previous[i].toInt() and 0xFF)
+                sum += diff * diff
+            }
+            kotlin.math.sqrt(sum / index) / 10.0
+        } else null
+        
+        if (previous == null || previous.size != index) {
+            previousFacePatch = ByteArray(index)
+        }
+        System.arraycopy(currentPatch, 0, previousFacePatch!!, 0, index)
+        return motion
+    }
+    
+    private fun computeSaturationPct(
+        buffer: ByteBuffer,
+        roi: Rect,
+        rowStride: Int,
+        threshold: Int = 250,
+        sampleStep: Int = 2
+    ): Double {
+        if (roi.isEmpty) return 0.0
+        var saturated = 0
+        var total = 0
+        
+        var y = roi.top
+        while (y < roi.bottom) {
+            val base = y * rowStride
+            var x = roi.left
+            while (x < roi.right) {
+                val value = buffer.get(base + x).toInt() and 0xFF
+                if (value >= threshold) {
+                    saturated++
+                }
+                total++
+                x += sampleStep
+            }
+            y += sampleStep
+        }
+        
+        return if (total == 0) 0.0 else saturated.toDouble() / total.toDouble()
     }
     
     /**
@@ -628,10 +722,10 @@ class DualCameraController(
         }
         faceRoiTracker.release()
         if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q && thermalListener != null) {
-             val powerManager = context.getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
-             powerManager.removeThermalStatusListener(thermalListener!!)
+            val powerManager = context.getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
+            powerManager.removeThermalStatusListener(thermalListener!!)
         }
-        executor.shutdown()
+        analyzerExecutor.shutdown()
         Log.d(tag, "Camera resources released")
     }
 }
@@ -643,4 +737,5 @@ data class RecordingResult(
     val frames: List<Frame>,
     val stats: SessionStats
 )
+
 
