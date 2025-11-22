@@ -85,7 +85,11 @@ internal class CameraBindingHelper(
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                 .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
                 .build()
-                .also { it.setAnalyzer(executor) { img -> processFrame(img, Source.FACE) } }
+                .also { 
+                    it.setAnalyzer(executor, com.vivopulse.feature.capture.analysis.SafeImageAnalyzer { img -> 
+                        processFrame(img, Source.FACE) 
+                    })
+                }
             
             val frontCamera = provider.bindToLifecycle(
                 lifecycleOwner,
@@ -105,7 +109,11 @@ internal class CameraBindingHelper(
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                 .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
                 .build()
-                .also { it.setAnalyzer(executor) { img -> processFrame(img, Source.FINGER) } }
+                .also { 
+                    it.setAnalyzer(executor, com.vivopulse.feature.capture.analysis.SafeImageAnalyzer { img -> 
+                        processFrame(img, Source.FINGER) 
+                    })
+                }
             
             val backCamera = provider.bindToLifecycle(
                 lifecycleOwner,
@@ -154,7 +162,11 @@ internal class CameraBindingHelper(
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                 .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
                 .build()
-                .also { it.setAnalyzer(executor) { img -> processFrame(img, source) } }
+                .also { 
+                    it.setAnalyzer(executor, com.vivopulse.feature.capture.analysis.SafeImageAnalyzer { img -> 
+                        processFrame(img, source) 
+                    })
+                }
             
             val camera = provider.bindToLifecycle(
                 lifecycleOwner,

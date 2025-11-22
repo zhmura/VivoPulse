@@ -225,18 +225,23 @@ fun CaptureScreen(
                     // Camera previews
                     var frontPreviewView by remember { mutableStateOf<PreviewView?>(null) }
                     var backPreviewView by remember { mutableStateOf<PreviewView?>(null) }
+                    var cameraStarted by remember { mutableStateOf(false) }
                     
-                    LaunchedEffect(frontPreviewView, backPreviewView, cameraPermissionGranted, sequentialPrimary) {
-                        if (cameraPermissionGranted && frontPreviewView != null && backPreviewView != null) {
-                            android.util.Log.d("CaptureScreen", "Starting camera - mode: $cameraMode, sequential: $sequentialPrimary, front: ${frontPreviewView != null}, back: ${backPreviewView != null}")
+                    LaunchedEffect(frontPreviewView, backPreviewView, cameraPermissionGranted, sequentialPrimary, cameraMode) {
+                        if (cameraPermissionGranted && frontPreviewView != null && backPreviewView != null && !cameraStarted) {
+                            android.util.Log.d("CaptureScreen", "Starting camera - mode: $cameraMode, sequential: $sequentialPrimary")
                             viewModel.getCameraController().startCamera(
                                 lifecycleOwner = lifecycleOwner,
                                 frontPreviewView = frontPreviewView!!,
                                 backPreviewView = backPreviewView!!
                             )
-                        } else {
-                            android.util.Log.w("CaptureScreen", "Cannot start camera - permission: $cameraPermissionGranted, front: ${frontPreviewView != null}, back: ${backPreviewView != null}")
+                            cameraStarted = true
                         }
+                    }
+                    
+                    // Reset camera started flag when mode changes
+                    LaunchedEffect(cameraMode, sequentialPrimary) {
+                        cameraStarted = false
                     }
                     
                     val faceWave = remember { mutableStateListOf<Double>() }
@@ -259,19 +264,19 @@ fun CaptureScreen(
                         }
                     }
                     
-                    // Camera previews - FULL HEIGHT
-                    Column(
+                    // Camera previews - HORIZONTAL LAYOUT
+                    Row(
                         modifier = Modifier
                             .fillMaxWidth()
                             .weight(1f)
                             .padding(horizontal = 4.dp, vertical = 4.dp),
-                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                        horizontalArrangement = Arrangement.spacedBy(4.dp)
                     ) {
                         CameraPreviewCard(
-                            title = "Face (Front)",
+                            title = "Face (Front) - ${faceWave.size} pts",
                             modifier = Modifier
-                                .fillMaxWidth()
-                                .weight(1f),
+                                .weight(1f)
+                                .fillMaxHeight(),
                             showRoiOverlay = true,
                             faceRoi = faceRoi,
                             waveform = faceWave
@@ -280,10 +285,10 @@ fun CaptureScreen(
                         }
                         
                         CameraPreviewCard(
-                            title = "Finger (Back)",
+                            title = "Finger (Back) - ${fingerWave.size} pts",
                             modifier = Modifier
-                                .fillMaxWidth()
-                                .weight(1f),
+                                .weight(1f)
+                                .fillMaxHeight(),
                             showTorchIndicator = torchEnabled,
                             waveform = fingerWave
                         ) { previewView ->

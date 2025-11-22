@@ -405,12 +405,13 @@ class DualCameraController(
      */
     @SuppressLint("UnsafeOptInUsageError")
     private fun processFrame(imageProxy: ImageProxy, source: Source) {
+        val image = imageProxy.image
+        if (image == null) {
+            Log.w(tag, "processFrame: image is null for ${source.name}")
+            return
+        }
+        
         try {
-            val image = imageProxy.image ?: run {
-                Log.w(tag, "processFrame: image is null for ${source.name}")
-                return
-            }
-
             val tracker = if (source == Source.FACE) frontFpsTracker else backFpsTracker
             tracker.onFrameReceived(image.timestamp)
 
@@ -430,35 +431,55 @@ class DualCameraController(
 
             if (source == Source.FACE) {
                 try {
-                    val planeCopy = yPlane.buffer.duplicate().apply { position(0) }
-                    val planeSize = planeCopy.remaining()
-                    val frameBytes = yPlaneBufferPool.acquire()
-                    planeCopy.get(frameBytes, 0, minOf(planeSize, frameBytes.size))
+                    // Try face ROI tracking, but don't let it block luma extraction
+                    try {
+                        val planeCopy = yPlane.buffer.duplicate().apply { position(0) }
+                        val planeSize = planeCopy.remaining()
+                        val exactSizeBuffer = ByteArray(planeSize)
+                        planeCopy.get(exactSizeBuffer)
 
-                    faceRoiTracker.processFrame(
-                        yPlane = frameBytes,
-                        width = image.width,
-                        height = image.height,
-                        rotation = 0
-                    )
-
-                    val currentRoi = faceRoi.value?.rect
-                    if (currentRoi != null && !currentRoi.isEmpty) {
-                        val roiBuffer = yPlane.buffer.duplicate().apply { position(0) }
-                        faceLuma = LumaExtractor.extractAverageLuma(
-                            roiBuffer,
-                            currentRoi,
-                            rowStride,
-                            image.width,
-                            image.height
+                        faceRoiTracker.processFrame(
+                            yPlane = exactSizeBuffer,
+                            width = image.width,
+                            height = image.height,
+                            rotation = 0
                         )
-                        val motionBuffer = yPlane.buffer.duplicate().apply { position(0) }
-                        faceMotionRms = computeFaceMotionRms(motionBuffer, rowStride, currentRoi)
-                        faceLuma.let { _faceWave.tryEmit(it) }
+                    } catch (e: Exception) {
+                        Log.w(tag, "Face ROI tracking failed (non-critical): ${e.message}")
+                    }
+
+                    // Always try to extract luma, even if ROI tracking fails
+                    val currentRoi = faceRoi.value?.rect
+                    val roiToUse = if (currentRoi != null && !currentRoi.isEmpty) {
+                        currentRoi
+                    } else {
+                        // Fallback: use center 60% of frame
+                        android.graphics.Rect(
+                            (image.width * 0.2).toInt(),
+                            (image.height * 0.2).toInt(),
+                            (image.width * 0.8).toInt(),
+                            (image.height * 0.8).toInt()
+                        )
                     }
                     
-                    // Return buffer to pool
-                    yPlaneBufferPool.release(frameBytes)
+                    val roiBuffer = yPlane.buffer.duplicate().apply { position(0) }
+                    faceLuma = LumaExtractor.extractAverageLuma(
+                        roiBuffer,
+                        roiToUse,
+                        rowStride,
+                        image.width,
+                        image.height
+                    )
+                    
+                    if (currentRoi != null && !currentRoi.isEmpty) {
+                        val motionBuffer = yPlane.buffer.duplicate().apply { position(0) }
+                        faceMotionRms = computeFaceMotionRms(motionBuffer, rowStride, currentRoi)
+                    }
+                    
+                    faceLuma?.let { 
+                        _faceWave.tryEmit(it)
+                        Log.v(tag, "Face luma: $it")
+                    }
                 } catch (e: Exception) {
                     Log.e(tag, "Error processing face channel", e)
                 }
@@ -489,7 +510,10 @@ class DualCameraController(
                     val satBuffer = yPlane.buffer.duplicate().apply { position(0) }
                     fingerSaturationPct = computeSaturationPct(satBuffer, roi, rowStride)
 
-                    fingerLuma.let { _fingerWave.tryEmit(it) }
+                    fingerLuma?.let { 
+                        _fingerWave.tryEmit(it)
+                        Log.v(tag, "Finger luma: $it")
+                    }
                 } catch (e: Exception) {
                     Log.e(tag, "Error processing finger channel", e)
                 }

@@ -13,6 +13,7 @@ import com.vivopulse.feature.capture.camera.CameraMode
 import com.vivopulse.feature.capture.camera.SequentialPrimary
 import com.vivopulse.feature.capture.RecordingResult
 import com.vivopulse.feature.capture.model.Frame
+import com.vivopulse.feature.capture.model.Source
 import com.vivopulse.feature.capture.roi.FaceRoi
 import com.vivopulse.feature.processing.realtime.QualityStatus
 import com.vivopulse.feature.processing.realtime.RealTimeQualityEngine
@@ -45,6 +46,10 @@ object SharedRecordingState {
     val lastProcessedSignals: StateFlow<List<com.vivopulse.signal.ProcessedSignal>?> = _lastProcessedSignals.asStateFlow()
     
     fun setRecordingResult(result: RecordingResult, signals: List<com.vivopulse.signal.ProcessedSignal>) {
+        Log.d(
+            "SharedRecordingState",
+            "setRecordingResult(): frames=${result.frames.size}, faceFrames=${result.frames.count { it.source == Source.FACE }}, fingerFrames=${result.frames.count { it.source == Source.FINGER }}, signals=${signals.size}"
+        )
         _lastRecordingResult.value = result
         _lastProcessedSignals.value = signals
     }
@@ -241,6 +246,17 @@ class CaptureViewModel @Inject constructor(
 
         _isRecording.value = false
         val result = cameraController.stopRecording()
+        Log.d(tag, "stopRecording(): frames=${result.frames.size}, durationMs=${result.stats.durationMs}")
+        Log.d(
+            tag,
+            "stopRecording(): faceReceived=${result.stats.faceStats.framesReceived}, fingerReceived=${result.stats.fingerStats.framesReceived}"
+        )
+        if (result.frames.isEmpty()) {
+            Log.w(tag, "stopRecording(): recording result is empty – no frames captured")
+        }
+        if (recordedSignals.isEmpty()) {
+            Log.w(tag, "stopRecording(): recordedSignals buffer empty during session")
+        }
         _lastRecordingResult.value = result
         _recordingDuration.value = 0L
         

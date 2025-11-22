@@ -385,24 +385,51 @@ class ProcessingViewModel @Inject constructor(
         val faceFrames = recordingResult.frames.filter { it.source == Source.FACE && it.hasLuma() }
         val fingerFrames = recordingResult.frames.filter { it.source == Source.FINGER && it.hasLuma() }
         
-        if (faceFrames.isEmpty() || fingerFrames.isEmpty()) {
-            // No luma data available, fall back to synthetic
+        Log.d(tag, "processRealFrames: ${faceFrames.size} face frames, ${fingerFrames.size} finger frames")
+        
+        // Check if we have data from at least one channel
+        if (faceFrames.isEmpty() && fingerFrames.isEmpty()) {
+            Log.w(tag, "No luma data available in any channel, falling back to synthetic")
             return generateSyntheticData()
         }
         
-        // Build time series from luma values
-        val faceData = faceFrames.map { frame ->
-            TimestampedValue(
-                timestampNs = frame.timestampNs,
-                value = frame.faceLuma ?: 0.0
-            )
+        // For sequential mode: if one channel is empty, generate synthetic for that channel
+        val faceData = if (faceFrames.isNotEmpty()) {
+            faceFrames.map { frame ->
+                TimestampedValue(
+                    timestampNs = frame.timestampNs,
+                    value = frame.faceLuma ?: 0.0
+                )
+            }
+        } else {
+            Log.w(tag, "No face frames, generating synthetic face data")
+            // Generate synthetic face data matching finger timeline
+            val fingerTimes = fingerFrames.map { it.timestampNs }
+            fingerTimes.mapIndexed { i, ts ->
+                TimestampedValue(
+                    timestampNs = ts,
+                    value = 128.0 + 10.0 * kotlin.math.sin(i * 0.1) // Simple sine wave
+                )
+            }
         }
         
-        val fingerData = fingerFrames.map { frame ->
-            TimestampedValue(
-                timestampNs = frame.timestampNs,
-                value = frame.fingerLuma ?: 0.0
-            )
+        val fingerData = if (fingerFrames.isNotEmpty()) {
+            fingerFrames.map { frame ->
+                TimestampedValue(
+                    timestampNs = frame.timestampNs,
+                    value = frame.fingerLuma ?: 0.0
+                )
+            }
+        } else {
+            Log.w(tag, "No finger frames, generating synthetic finger data")
+            // Generate synthetic finger data matching face timeline
+            val faceTimes = faceFrames.map { it.timestampNs }
+            faceTimes.mapIndexed { i, ts ->
+                TimestampedValue(
+                    timestampNs = ts,
+                    value = 128.0 + 10.0 * kotlin.math.sin(i * 0.1 + 0.5) // Offset sine wave
+                )
+            }
         }
         
         val rawBuffer = RawSeriesBuffer(faceData, fingerData)
@@ -417,6 +444,7 @@ class ProcessingViewModel @Inject constructor(
      * Uses current simulation configuration.
      */
     private fun generateSyntheticData(): ProcessedSeries {
+        Log.w(tag, "generateSyntheticData(): using simulated PPG for both channels")
         // Use simulated frame source with current config
         val simulator = SimulatedFrameSource(_simulationConfig.value)
         val rawBuffer = simulator.generateSignals()
