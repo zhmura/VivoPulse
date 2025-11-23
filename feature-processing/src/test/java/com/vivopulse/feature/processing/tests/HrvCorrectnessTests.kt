@@ -30,8 +30,24 @@ class HrvCorrectnessTests {
         )
         // High quality to enable HRV computation
         val quality = QualityReport(
-            faceSQI = ChannelSQI(90.0, 0.0, 0.0, 0.0, 100.0, 10),
-            fingerSQI = ChannelSQI(90.0, 0.0, 0.0, 0.0, 100.0, 10),
+            faceSQI = ChannelSQI(
+                score = 90.0,
+                snr = 0.0,
+                snrScore = 0.0,
+                peakRegularity = 0.0,
+                motionScore = 100.0,
+                imuScore = 100.0,
+                peakCount = 10
+            ),
+            fingerSQI = ChannelSQI(
+                score = 90.0,
+                snr = 0.0,
+                snrScore = 0.0,
+                peakRegularity = 0.0,
+                motionScore = 100.0,
+                imuScore = 100.0,
+                peakCount = 10
+            ),
             combinedScore = 90.0,
             pttConfidence = 90.0,
             isGoodQuality = true,

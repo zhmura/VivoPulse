@@ -29,8 +29,8 @@ class MedicalWordingCheck {
         var dir: File? = File(System.getProperty("user.dir"))
         var steps = 0
         while (dir != null && steps < 7) {
-            if (File(dir, "settings.gradle.kts").exists()) return dir
-            dir = dir.parentFile
+            if (File(dir!!, "settings.gradle.kts").exists()) return dir!!
+            dir = dir!!.parentFile
             steps++
         }
         return File(System.getProperty("user.dir"))

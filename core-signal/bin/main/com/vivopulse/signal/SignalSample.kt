@@ -12,6 +12,7 @@ data class SignalSample(
     val fingerMeanLuma: Double? = null,
     val faceMotionRmsPx: Double? = null,
     val fingerSaturationPct: Double? = null,
+    val imuRmsG: Double? = null,
     val torchEnabled: Boolean = false
 )
 

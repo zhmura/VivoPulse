@@ -24,6 +24,7 @@ data class ProcessedSignal(
     // New Robustness Metrics
     val faceMotionRms: Double = 0.0,
     val fingerSaturationPct: Double = 0.0,
+    val imuRmsG: Double = 0.0,
     val snrDb: Double = 0.0,
     val faceSqi: Int = 100,
     val fingerSqi: Int = 100,

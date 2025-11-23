@@ -162,10 +162,27 @@ class SignalQualityTest {
     }
     
     @Test
+    fun `computeChannelSQI - with IMU penalty`() {
+        val signal = DspFunctions.generateSineWave(1.2, 10.0, 100.0, amplitude = 1.0)
+        val normalized = DspFunctions.zscoreNormalize(signal)
+        
+        // With high IMU score (stable)
+        val sqiStable = SignalQuality.computeChannelSQI(normalized, 100.0, imuScore = 100.0)
+        
+        // With low IMU score (shaky)
+        val sqiShaky = SignalQuality.computeChannelSQI(normalized, 100.0, imuScore = 40.0)
+        
+        // IMU penalty should reduce score
+        assertTrue("IMU penalty should reduce score", sqiShaky.score < sqiStable.score)
+        
+        println("SQI stable: ${sqiStable.score}, shaky: ${sqiShaky.score}")
+    }
+    
+    @Test
     fun `computePttConfidence - good signals high confidence`() {
         // Good quality both channels
-        val faceSQI = ChannelSQI(85.0, 15.0, 85.0, 90.0, 95.0, 12)
-        val fingerSQI = ChannelSQI(80.0, 12.0, 80.0, 85.0, 100.0, 11)
+        val faceSQI = ChannelSQI(85.0, 15.0, 85.0, 90.0, 95.0, 100.0, 12)
+        val fingerSQI = ChannelSQI(80.0, 12.0, 80.0, 85.0, 100.0, 100.0, 11)
         val correlation = 0.95
         
         val confidence = SignalQuality.computePttConfidence(faceSQI, fingerSQI, correlation)
@@ -179,8 +196,8 @@ class SignalQualityTest {
     @Test
     fun `computePttConfidence - poor signals low confidence`() {
         // Poor quality channels
-        val faceSQI = ChannelSQI(45.0, 2.0, 40.0, 50.0, 60.0, 5)
-        val fingerSQI = ChannelSQI(50.0, 3.0, 45.0, 55.0, 100.0, 6)
+        val faceSQI = ChannelSQI(45.0, 2.0, 40.0, 50.0, 60.0, 60.0, 5)
+        val fingerSQI = ChannelSQI(50.0, 3.0, 45.0, 55.0, 100.0, 100.0, 6)
         val correlation = 0.4
         
         val confidence = SignalQuality.computePttConfidence(faceSQI, fingerSQI, correlation)

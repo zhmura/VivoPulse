@@ -260,6 +260,11 @@ class ProcessingViewModel @Inject constructor(
             
             try {
                 val path = withContext(Dispatchers.IO) {
+                    // Get recording stats if available
+                    val recordingStats = SharedRecordingState.lastRecordingResult.value?.stats
+                    val faceFps = recordingStats?.faceStats?.averageFps ?: 30f
+                    val fingerFps = recordingStats?.fingerStats?.averageFps ?: 30f
+                    
                     // Create metadata
                     val metadata = SessionMetadata(
                         appVersion = "1.0.0",
@@ -280,9 +285,9 @@ class ProcessingViewModel @Inject constructor(
                         pttStabilityMs = ptt.stabilityMs,
                         pttConfidence = quality.pttConfidence,
                         pttQuality = ptt.getQuality().name,
-                        faceFps = 30f, // TODO: Get from actual capture
-                        fingerFps = 30f,
-                        driftMsPerSecond = 0.0 // TODO: Get from actual capture
+                        faceFps = faceFps,
+                        fingerFps = fingerFps,
+                        driftMsPerSecond = 0.0 // Drift calculation requires clock sync analysis
                     )
                     
                     // Find peaks for marking

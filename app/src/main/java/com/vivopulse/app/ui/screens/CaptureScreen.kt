@@ -273,35 +273,71 @@ fun CaptureScreen(
                         horizontalArrangement = Arrangement.spacedBy(4.dp)
                     ) {
                         CameraPreviewCard(
-                            title = "Face (Front) - ${faceWave.size} pts",
+                            title = "Face (Front)",
                             modifier = Modifier
                                 .weight(1f)
                                 .fillMaxHeight(),
                             showRoiOverlay = true,
                             faceRoi = faceRoi,
-                            waveform = faceWave
+                            waveform = faceWave,
+                            quality = qualityState?.face
                         ) { previewView ->
                             frontPreviewView = previewView
                         }
                         
                         CameraPreviewCard(
-                            title = "Finger (Back) - ${fingerWave.size} pts",
+                            title = "Finger (Back)",
                             modifier = Modifier
                                 .weight(1f)
                                 .fillMaxHeight(),
                             showTorchIndicator = torchEnabled,
-                            waveform = fingerWave
+                            waveform = fingerWave,
+                            quality = qualityState?.finger
                         ) { previewView ->
                             backPreviewView = previewView
                         }
                     }
                     
                     // Compact controls at bottom
-                    Card(
+                    Column(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(4.dp)
+                            .background(MaterialTheme.colorScheme.surface)
                     ) {
+                        qualityState?.tip?.let {
+                            Card(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 8.dp, vertical = 4.dp),
+                                colors = CardDefaults.cardColors(
+                                    containerColor = MaterialTheme.colorScheme.secondaryContainer
+                                )
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(8.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Icon(
+                                        Icons.Default.Lightbulb,
+                                        contentDescription = null,
+                                        modifier = Modifier.size(16.dp),
+                                        tint = MaterialTheme.colorScheme.onSecondaryContainer
+                                    )
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Text(
+                                        text = it,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSecondaryContainer
+                                    )
+                                }
+                            }
+                        }
+                        
+                        Card(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(4.dp)
+                        ) {
                         Column(
                             modifier = Modifier.padding(8.dp),
                             horizontalAlignment = Alignment.CenterHorizontally
@@ -375,6 +411,7 @@ fun CaptureScreen(
                         }
                     }
                 }
+                }
             }
             
             if (showDebugMenu) {
@@ -395,16 +432,26 @@ fun CameraPreviewCard(
     showRoiOverlay: Boolean = false,
     faceRoi: com.vivopulse.feature.capture.roi.FaceRoi? = null,
     waveform: List<Double>? = null,
+    quality: ChannelQualityIndicator? = null,
     onPreviewViewCreated: (PreviewView) -> Unit = {}
 ) {
+    val cardColor = quality?.status?.let { 
+        when(it) {
+            QualityStatus.GREEN -> MaterialTheme.colorScheme.primaryContainer
+            QualityStatus.YELLOW -> MaterialTheme.colorScheme.tertiaryContainer
+            QualityStatus.RED -> MaterialTheme.colorScheme.errorContainer
+        }
+    } ?: MaterialTheme.colorScheme.surfaceVariant
+
     Card(
         modifier = modifier,
-        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp),
+        colors = CardDefaults.cardColors(containerColor = cardColor)
     ) {
         Column(modifier = Modifier.fillMaxSize()) {
             Surface(
                 modifier = Modifier.fillMaxWidth(),
-                color = MaterialTheme.colorScheme.primaryContainer
+                color = cardColor.copy(alpha = 0.8f)
             ) {
                 Row(
                     modifier = Modifier.padding(4.dp),
@@ -414,15 +461,24 @@ fun CameraPreviewCard(
                     Text(
                         text = title,
                         style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onPrimaryContainer
+                        color = MaterialTheme.colorScheme.onSurface
                     )
-                    if (showTorchIndicator) {
-                        Icon(
-                            imageVector = Icons.Default.FlashlightOn,
-                            contentDescription = "Torch on",
-                            tint = MaterialTheme.colorScheme.tertiary,
-                            modifier = Modifier.size(12.dp)
-                        )
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        if (quality?.snrDb != null) {
+                            Text(
+                                text = "${String.format("%.1f", quality.snrDb)} dB",
+                                style = MaterialTheme.typography.labelSmall,
+                                modifier = Modifier.padding(end = 4.dp)
+                            )
+                        }
+                        if (showTorchIndicator) {
+                            Icon(
+                                imageVector = Icons.Default.FlashlightOn,
+                                contentDescription = "Torch on",
+                                tint = MaterialTheme.colorScheme.onSurface,
+                                modifier = Modifier.size(12.dp)
+                            )
+                        }
                     }
                 }
             }
@@ -492,12 +548,13 @@ fun CameraPreviewCard(
                         val data = waveform
                         val minV = data.minOrNull() ?: 0.0
                         val maxV = data.maxOrNull() ?: 1.0
-                        val range = (maxV - minV).let { if (it < 1e-9) 1.0 else it }
+                        val actualRange = maxV - minV
+                        val range = kotlin.math.max(actualRange, 10.0) // Minimum range of 10.0 to prevent noise jumping
                         val count = data.size
                         for (i in data.indices) {
                             val x = (i.toFloat() / (count - 1).coerceAtLeast(1)) * w
                             val yNorm = ((data[i] - minV) / range).toFloat()
-                            val y = h - (yNorm * h * 0.4f + h * 0.05f)
+                            val y = h - (yNorm * h * 0.4f + h * 0.3f) // centered vertically
                             if (i == 0) path.moveTo(x, y) else path.lineTo(x, y)
                         }
                         drawPath(

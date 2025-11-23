@@ -50,6 +50,9 @@ internal class CameraBindingHelper(
             CameraMode.CONCURRENT, CameraMode.SAFE_MODE_REDUCED -> {
                 bindConcurrent(provider, lifecycleOwner, frontPreviewView, backPreviewView, resolution)
             }
+            CameraMode.SAFE_MODE_ANALYSIS_ONLY -> {
+                bindAnalysisOnly(provider, lifecycleOwner, resolution)
+            }
             CameraMode.SAFE_MODE_SEQUENTIAL -> {
                 bindSequential(
                     provider = provider,
@@ -131,6 +134,60 @@ internal class CameraBindingHelper(
         }
     }
     
+    /**
+     * Bind both cameras in analysis-only mode (no preview).
+     */
+    private fun bindAnalysisOnly(
+        provider: ProcessCameraProvider,
+        lifecycleOwner: LifecycleOwner,
+        resolution: Size
+    ): Pair<androidx.camera.core.Camera?, androidx.camera.core.Camera?>? {
+        return try {
+            // Front Analysis
+            val frontAnalysis = ImageAnalysis.Builder()
+                .setTargetResolution(resolution)
+                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
+                .build()
+                .also { 
+                    it.setAnalyzer(executor, com.vivopulse.feature.capture.analysis.SafeImageAnalyzer { img -> 
+                        processFrame(img, Source.FACE) 
+                    })
+                }
+            
+            val frontCamera = provider.bindToLifecycle(
+                lifecycleOwner,
+                CameraSelector.DEFAULT_FRONT_CAMERA,
+                frontAnalysis
+            )
+            
+            // Back Analysis
+            val backAnalysis = ImageAnalysis.Builder()
+                .setTargetResolution(resolution)
+                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
+                .build()
+                .also { 
+                    it.setAnalyzer(executor, com.vivopulse.feature.capture.analysis.SafeImageAnalyzer { img -> 
+                        processFrame(img, Source.FINGER) 
+                    })
+                }
+            
+            val backCamera = provider.bindToLifecycle(
+                lifecycleOwner,
+                CameraSelector.DEFAULT_BACK_CAMERA,
+                backAnalysis
+            )
+            
+            Log.d(tag, "Analysis-only binding successful at $resolution")
+            Pair(frontCamera, backCamera)
+            
+        } catch (e: Exception) {
+            Log.w(tag, "Analysis-only binding failed at $resolution", e)
+            null
+        }
+    }
+
     /**
      * Bind cameras sequentially (back camera only for now).
      */

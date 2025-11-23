@@ -17,17 +17,15 @@ class PTTConsensus {
         face: DoubleArray,
         finger: DoubleArray,
         fsHz: Double,
+        hrFaceBpm: Double,
+        hrFingerBpm: Double,
         @Suppress("UNUSED_PARAMETER") segment: Window
     ): ConsensusPtt {
         // Method A: XCorr lag
         // We can reuse SyncMetrics logic but we need just the lag
         // Assuming face and finger are already windowed to 'segment'
         
-        // Placeholder HRs
-        val hrFace = 60.0
-        val hrFinger = 60.0
-        
-        val syncResult = SyncMetrics.computeMetrics(face, finger, hrFace, hrFinger, fsHz)
+        val syncResult = SyncMetrics.computeMetrics(face, finger, hrFaceBpm, hrFingerBpm, fsHz)
         val pttXCorr = syncResult.lagMs
         
         // Method B: Foot-to-Foot
@@ -76,18 +74,56 @@ class PTTConsensus {
     }
     
     private fun detectFeet(signal: DoubleArray, fsHz: Double): List<Double> {
-        // Simple derivative-based onset detection
-        // d/dt max is the systolic upstroke.
-        // Foot is 10-20% of max d/dt? Or min point before max d/dt?
-        // Let's use local minima.
+        if (signal.size < 3) return emptyList()
+        
+        // 1. Compute 1st derivative (central difference)
+        val diff = DoubleArray(signal.size)
+        for (i in 1 until signal.size - 1) {
+            diff[i] = (signal[i + 1] - signal[i - 1]) / 2.0
+        }
+        
+        // 2. Find max d/dt (steepest systolic upstroke)
+        val maxSlope = diff.maxOrNull() ?: return emptyList()
+        val slopeThreshold = maxSlope * 0.15 // 15% of max slope
         
         val feet = mutableListOf<Double>()
-        for (i in 1 until signal.size - 1) {
-            if (signal[i] < signal[i-1] && signal[i] < signal[i+1]) {
-                // Local minimum
-                feet.add((i / fsHz) * 1000.0)
+        
+        // 3. Find feet
+        // Look for local maxima in derivative that exceed threshold
+        var i = 1
+        while (i < diff.size - 1) {
+            // Check if i is a local max of derivative and exceeds threshold
+            if (diff[i] > slopeThreshold && diff[i] >= diff[i-1] && diff[i] >= diff[i+1]) {
+                
+                // This is a systolic upstroke peak velocity.
+                // The foot is the minimum value point preceding this upstroke.
+                // Search backwards for local minimum in the signal.
+                // Limit search window to e.g. 300ms (30 samples)
+                
+                val searchLimit = 30
+                var bestK = i
+                var minVal = signal[i]
+                
+                for (k in i downTo maxOf(0, i - searchLimit)) {
+                    if (signal[k] <= minVal) {
+                        minVal = signal[k]
+                        bestK = k
+                    } else {
+                        // If signal rises significantly backwards, we left the foot valley.
+                        // But noisy signals might fluctuate.
+                        // Simple approach: absolute minimum in the window.
+                    }
+                }
+                
+                feet.add((bestK / fsHz) * 1000.0)
+                
+                // Skip forward to avoid detecting same beat
+                i += 30
+            } else {
+                i++
             }
         }
+        
         return feet
     }
     

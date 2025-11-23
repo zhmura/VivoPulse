@@ -162,48 +162,56 @@ object SignalQuality {
     /**
      * Compute per-channel Signal Quality Index.
      * 
-     * Combines SNR, peak regularity, and motion (for face).
- *
- * Literature alignment:
- * - SNR-like band vs off-band energy proxy
- * - Peak regularity via RR variability (CV)
- * - Optional motion penalty for face camera
- *
- * Safety:
- * - SQI/Confidence are conservative gates; advanced metrics are suppressed when low.
-     * 
+     * Combines SNR, peak regularity, motion (for face), and IMU stability.
+     *
      * @param signal Processed signal
      * @param sampleRateHz Sample rate
      * @param motionScore Optional motion score (0-100)
+     * @param imuScore Optional IMU stability score (0-100)
      * @return SQI score (0-100)
      */
     fun computeChannelSQI(
         signal: DoubleArray,
         sampleRateHz: Double,
-        motionScore: Double? = null
+        motionScore: Double? = null,
+        imuScore: Double? = null
     ): ChannelSQI {
         val snr = computeSNR(signal, sampleRateHz)
         val regularity = computePeakRegularity(signal, sampleRateHz)
         val motion = motionScore ?: 100.0
+        val imu = imuScore ?: 100.0
         
         // Convert SNR to 0-100 score
         // SNR 20 dB = excellent = 100
-        // SNR 10 dB = good = 80
-        // SNR 5 dB = fair = 60
-        // SNR 0 dB = poor = 40
-        // SNR -5 dB = very poor = 20
         val snrScore = max(0.0, min(100.0, (snr + 5.0) * 4.0))
         
         // Weighted combination
-        val weights = if (motionScore != null) {
-            mapOf("snr" to 0.4, "regularity" to 0.3, "motion" to 0.3)
-        } else {
-            mapOf("snr" to 0.6, "regularity" to 0.4, "motion" to 0.0)
+        val weights = mutableMapOf(
+            "snr" to 0.5,
+            "regularity" to 0.3,
+            "motion" to 0.0,
+            "imu" to 0.0
+        )
+        
+        if (motionScore != null) {
+            weights["snr"] = 0.4
+            weights["regularity"] = 0.2
+            weights["motion"] = 0.2
+            weights["imu"] = 0.2
+        } else if (imuScore != null) {
+            weights["snr"] = 0.4
+            weights["regularity"] = 0.3
+            weights["imu"] = 0.3
         }
         
-        val combinedScore = weights["snr"]!! * snrScore +
-                           weights["regularity"]!! * regularity +
-                           weights["motion"]!! * motion
+        // Normalize weights
+        val sumWeights = weights.values.sum()
+        val normWeights = weights.mapValues { it.value / sumWeights }
+        
+        val combinedScore = normWeights["snr"]!! * snrScore +
+                           normWeights["regularity"]!! * regularity +
+                           normWeights["motion"]!! * motion +
+                           normWeights["imu"]!! * imu
         
         return ChannelSQI(
             score = combinedScore,
@@ -211,6 +219,7 @@ object SignalQuality {
             snrScore = snrScore,
             peakRegularity = regularity,
             motionScore = motion,
+            imuScore = imu,
             peakCount = findPeaks(signal, minDistance = (sampleRateHz * 0.4).toInt()).size
         )
     }
@@ -249,7 +258,8 @@ data class ChannelSQI(
     val snr: Double,                // SNR in dB
     val snrScore: Double,           // SNR as 0-100 score
     val peakRegularity: Double,     // Regularity score 0-100
-    val motionScore: Double,        // Motion score 0-100 (higher = less motion)
+    val motionScore: Double,        // Motion score 0-100
+    val imuScore: Double,           // IMU stability score 0-100
     val peakCount: Int             // Number of detected peaks
 ) {
     /**

@@ -1,53 +1,42 @@
 package com.vivopulse.feature.capture.analysis
 
 import androidx.camera.core.ImageProxy
-import org.junit.Assert.assertTrue
+import io.mockk.mockk
+import io.mockk.verify
 import org.junit.Test
-import java.lang.reflect.Proxy
-import java.util.concurrent.atomic.AtomicBoolean
+import java.lang.RuntimeException
 
 class SafeImageAnalyzerTest {
 
     @Test
-    fun closesImageOnException() {
-        val analyzer = SafeImageAnalyzer { throw RuntimeException("boom") }
-        val closed = AtomicBoolean(false)
-        val proxy = proxyImageProxy { closed.set(true) }
-        try {
-            analyzer.analyze(proxy)
-        } catch (_: RuntimeException) {
+    fun `analyze calls close on image after processing`() {
+        val mockImage = mockk<ImageProxy>(relaxed = true)
+        var processed = false
+        
+        val analyzer = SafeImageAnalyzer {
+            processed = true
         }
-        assertTrue(closed.get())
+        
+        analyzer.analyze(mockImage)
+        
+        assert(processed)
+        verify(exactly = 1) { mockImage.close() }
     }
 
-    private fun proxyImageProxy(onClose: () -> Unit): ImageProxy {
-        val handler = java.lang.reflect.InvocationHandler { _, method, _ ->
-            when (method.name) {
-                "close" -> {
-                    onClose()
-                    Unit
-                }
-                "toString" -> "FakeImageProxy"
-                "hashCode" -> 0
-                "equals" -> false
-                else -> {
-                    when (method.returnType) {
-                        java.lang.Boolean.TYPE -> false
-                        java.lang.Integer.TYPE -> 0
-                        java.lang.Long.TYPE -> 0L
-                        java.lang.Float.TYPE -> 0f
-                        java.lang.Double.TYPE -> 0.0
-                        else -> null
-                    }
-                }
-            }
+    @Test
+    fun `analyze calls close on image even if processing throws`() {
+        val mockImage = mockk<ImageProxy>(relaxed = true)
+        
+        val analyzer = SafeImageAnalyzer {
+            throw RuntimeException("Processing failed")
         }
-        return Proxy.newProxyInstance(
-            ImageProxy::class.java.classLoader,
-            arrayOf(ImageProxy::class.java),
-            handler
-        ) as ImageProxy
+        
+        try {
+            analyzer.analyze(mockImage)
+        } catch (e: RuntimeException) {
+            // Expected
+        }
+        
+        verify(exactly = 1) { mockImage.close() }
     }
 }
-
-

@@ -23,8 +23,8 @@ object QualityAssessment {
     ): QualityReport {
         if (!processedSeries.isValid) {
             return QualityReport(
-                faceSQI = ChannelSQI(0.0, 0.0, 0.0, 0.0, 100.0, 0),
-                fingerSQI = ChannelSQI(0.0, 0.0, 0.0, 0.0, 100.0, 0),
+                faceSQI = ChannelSQI(0.0, 0.0, 0.0, 0.0, 100.0, 100.0, 0),
+                fingerSQI = ChannelSQI(0.0, 0.0, 0.0, 0.0, 100.0, 100.0, 0),
                 combinedScore = 0.0,
                 pttConfidence = 0.0,
                 isGoodQuality = false,
@@ -33,17 +33,27 @@ object QualityAssessment {
             )
         }
         
+        // Compute IMU score
+        val imuScore = if (processedSeries.imuRmsG.isNotEmpty()) {
+            val stableSamples = processedSeries.imuRmsG.count { it < 0.05 }
+            (stableSamples.toDouble() / processedSeries.imuRmsG.size) * 100.0
+        } else {
+            null
+        }
+
         // Compute per-channel SQI
         val faceSQI = SignalQuality.computeChannelSQI(
             processedSeries.faceSignal,
             processedSeries.sampleRateHz,
-            motionScore = faceMotionScore
+            motionScore = faceMotionScore,
+            imuScore = imuScore
         )
         
         val fingerSQI = SignalQuality.computeChannelSQI(
             processedSeries.fingerSignal,
             processedSeries.sampleRateHz,
-            motionScore = null // No motion tracking for finger
+            motionScore = null, // No motion tracking for finger
+            imuScore = imuScore
         )
         
         // Compute PTT confidence

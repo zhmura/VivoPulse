@@ -20,6 +20,7 @@ data class ChannelQualityIndicator(
     val snrDb: Double?,
     val saturationPct: Double?,
     val motionRmsPx: Double?,
+    val imuRmsG: Double?,
     val hrEstimateBpm: Double?,
     val acDcRatio: Double?,
     val sparkline: List<Double>,
@@ -52,6 +53,7 @@ class RealTimeQualityEngine(
     private val fingerBuffer = RingBufferDouble(bufferCapacity)
     private val faceMotionBuffer = RingBufferDouble(bufferCapacity)
     private val fingerSaturationBuffer = RingBufferDouble(bufferCapacity)
+    private val imuBuffer = RingBufferDouble(bufferCapacity)
 
     private var lastEmitMs = 0L
     private var lastTorchEnabled = false
@@ -62,6 +64,7 @@ class RealTimeQualityEngine(
         sample.fingerMeanLuma?.let { fingerBuffer.add(it, sample.timestampNs) }
         sample.faceMotionRmsPx?.let { faceMotionBuffer.add(it, sample.timestampNs) }
         sample.fingerSaturationPct?.let { fingerSaturationBuffer.add(it, sample.timestampNs) }
+        sample.imuRmsG?.let { imuBuffer.add(it, sample.timestampNs) }
         lastTorchEnabled = sample.torchEnabled
 
         val nowMs = sample.timestampNs / 1_000_000
@@ -71,24 +74,53 @@ class RealTimeQualityEngine(
 
         val faceWindow = faceBuffer.snapshot(windowNs)
         val fingerWindow = fingerBuffer.snapshot(windowNs)
-        if (faceWindow == null || fingerWindow == null) return null
-        if (faceWindow.values.size < 60 || fingerWindow.values.size < 60) return null
+        
+        // In sequential mode, one buffer might be empty. We should still emit what we have.
+        val hasFace = faceWindow != null && faceWindow.values.size >= 30 // Reduced requirement
+        val hasFinger = fingerWindow != null && fingerWindow.values.size >= 30
+        
+        if (!hasFace && !hasFinger) return null
 
         val faceMotion = faceMotionBuffer.snapshot(windowNs)?.values?.average()
         val fingerSat = fingerSaturationBuffer.snapshot(windowNs)?.values?.average()
+        val imuRms = imuBuffer.snapshot(windowNs)?.values?.average()
 
-        val faceIndicator = computeChannelIndicator(
-            channel = ChannelType.FACE,
-            window = faceWindow,
-            auxMetric = faceMotion,
-            saturationMetric = null
-        )
-        val fingerIndicator = computeChannelIndicator(
-            channel = ChannelType.FINGER,
-            window = fingerWindow,
-            auxMetric = fingerSat,
-            saturationMetric = fingerSat
-        )
+        val faceIndicator = if (hasFace && faceWindow != null) {
+            computeChannelIndicator(
+                channel = ChannelType.FACE,
+                window = faceWindow,
+                auxMetric = faceMotion,
+                saturationMetric = null,
+                imuMetric = imuRms
+            )
+        } else {
+            // Placeholder for inactive channel
+            ChannelQualityIndicator(
+                channel = ChannelType.FACE,
+                status = QualityStatus.GREEN, // Default to green to not alarm
+                snrDb = null, saturationPct = null, motionRmsPx = null, 
+                imuRmsG = null, hrEstimateBpm = null, acDcRatio = null, 
+                sparkline = emptyList(), diagnostics = listOf("Inactive")
+            )
+        }
+
+        val fingerIndicator = if (hasFinger && fingerWindow != null) {
+            computeChannelIndicator(
+                channel = ChannelType.FINGER,
+                window = fingerWindow,
+                auxMetric = fingerSat,
+                saturationMetric = fingerSat,
+                imuMetric = imuRms
+            )
+        } else {
+            ChannelQualityIndicator(
+                channel = ChannelType.FINGER,
+                status = QualityStatus.GREEN,
+                snrDb = null, saturationPct = null, motionRmsPx = null,
+                imuRmsG = null, hrEstimateBpm = null, acDcRatio = null,
+                sparkline = emptyList(), diagnostics = listOf("Inactive")
+            )
+        }
 
         val hrDelta = if (faceIndicator.hrEstimateBpm != null && fingerIndicator.hrEstimateBpm != null) {
             abs(faceIndicator.hrEstimateBpm - fingerIndicator.hrEstimateBpm)
@@ -127,7 +159,8 @@ class RealTimeQualityEngine(
         channel: ChannelType,
         window: RingBufferDouble.SignalWindow,
         auxMetric: Double?,
-        saturationMetric: Double?
+        saturationMetric: Double?,
+        imuMetric: Double?
     ): ChannelQualityIndicator {
         val fsHz = window.sampleRateHz()
         val detrended = DspFunctions.detrend(window.values)
@@ -143,8 +176,8 @@ class RealTimeQualityEngine(
         val sparkline = window.normalized()
 
         val (status, diagnostics) = when (channel) {
-            ChannelType.FACE -> evaluateFaceStatus(snrDb, auxMetric, hr)
-            ChannelType.FINGER -> evaluateFingerStatus(snrDb, saturationMetric, hr)
+            ChannelType.FACE -> evaluateFaceStatus(snrDb, auxMetric, imuMetric, hr)
+            ChannelType.FINGER -> evaluateFingerStatus(snrDb, saturationMetric, imuMetric, hr)
         }
 
         return ChannelQualityIndicator(
@@ -153,6 +186,7 @@ class RealTimeQualityEngine(
             snrDb = snrDb,
             saturationPct = if (channel == ChannelType.FINGER) saturationMetric else null,
             motionRmsPx = if (channel == ChannelType.FACE) auxMetric else null,
+            imuRmsG = imuMetric,
             hrEstimateBpm = hr,
             acDcRatio = acDc,
             sparkline = sparkline,
@@ -180,6 +214,7 @@ class RealTimeQualityEngine(
     private fun evaluateFaceStatus(
         snrDb: Double?,
         motion: Double?,
+        imu: Double?,
         hr: Double?
     ): Pair<QualityStatus, List<String>> {
         val diagnostics = mutableListOf<String>()
@@ -202,6 +237,11 @@ class RealTimeQualityEngine(
                 status = degrade(status, QualityStatus.YELLOW)
             }
         }
+        
+        if (imu != null && imu > 0.05) {
+            diagnostics.add("High device motion")
+            status = degrade(status, QualityStatus.YELLOW)
+        }
 
         if (hr == null) {
             diagnostics.add("Face HR unresolved")
@@ -214,6 +254,7 @@ class RealTimeQualityEngine(
     private fun evaluateFingerStatus(
         snrDb: Double?,
         saturationPct: Double?,
+        imu: Double?,
         hr: Double?
     ): Pair<QualityStatus, List<String>> {
         val diagnostics = mutableListOf<String>()
@@ -238,6 +279,11 @@ class RealTimeQualityEngine(
                     status = degrade(status, QualityStatus.YELLOW)
                 }
             }
+        }
+        
+        if (imu != null && imu > 0.05) {
+            diagnostics.add("High device motion")
+            status = degrade(status, QualityStatus.YELLOW)
         }
 
         if (hr == null) {

@@ -21,7 +21,7 @@ data class RoiStats(
     val imuRmsG: Double
 )
 
-class GoodSyncDetector {
+open class GoodSyncDetector {
 
     fun detectGoodSyncWindows(
         face: DoubleArray,

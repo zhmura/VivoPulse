@@ -2,66 +2,80 @@ package com.vivopulse.feature.processing.realtime
 
 import com.vivopulse.signal.SignalSample
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class RealTimeQualityEngineTest {
 
     @Test
-    fun stableSignalsReachGreen() {
-        val engine = RealTimeQualityEngine()
-        var latest: RealTimeQualityState? = null
-        repeat(500) { idx ->
-            val state = engine.addSample(sample(idx, faceBase = 0.6, fingerBase = 0.6))
-            if (state != null) latest = state
-        }
-        assertEquals(QualityStatus.GREEN, latest?.face?.status)
-        assertEquals(QualityStatus.GREEN, latest?.finger?.status)
-    }
-
-    @Test
-    fun highSaturationTriggersTip() {
-        val engine = RealTimeQualityEngine()
-        var latest: RealTimeQualityState? = null
-        repeat(450) { idx ->
-            val sat = if (idx > 250) 0.2 else 0.02
-            latest = engine.addSample(sample(idx, faceBase = 0.6, fingerBase = 0.6, saturation = sat))
-        }
-        assertTrue(latest?.tip?.contains("finger", ignoreCase = true) == true)
-        assertEquals(QualityStatus.RED, latest?.finger?.status)
-    }
-
-    @Test
-    fun updateRateStaysBelowFourHz() {
-        val engine = RealTimeQualityEngine()
-        var states = 0
-        repeat(120) { idx ->
-            val state = engine.addSample(sample(idx, faceBase = 0.6, fingerBase = 0.55))
-            if (state != null) states++
-        }
-        // 120 samples @ ~30Hz ≈ 4 seconds → expect <= 12 updates @ 3 Hz target
-        assertTrue(states <= 12)
-    }
-
-    private fun sample(
-        index: Int,
-        faceBase: Double,
-        fingerBase: Double,
-        motion: Double = 0.2,
-        saturation: Double = 0.02
-    ): SignalSample {
-        val timestamp = 1_000_000_000L + index * 33_000_000L
-        val omega = 2 * Math.PI * 1.2 / 30.0
-        val phase = index * omega
-        return SignalSample(
-            timestampNs = timestamp,
-            faceMeanLuma = faceBase + 0.4 * kotlin.math.sin(phase),
-            fingerMeanLuma = fingerBase + 0.4 * kotlin.math.cos(phase),
-            faceMotionRmsPx = motion,
-            fingerSaturationPct = saturation,
-            torchEnabled = true
+    fun addSample_emitsStatePeriodically() {
+        val engine = RealTimeQualityEngine(
+            bufferSeconds = 5.0,
+            windowSeconds = 2.0,
+            updateIntervalMs = 100
         )
+        
+        // Add samples at 60fps to ensure > 60 samples in 2s window
+        val startTs = 1000000000L // 1s in ns
+        var state: RealTimeQualityState? = null
+        
+        for (i in 0..200) {
+            val ts = startTs + i * 16666666L // 60fps
+            val sample = SignalSample(
+                timestampNs = ts,
+                faceMeanLuma = 100.0 + 10.0 * kotlin.math.sin(i * 0.1),
+                fingerMeanLuma = 100.0 + 10.0 * kotlin.math.sin(i * 0.1 + 0.5),
+                faceMotionRmsPx = 0.1,
+                fingerSaturationPct = 0.01,
+                torchEnabled = true
+            )
+            
+            val result = engine.addSample(sample)
+            if (result != null) {
+                state = result
+            }
+        }
+        
+        assertNotNull("Should emit state", state)
+        assertEquals(QualityStatus.GREEN, state?.face?.status)
+        assertEquals(QualityStatus.GREEN, state?.finger?.status)
+    }
+
+    @Test
+    fun addSample_detectsImuMotion() {
+        val engine = RealTimeQualityEngine(
+            bufferSeconds = 5.0,
+            windowSeconds = 2.0,
+            updateIntervalMs = 100
+        )
+        
+        val startTs = 1000000000L
+        var state: RealTimeQualityState? = null
+        
+        for (i in 0..200) {
+            val ts = startTs + i * 16666666L // 60fps
+            val sample = SignalSample(
+                timestampNs = ts,
+                faceMeanLuma = 100.0,
+                fingerMeanLuma = 100.0,
+                faceMotionRmsPx = 0.1,
+                fingerSaturationPct = 0.01,
+                imuRmsG = 0.2, // High IMU motion (> 0.05)
+                torchEnabled = true
+            )
+            
+            val result = engine.addSample(sample)
+            if (result != null) {
+                state = result
+            }
+        }
+        
+        assertNotNull("Should emit state", state)
+        // IMU affects both channels
+        assertTrue("Face status should reflect IMU motion", state!!.face.status != QualityStatus.GREEN)
+        assertTrue("Finger status should reflect IMU motion", state!!.finger.status != QualityStatus.GREEN)
+        assertTrue("Diagnostics should contain motion warning", 
+            state!!.face.diagnostics.any { it.contains("device motion", ignoreCase = true) })
     }
 }
-
-

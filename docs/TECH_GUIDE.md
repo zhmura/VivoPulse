@@ -1,63 +1,55 @@
 # VivoPulse — Tech Guide (Build & Debug)
 
-## Build
-- CLI:
-  - Debug APK: `./gradlew assembleDebug`
-  - Run unit tests (processing only): `./gradlew :feature-processing:test`
-  - Run all unit tests: `./gradlew test`
-- Android Studio:
-  - Open project root.
-  - Select “app” module, “debug” variant.
-  - Build/Run on a whitelisted device (see README).
+## 1. Build System
 
-## Modules (high level)
-- app: UI (Jetpack Compose), navigation, ViewModels, export
-- feature-processing: DSP, PTT, SQI, wave features, biomarkers, reactivity analyzer
-- feature-capture: dual-camera capture (face/finger), ROI overlays
-- core-signal: low-level DSP utilities, SQI components
-- core-io: export (encrypted ZIP), session.json writer
+The project uses standard Gradle build system. Key modules:
+- `:app` — Main application entry point and UI
+- `:core-signal` — Pure Kotlin signal processing logic
+- `:core-io` — Data export and formatting
+- `:feature-capture` — CameraX implementation and frame processing
+- `:feature-processing` — PTT algorithms and pipeline orchestration
+- `:feature-results` — Results screen and visualization
 
-## Key runtime switches
-- Simulated Mode toggle (Debug menu on Capture screen): generates synthetic data for quick testing.
-- Torch control on Capture screen for finger camera.
+### Build Commands
+- ` ./gradlew assembleDebug` — Build debug APK
+- ` ./gradlew installDebug` — Install to connected device
+- ` ./gradlew test` — Run unit tests
+- ` ./gradlew connectedAndroidTest` — Run instrumented tests
 
-## Where computations happen
-- PTT: `feature-processing/PttCalculator` (cross-correlation lag; dual-site optical PTT surrogate)
-- SQI & confidence: `core-signal/SignalQuality` (+ enhanced variants)
-- Wave features: `feature-processing/wave/WaveFeatures`
-- Biomarkers: `feature-processing/biomarker/Biomarkers`
-- Trend index: `app/trend/VascularTrendStore`
-- Reactivity protocol: `feature-processing/reactivity/ReactivityProtocolAnalyzer`
+## 2. Architecture Overview
 
-## Result screen state
-- ViewModel: `app/viewmodel/ProcessingViewModel`
-  - Exposes: PTT result, QualityReport, VascularWaveProfile, BiomarkerPanel, VascularTrendSummary, SessionSummary.
+### Camera Capture
+- Uses `CameraX` with `ImageAnalysis` use case.
+- **Dual Camera**: Supports concurrent front/back capture on compatible devices (Pixel 6+, Samsung S22+).
+- **Fallback**: Automatically degrades to sequential mode (one camera at a time) if concurrent is not supported or fails.
+- **Luma Extraction**: Frame processing extracts average luma from ROI (Face) or center (Finger) directly from YUV buffer.
+- **Safety**: `SafeImageAnalyzer` ensures `image.close()` is called to prevent pipeline stalls.
 
-## Export
-- Writer: `core-io/DataExporter`
-- session.json includes:
-  - Required: device/app/session/ptt/quality/camera
-  - Optional enrichment (if available): `vascularWaveProfile`, `vascularTrendSummary`, `biomarkerPanel`, `reactivityProtocol`
-- Files: `session.json`, `face_signal.csv`, `finger_signal.csv` (encrypted ZIP)
+### Signal Processing
+- **Pipeline**: Resampling (100Hz) -> Detrend -> Bandpass (0.7-4Hz) -> Normalization.
+- **PTT**: Calculates Pulse Transit Time using Cross-Correlation + Foot-to-Foot consensus.
+- **Sync**: `GoodSyncDetector` checks signal quality and correlation to identify valid windows.
 
-## Tests
-- Processing module: `feature-processing/src/test/...`
-  - PTT literature consistency (lag accuracy, monotonicity)
-  - Wave feature directionality on synthetic shapes
-  - HRV formula sanity (RMSSD/SDNN)
-  - SQI monotonic behavior
-  - Wording check to avoid forbidden clinical claims (except explicit disclaimers)
+### Visualization
+- **Waveform**: Real-time preview shows raw luma signal.
+  - *Note*: Auto-scaling is clamped to a minimum range (10.0) to prevent small noise from appearing as large jumps. Real PPG signals (amplitude ~30+) will fill the view.
+- **Quality Indicators**: Real-time traffic light (Green/Yellow/Red) based on SNR and motion.
 
-## Debug workflow tips
-1. Start with Simulated Mode on Capture screen.
-2. Process once; open Results and verify PTT/SQI.
-3. Toggle torch and adjust lighting to improve SNR.
-4. Use Reactivity Protocol to exercise deltas and recovery computation.
-5. Export ZIP and inspect `session.json` and CSVs.
+## 3. Debugging
 
-## Common pitfalls
-- Low light or motion → poor SQI; PTT and advanced metrics suppressed.
-- Finger not fully covering lens → unstable signal.
-- Avoid interpreting PTT/shape features as clinical stiffness or BP.
+### Logs
+Filter Logcat by `tag:VivoPulse`:
+- `DualCameraController`: Camera state, frame drops, luma values.
+- `ProcessingViewModel`: Pipeline steps, synthetic fallback events.
+- `PttEngine`: PTT calculation details.
 
+### Common Issues
+- **FPS 0**: Check if `SafeImageAnalyzer` is closing images. Check thermal state.
+- **No Waveform**: Verify luma values in logs (`Face luma: ...`). If 0, check ROI detection.
+- **Sequential Mode**: Only one camera runs. The other channel uses synthetic data for pipeline stability.
 
+## 4. Testing
+
+- **Unit Tests**: `./gradlew test` covers signal processing logic (`SignalQuality`, `PttConsensus`).
+- **Robolectric**: Used for camera binding logic tests (`CameraBindingHelperTest`).
+- **Manual Validation**: See `docs/ON_DEVICE_TESTING_GUIDE.md`.

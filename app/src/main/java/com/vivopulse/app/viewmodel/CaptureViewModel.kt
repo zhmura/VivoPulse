@@ -301,6 +301,7 @@ class CaptureViewModel @Inject constructor(
             processedData = processedData,
             faceMotionRms = face.motionRmsPx ?: 0.0,
             fingerSaturationPct = finger.saturationPct ?: 0.0,
+            imuRmsG = face.imuRmsG ?: 0.0,
             snrDb = snrAverage,
             faceSqi = statusToScore(face.status),
             fingerSqi = statusToScore(finger.status),

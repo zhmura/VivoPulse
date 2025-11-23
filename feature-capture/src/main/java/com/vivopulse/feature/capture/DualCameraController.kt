@@ -2,6 +2,10 @@ package com.vivopulse.feature.capture
 
 import android.annotation.SuppressLint
 import android.content.Context
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CaptureRequest
@@ -48,6 +52,44 @@ class DualCameraController(
 ) {
     private val tag = "DualCameraController"
     
+    private var sensorManager: SensorManager? = null
+    private var accelerometer: Sensor? = null
+    @Volatile private var imuRmsG: Double = 0.0
+    
+    // Gravity estimation for high-pass filter
+    private var gravityMag: Double = 9.8
+    private val alpha = 0.9 // Low-pass filter constant
+
+    private val sensorListener = object : SensorEventListener {
+        override fun onSensorChanged(event: SensorEvent?) {
+            event?.let {
+                if (it.sensor.type == Sensor.TYPE_ACCELEROMETER) {
+                    val x = it.values[0].toDouble()
+                    val y = it.values[1].toDouble()
+                    val z = it.values[2].toDouble()
+                    val mag = sqrt(x*x + y*y + z*z)
+                    
+                    // Simple high-pass filter to remove gravity
+                    gravityMag = alpha * gravityMag + (1 - alpha) * mag
+                    val dynamic = mag - gravityMag
+                    
+                    // Update current RMS estimate (instantaneous absolute deviation)
+                    // For a true RMS over a window, we'd need a buffer.
+                    // Here we approximate instantaneous motion intensity.
+                    // We could smooth this too.
+                    val instantRms = kotlin.math.abs(dynamic) / 9.8 // Normalize to G
+                    
+                    // Smooth the RMS display value
+                    imuRmsG = 0.8 * imuRmsG + 0.2 * instantRms
+                }
+            }
+        }
+
+        override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {
+            // No-op
+        }
+    }
+
     private var cameraProvider: ProcessCameraProvider? = null
     private var frontCamera: Camera? = null
     private var backCamera: Camera? = null
@@ -236,6 +278,7 @@ class DualCameraController(
             ?: com.vivopulse.feature.capture.camera.CameraMode.SAFE_MODE_SEQUENTIAL
         
         setupThermalMonitoring()
+        setupImu()
         
         Log.d(tag, "Camera provider initialized")
         Log.d(tag, "Device: ${deviceCapabilities?.deviceInfo}")
@@ -243,6 +286,24 @@ class DualCameraController(
         Log.d(tag, "Recommended mode: ${_cameraMode.value}")
     }
     
+    private fun setupImu() {
+        sensorManager = context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
+        accelerometer = sensorManager?.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
+        if (accelerometer == null) {
+            Log.w(tag, "No accelerometer found")
+        }
+    }
+
+    private fun startImu() {
+        accelerometer?.let {
+            sensorManager?.registerListener(sensorListener, it, SensorManager.SENSOR_DELAY_GAME)
+        }
+    }
+
+    private fun stopImu() {
+        sensorManager?.unregisterListener(sensorListener)
+    }
+
     /**
      * Start dual camera preview and capture.
      */
@@ -262,6 +323,7 @@ class DualCameraController(
         
         // Unbind all use cases before rebinding
         provider.unbindAll()
+        stopImu() // Ensure clean state
         fingerFrameCounter = 0
         fingerRoiRect = null
         
@@ -277,10 +339,16 @@ class DualCameraController(
                 com.vivopulse.feature.capture.camera.CameraMode.SAFE_MODE_REDUCED -> {
                     _statusBanner.value = "Safe Mode: Reduced resolution"
                 }
+                com.vivopulse.feature.capture.camera.CameraMode.SAFE_MODE_ANALYSIS_ONLY -> {
+                    _statusBanner.value = "Safe Mode: No preview (analysis only)"
+                }
             }
             
             // Attempt to start cameras with current configuration
             startCamerasWithFallback(lifecycleOwner, frontPreviewView, backPreviewView, provider)
+            
+            // Start IMU monitoring
+            startImu()
             
         } catch (e: Exception) {
             Log.e(tag, "Error starting cameras", e)
@@ -353,23 +421,29 @@ class DualCameraController(
             // Try next resolution in current mode
             currentResolutionIndex < resolutionFallbacks.size - 1 -> {
                 currentResolutionIndex++
-                _cameraMode.value = com.vivopulse.feature.capture.camera.CameraMode.SAFE_MODE_REDUCED
+                // Update mode status if we are effectively in reduced mode now
+                if (_cameraMode.value == com.vivopulse.feature.capture.camera.CameraMode.CONCURRENT) {
+                    _cameraMode.value = com.vivopulse.feature.capture.camera.CameraMode.SAFE_MODE_REDUCED
+                }
                 Log.w(tag, "Retrying with reduced resolution (index $currentResolutionIndex)")
             }
-            // Switch to sequential mode
-            _cameraMode.value != com.vivopulse.feature.capture.camera.CameraMode.SAFE_MODE_SEQUENTIAL -> {
+            // Switch to analysis-only mode (from Concurrent/Reduced)
+            _cameraMode.value == com.vivopulse.feature.capture.camera.CameraMode.CONCURRENT || 
+            _cameraMode.value == com.vivopulse.feature.capture.camera.CameraMode.SAFE_MODE_REDUCED -> {
+                _cameraMode.value = com.vivopulse.feature.capture.camera.CameraMode.SAFE_MODE_ANALYSIS_ONLY
+                currentResolutionIndex = 0
+                Log.w(tag, "Switching to analysis-only mode")
+            }
+            // Switch to sequential mode (from Analysis-Only)
+            _cameraMode.value == com.vivopulse.feature.capture.camera.CameraMode.SAFE_MODE_ANALYSIS_ONLY -> {
                 _cameraMode.value = com.vivopulse.feature.capture.camera.CameraMode.SAFE_MODE_SEQUENTIAL
-                currentResolutionIndex = 0 // Reset resolution
+                currentResolutionIndex = 0
                 Log.w(tag, "Switching to sequential mode")
             }
-            // Already in sequential mode, try next resolution
+            // Already in sequential mode and resolutions exhausted
             else -> {
-                currentResolutionIndex++
-                if (currentResolutionIndex >= resolutionFallbacks.size) {
-                    _statusBanner.value = "Camera initialization failed. Please restart."
-                    return
-                }
-                Log.w(tag, "Sequential mode: trying resolution index $currentResolutionIndex")
+                _statusBanner.value = "Camera initialization failed. Please restart."
+                return
             }
         }
         
@@ -559,6 +633,7 @@ class DualCameraController(
                     fingerMeanLuma = fingerLuma,
                     faceMotionRmsPx = faceMotionRms,
                     fingerSaturationPct = fingerSaturationPct,
+                    imuRmsG = imuRmsG,
                     torchEnabled = torchEnabled
                 )
             )

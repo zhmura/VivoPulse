@@ -73,8 +73,39 @@ class ClinicianGradeExporter(private val context: Context) {
             ZipOutputStream(zipBytes).use { zip ->
                 // 1. session.json (comprehensive metadata)
                 zip.putNextEntry(ZipEntry("session.json"))
-                zip.write(createClinicianJson(metadata, thermalTimeline, threeAState).toByteArray())
+                val sessionJson = createClinicianJson(metadata, thermalTimeline, threeAState)
+                zip.write(sessionJson.toByteArray())
                 zip.closeEntry()
+                
+                // 1b. device_capabilities.json (extracted from session.json)
+                zip.putNextEntry(ZipEntry("device_capabilities.json"))
+                val deviceCaps = JSONObject(sessionJson).getJSONObject("device")
+                // Enrich with capabilities if we had them, for now extract what's available
+                zip.write(deviceCaps.toString(2).toByteArray())
+                zip.closeEntry()
+                
+                // 1c. fps_report.json (extracted from session.json)
+                zip.putNextEntry(ZipEntry("fps_report.json"))
+                val cameraStats = JSONObject(sessionJson).getJSONObject("camera")
+                zip.write(cameraStats.toString(2).toByteArray())
+                zip.closeEntry()
+                
+                // 1d. thermal_timeline.json
+                if (thermalTimeline != null) {
+                    zip.putNextEntry(ZipEntry("thermal_timeline.json"))
+                    val thermalJson = JSONObject().apply {
+                        put("events", JSONArray().apply {
+                            thermalTimeline.forEach { event ->
+                                put(JSONObject().apply {
+                                    put("time_s", event.timeS)
+                                    put("state", event.state)
+                                })
+                            }
+                        })
+                    }
+                    zip.write(thermalJson.toString(2).toByteArray())
+                    zip.closeEntry()
+                }
                 
                 // 2. face_signal.csv
                 zip.putNextEntry(ZipEntry("face_signal.csv"))

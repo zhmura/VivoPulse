@@ -5,6 +5,7 @@ import com.vivopulse.feature.processing.ptt.PttOutput
 import com.vivopulse.feature.processing.timestamp.TimestampSync
 import com.vivopulse.feature.processing.timestamp.TimestampedValue
 import com.vivopulse.signal.DspFunctions
+import android.util.Log
 
 /**
  * Signal processing pipeline for dual camera PPG signals.
@@ -25,6 +26,7 @@ class SignalPipeline(
     private val highCutoffHz: Double = 4.0,
     private val correlationWindowSec: Double = 20.0
 ) {
+    private val tag = "SignalPipeline"
     
     /**
      * Process raw signal buffers into clean, aligned signals.
@@ -43,6 +45,8 @@ class SignalPipeline(
         rawBuffer: RawSeriesBuffer,
         preProcessedSignals: List<com.vivopulse.signal.ProcessedSignal>? = null
     ): ProcessedSeries {
+        Log.d(tag, "Starting pipeline process. Raw buffer size: ${rawBuffer.faceData.size} (face), ${rawBuffer.fingerData.size} (finger)")
+        
         // Resample both channels to unified 100 Hz timeline
         val resampled = TimestampSync.resampleToUnifiedTimeline(
             stream1Data = rawBuffer.faceData,
@@ -51,6 +55,7 @@ class SignalPipeline(
         )
         
         if (!resampled.isValid) {
+            Log.w(tag, "Resampling failed: ${resampled.message}")
             return ProcessedSeries(
                 timeMillis = emptyList(),
                 faceSignal = doubleArrayOf(),
@@ -60,6 +65,8 @@ class SignalPipeline(
                 message = resampled.message
             )
         }
+        
+        Log.d(tag, "Resampling success: ${resampled.unifiedTimestamps.size} samples at ${targetSampleRateHz} Hz")
         
         // Extract face and finger signals
         val rawFaceSignal = resampled.stream1Values.toDoubleArray()
@@ -77,20 +84,32 @@ class SignalPipeline(
         // Resample metrics if available
         var faceMotion: DoubleArray = doubleArrayOf()
         var fingerSat: DoubleArray = doubleArrayOf()
+        var imuRms: DoubleArray = doubleArrayOf()
         var faceSqi: IntArray = intArrayOf()
         var fingerSqi: IntArray = intArrayOf()
         var consensusPtt: Double? = null
         
         if (preProcessedSignals != null && preProcessedSignals.isNotEmpty()) {
-            // Simple resampling/interpolation for metrics
-            // For now, just taking the nearest neighbor or average
-            // Since metrics are sparse (30Hz vs 100Hz), we interpolate
-            // TODO: Implement proper interpolation
-            // Placeholder: just fill with 0 or average for now to avoid crash
             faceMotion = DoubleArray(timeMillis.size)
             fingerSat = DoubleArray(timeMillis.size)
+            imuRms = DoubleArray(timeMillis.size)
             faceSqi = IntArray(timeMillis.size)
             fingerSqi = IntArray(timeMillis.size)
+            
+            // Simple nearest neighbor resampling
+            val sourceSize = preProcessedSignals.size
+            val targetSize = timeMillis.size
+            
+            for (i in 0 until targetSize) {
+                val sourceIndex = (i.toDouble() / targetSize * sourceSize).toInt().coerceIn(0, sourceSize - 1)
+                val signal = preProcessedSignals[sourceIndex]
+                
+                faceMotion[i] = signal.faceMotionRms
+                fingerSat[i] = signal.fingerSaturationPct
+                imuRms[i] = signal.imuRmsG
+                faceSqi[i] = signal.faceSqi
+                fingerSqi[i] = signal.fingerSqi
+            }
             
             // Extract consensus PTT from the last valid signal
             consensusPtt = preProcessedSignals.mapNotNull { it.consensusPtt }.lastOrNull()
@@ -107,6 +126,8 @@ class SignalPipeline(
             faceMotionPenalty = 100.0 // Will be injected from motion analyzer later
         )
         
+        Log.d(tag, "PTT Engine output: PTT=${pttOutput.pttMs}, Conf=${pttOutput.confidence}, Valid=${pttOutput.isValid}")
+        
         return ProcessedSeries(
             timeMillis = timeMillis,
             faceSignal = faceProcessed,
@@ -119,6 +140,7 @@ class SignalPipeline(
             message = "Processed ${timeMillis.size} samples at ${targetSampleRateHz} Hz",
             faceMotionRms = faceMotion,
             fingerSaturationPct = fingerSat,
+            imuRmsG = imuRms,
             faceSqi = faceSqi,
             fingerSqi = fingerSqi,
             consensusPtt = consensusPtt
@@ -180,6 +202,7 @@ data class ProcessedSeries(
     // New Metrics
     val faceMotionRms: DoubleArray = doubleArrayOf(),
     val fingerSaturationPct: DoubleArray = doubleArrayOf(),
+    val imuRmsG: DoubleArray = doubleArrayOf(),
     val faceSqi: IntArray = intArrayOf(),
     val fingerSqi: IntArray = intArrayOf(),
     val consensusPtt: Double? = null

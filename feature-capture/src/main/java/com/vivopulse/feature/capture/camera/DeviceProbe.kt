@@ -15,7 +15,8 @@ import android.util.Size
 enum class CameraMode {
     CONCURRENT,           // Both cameras simultaneously
     SAFE_MODE_SEQUENTIAL, // Sequential fallback
-    SAFE_MODE_REDUCED     // Reduced resolution concurrent
+    SAFE_MODE_REDUCED,    // Reduced resolution concurrent
+    SAFE_MODE_ANALYSIS_ONLY // YUV-only concurrent (no preview)
 }
 
 /**
