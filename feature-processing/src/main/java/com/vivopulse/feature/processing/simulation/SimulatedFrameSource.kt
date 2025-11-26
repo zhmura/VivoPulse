@@ -89,9 +89,10 @@ class SimulatedFrameSource(
     }
     
     /**
-     * Generate realistic PPG signal.
+     * Generate realistic PPG signal (Pulse Train).
      * 
-     * Includes fundamental + harmonics for realistic waveform shape.
+     * Uses Gaussian pulses instead of sine waves for more realistic morphology
+     * (sharper upstroke, distinct feet).
      */
     private fun generatePPGSignal(
         heartRateHz: Double,
@@ -101,21 +102,30 @@ class SimulatedFrameSource(
     ): DoubleArray {
         val numSamples = (duration * sampleRate).toInt()
         val signal = DoubleArray(numSamples)
+        val period = 1.0 / heartRateHz
         
-        // PPG waveform with multiple harmonics
-        for (i in 0 until numSamples) {
-            val t = i / sampleRate
+        // Generate pulse train
+        var tPulse = 0.0
+        while (tPulse < duration) {
+            // Add pulse centered at tPulse
+            // Width (sigma) = 0.08s (80ms) - typical systolic width
+            val sigma = 0.08
+            val widthFactor = 1.0 / (2.0 * sigma * sigma) // ~78.125
             
-            // Fundamental (heart rate)
-            val fundamental = amplitude * sin(2.0 * PI * heartRateHz * t)
+            // Optimization: iterate all samples (for simplicity) or just window
+            // Since this is offline generation, iterating all is fine for 30s buffer
+            for (i in 0 until numSamples) {
+                val t = i / sampleRate
+                
+                // Systolic peak
+                val dt = t - tPulse
+                // Limit influence to +/- 0.5s
+                if (kotlin.math.abs(dt) < 0.5) {
+                    signal[i] += amplitude * kotlin.math.exp(-widthFactor * dt * dt)
+                }
+            }
             
-            // Second harmonic (adds waveform shape)
-            val harmonic2 = amplitude * 0.3 * sin(2.0 * PI * heartRateHz * 2 * t + PI/4)
-            
-            // Third harmonic (subtle)
-            val harmonic3 = amplitude * 0.1 * sin(2.0 * PI * heartRateHz * 3 * t + PI/3)
-            
-            signal[i] = fundamental + harmonic2 + harmonic3
+            tPulse += period
         }
         
         return signal

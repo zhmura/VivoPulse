@@ -84,7 +84,7 @@ class PTTConsensus {
         
         // 2. Find max d/dt (steepest systolic upstroke)
         val maxSlope = diff.maxOrNull() ?: return emptyList()
-        val slopeThreshold = maxSlope * 0.15 // 15% of max slope
+        val slopeThreshold = maxSlope * 0.05 // 5% of max slope - robust for smoother signals
         
         val feet = mutableListOf<Double>()
         
@@ -98,9 +98,9 @@ class PTTConsensus {
                 // This is a systolic upstroke peak velocity.
                 // The foot is the minimum value point preceding this upstroke.
                 // Search backwards for local minimum in the signal.
-                // Limit search window to e.g. 300ms (30 samples)
+                // Limit search window to e.g. 500ms (50 samples) to cover slow HR (0.6 Hz)
                 
-                val searchLimit = 30
+                val searchLimit = 50
                 var bestK = i
                 var minVal = signal[i]
                 
@@ -108,10 +108,16 @@ class PTTConsensus {
                     if (signal[k] <= minVal) {
                         minVal = signal[k]
                         bestK = k
-                    } else {
-                        // If signal rises significantly backwards, we left the foot valley.
-                        // But noisy signals might fluctuate.
-                        // Simple approach: absolute minimum in the window.
+                    }
+                    
+                    // Check if we found a local minimum (valley)
+                    // k < k-1 and k <= k+1
+                    if (k > 0 && k < i) {
+                        if (signal[k] < signal[k-1] && signal[k] <= signal[k+1]) {
+                            // Found local min
+                            bestK = k
+                            break
+                        }
                     }
                 }
                 

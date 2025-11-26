@@ -264,19 +264,19 @@ fun CaptureScreen(
                         }
                     }
                     
-                    // Camera previews - HORIZONTAL LAYOUT
-                    Row(
+                    // Camera previews - VERTICAL LAYOUT (Primary + Secondary)
+                    Column(
                         modifier = Modifier
                             .fillMaxWidth()
                             .weight(1f)
                             .padding(horizontal = 4.dp, vertical = 4.dp),
-                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                        verticalArrangement = Arrangement.spacedBy(4.dp)
                     ) {
                         CameraPreviewCard(
                             title = "Face (Front)",
                             modifier = Modifier
-                                .weight(1f)
-                                .fillMaxHeight(),
+                                .fillMaxWidth()
+                                .weight(2f), // Primary preview takes more space
                             showRoiOverlay = true,
                             faceRoi = faceRoi,
                             waveform = faceWave,
@@ -288,8 +288,8 @@ fun CaptureScreen(
                         CameraPreviewCard(
                             title = "Finger (Back)",
                             modifier = Modifier
-                                .weight(1f)
-                                .fillMaxHeight(),
+                                .fillMaxWidth()
+                                .weight(1f), // Secondary preview strip
                             showTorchIndicator = torchEnabled,
                             waveform = fingerWave,
                             quality = qualityState?.finger

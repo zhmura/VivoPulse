@@ -80,6 +80,20 @@ class DataExporter(private val context: Context) {
                 zip.putNextEntry(ZipEntry("finger_signal.csv"))
                 zip.write(createSignalCsv(fingerSignal).toByteArray())
                 zip.closeEntry()
+                
+                // Add combined session-{timestamp}.csv (time, face, finger)
+                val combinedCsv = createCombinedCsv(faceSignal, fingerSignal)
+                zip.putNextEntry(ZipEntry("session-${timestamp}.csv"))
+                zip.write(combinedCsv.toByteArray())
+                zip.closeEntry()
+            }
+
+            // Also save combined CSV as a separate file for easy access
+            try {
+                val csvFile = File(documentsDir, "session-${timestamp}.csv")
+                csvFile.writeText(createCombinedCsv(faceSignal, fingerSignal))
+            } catch (e: Exception) {
+                e.printStackTrace() // Non-fatal
             }
 
             // Encrypt ZIP bytes to file at rest
@@ -209,6 +223,20 @@ class DataExporter(private val context: Context) {
             csv.appendLine(point.toCsvRow())
         }
         
+        return csv.toString()
+    }
+    
+    /**
+     * Create combined CSV (timestamp, face, finger).
+     */
+    private fun createCombinedCsv(face: List<SignalDataPoint>, finger: List<SignalDataPoint>): String {
+        val csv = StringBuilder()
+        csv.appendLine("time_ms,face_signal,finger_signal")
+        
+        val size = minOf(face.size, finger.size)
+        for (i in 0 until size) {
+            csv.appendLine("${face[i].timeMs},${face[i].filteredValue},${finger[i].filteredValue}")
+        }
         return csv.toString()
     }
 }

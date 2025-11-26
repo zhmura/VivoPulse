@@ -9,6 +9,21 @@ import com.vivopulse.app.BuildConfig
 object FeatureFlags {
     
     private var simulatedModeEnabled: Boolean = false
+    private var walkingModeEnabled: Boolean = false
+    
+    const val ENABLE_TF_EXPORT = true // Enable TF export for validation phase
+    
+    /**
+     * Check if walking mode is enabled.
+     */
+    fun isWalkingModeEnabled(): Boolean = walkingModeEnabled
+    
+    /**
+     * Set walking mode.
+     */
+    fun setWalkingModeEnabled(enabled: Boolean) {
+        walkingModeEnabled = enabled
+    }
     
     /**
      * Check if simulated mode is enabled.

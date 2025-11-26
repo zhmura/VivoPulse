@@ -4,7 +4,10 @@ import com.vivopulse.feature.processing.timestamp.TimestampedValue
 import com.vivopulse.signal.ProcessedSignal
 import org.junit.Assert.*
 import org.junit.Test
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
 
+@RunWith(RobolectricTestRunner::class)
 class SignalPipelineTest {
 
     private val pipeline = SignalPipeline(

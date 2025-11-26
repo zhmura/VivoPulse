@@ -104,6 +104,57 @@ object DspFunctions {
     }
     
     /**
+     * Apply IIR Notch filter.
+     * 
+     * @param signal Input signal
+     * @param notchFreqHz Frequency to notch out (Hz)
+     * @param sampleRateHz Sample rate (Hz)
+     * @param qFactor Quality factor (higher Q = narrower notch). Default 10.
+     * @return Filtered signal
+     */
+    fun notchFilter(
+        signal: DoubleArray,
+        notchFreqHz: Double,
+        sampleRateHz: Double,
+        qFactor: Double = 10.0
+    ): DoubleArray {
+        if (signal.isEmpty()) return doubleArrayOf()
+        
+        // Biquad Notch Coefficients (RBJ Cookbook)
+        val omega = 2.0 * PI * notchFreqHz / sampleRateHz
+        val alpha = sin(omega) / (2.0 * qFactor)
+        val cs = cos(omega)
+        
+        val b0 = 1.0
+        val b1 = -2.0 * cs
+        val b2 = 1.0
+        val a0 = 1.0 + alpha
+        val a1 = -2.0 * cs
+        val a2 = 1.0 - alpha
+        
+        // Normalize
+        val b0n = b0 / a0
+        val b1n = b1 / a0
+        val b2n = b2 / a0
+        val a1n = a1 / a0
+        val a2n = a2 / a0
+        
+        // Apply filter (Direct Form II)
+        val filtered = DoubleArray(signal.size)
+        var w1 = 0.0
+        var w2 = 0.0
+        
+        for (i in signal.indices) {
+            val w0 = signal[i] - a1n * w1 - a2n * w2
+            filtered[i] = b0n * w0 + b1n * w1 + b2n * w2
+            w2 = w1
+            w1 = w0
+        }
+        
+        return filtered
+    }
+    
+    /**
      * Second-order Butterworth low-pass filter.
      */
     private fun butterworthLowpass(
@@ -302,4 +353,3 @@ object DspFunctions {
         return sqrt(signal.map { it * it }.average())
     }
 }
-

@@ -5,6 +5,8 @@ import com.vivopulse.feature.processing.SignalPipeline
 import com.vivopulse.signal.CrossCorrelation
 import org.junit.Assert.*
 import org.junit.Test
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
 import kotlin.math.abs
 
 /**
@@ -12,6 +14,7 @@ import kotlin.math.abs
  * 
  * Validates that simulated signals produce expected PTT values.
  */
+@RunWith(RobolectricTestRunner::class)
 class SimulatedFrameSourceTest {
     
     @Test
@@ -40,6 +43,7 @@ class SimulatedFrameSourceTest {
             heartRateHz = 1.2,
             pttLagMs = expectedPTT,
             durationSeconds = 30.0,
+            captureRateHz = 100.0, // Use 100Hz to avoid resampling artifacts affecting d/dt
             noiseEnabled = false,
             driftEnabled = false
         )
@@ -61,7 +65,7 @@ class SimulatedFrameSourceTest {
         
         // Validate PTT matches injected lag within ±5 ms
         val error = abs(pttResult.pttMs - expectedPTT)
-        assertTrue("PTT should be ~${expectedPTT}ms (±5ms), was ${pttResult.pttMs}ms, error=${error}ms",
+        assertTrue("PTT should be ~${expectedPTT}ms (±5ms), was ${pttResult.pttMs}ms, error=${error}ms. Msg=${pttResult.message}, Valid=${pttResult.isValid}, Stable=${pttResult.isStable}",
             error < 5.0)
         
         println("Ideal 100ms PTT test: Expected=${expectedPTT}ms, Detected=${pttResult.pttMs}ms, Error=${error}ms, Corr=${pttResult.correlationScore}")
@@ -104,6 +108,7 @@ class SimulatedFrameSourceTest {
             heartRateHz = 1.2,
             pttLagMs = expectedPTT,
             durationSeconds = 30.0,
+            captureRateHz = 100.0,
             noiseEnabled = true,
             noiseLevel = 0.10,  // 10% noise
             driftEnabled = false

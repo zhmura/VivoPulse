@@ -129,7 +129,15 @@ class DefaultProcessingPipeline : ProcessingPipeline {
                     if (isGoodSync) {
                         // Use the last segment or average
                         val segment = goodSyncSegments.last()
-                        val consensus = pttConsensus.estimateConsensusPtt(faceArray, fingerArray, fsHz, segment.window)
+                        // Placeholder HRs for legacy pipeline
+                        val consensus = pttConsensus.estimateConsensusPtt(
+                            face = faceArray, 
+                            finger = fingerArray, 
+                            fsHz = fsHz, 
+                            hrFaceBpm = 0.0, 
+                            hrFingerBpm = 0.0,
+                            segment = segment.window
+                        )
                         // Check if consensus is reliable (good agreement and enough beats)
                         if (consensus.nBeats >= 3 && consensus.methodAgreeMs <= 20.0) {
                             ptt = consensus.pttMsMedian

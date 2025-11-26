@@ -53,14 +53,14 @@ object PttEngine {
             face = faceSig,
             finger = fingerSig,
             fsHz = fsHz,
-            hrFaceBpm = hrFace.hrBpm ?: 0.0,
-            hrFingerBpm = hrFinger.hrBpm ?: 0.0,
+            hrFaceBpm = hrFace.hrBpm,
+            hrFingerBpm = hrFinger.hrBpm,
             segment = com.vivopulse.feature.processing.sync.Window(0, durationMs)
         )
         
         // Use median PTT from consensus
         val pttMsRaw = consensusResult.pttMsMedian
-        val agreementScore = if (consensusResult.methodAgreeMs <= 20.0) 1.0 else 0.5
+        val agreementScore = if (consensusResult.methodAgreeMs <= 50.0) 1.0 else 0.5
         
         // 4. Compute per-channel SQI
         val sqiFace = PttSqi.computeChannelSqi(
@@ -90,7 +90,7 @@ object PttEngine {
         // Re-calculate SyncMetrics for confidence inputs if needed, or expose them in ConsensusPtt
         // Let's compute metrics directly for confidence:
         val syncMetrics = com.vivopulse.feature.processing.sync.SyncMetrics.computeMetrics(
-            faceSig, fingerSig, hrFace.hrBpm ?: 0.0, hrFinger.hrBpm ?: 0.0, fsHz
+            faceSig, fingerSig, hrFace.hrBpm, hrFinger.hrBpm, fsHz
         )
         
         val finalConfidence = PttSqi.computeCombinedConfidence(

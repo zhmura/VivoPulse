@@ -12,6 +12,8 @@ import androidx.security.crypto.EncryptedFile
 import androidx.security.crypto.MasterKey
 import com.vivopulse.io.model.SessionMetadata
 import com.vivopulse.io.model.SignalDataPoint
+import com.vivopulse.io.model.ExportSegment
+import com.vivopulse.io.model.ExportExtras
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
@@ -22,6 +24,7 @@ import java.text.SimpleDateFormat
 import java.util.*
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
+import com.vivopulse.signal.TimeFrequencyTooling
 
 /**
  * Clinician-grade export manager.
@@ -51,7 +54,10 @@ class ClinicianGradeExporter(private val context: Context) {
         faceSignal: List<SignalDataPoint>,
         fingerSignal: List<SignalDataPoint>,
         thermalTimeline: List<ThermalEvent>? = null,
-        threeAState: ThreeATimeline? = null
+        threeAState: ThreeATimeline? = null,
+        includeTimeFrequency: Boolean = false,
+        segments: List<ExportSegment> = emptyList(),
+        extras: ExportExtras? = null
     ): String? = withContext(Dispatchers.IO) {
         try {
             // Generate filename
@@ -73,14 +79,13 @@ class ClinicianGradeExporter(private val context: Context) {
             ZipOutputStream(zipBytes).use { zip ->
                 // 1. session.json (comprehensive metadata)
                 zip.putNextEntry(ZipEntry("session.json"))
-                val sessionJson = createClinicianJson(metadata, thermalTimeline, threeAState)
+                val sessionJson = createClinicianJson(metadata, thermalTimeline, threeAState, segments, extras)
                 zip.write(sessionJson.toByteArray())
                 zip.closeEntry()
                 
                 // 1b. device_capabilities.json (extracted from session.json)
                 zip.putNextEntry(ZipEntry("device_capabilities.json"))
                 val deviceCaps = JSONObject(sessionJson).getJSONObject("device")
-                // Enrich with capabilities if we had them, for now extract what's available
                 zip.write(deviceCaps.toString(2).toByteArray())
                 zip.closeEntry()
                 
@@ -104,6 +109,27 @@ class ClinicianGradeExporter(private val context: Context) {
                         })
                     }
                     zip.write(thermalJson.toString(2).toByteArray())
+                    zip.closeEntry()
+                }
+                
+                // 1e. TF tooling exports (if enabled)
+                if (includeTimeFrequency) {
+                    // Convert SignalDataPoint list to DoubleArray
+                    val faceArray = faceSignal.map { it.filteredValue }.toDoubleArray()
+                    val fingerArray = fingerSignal.map { it.filteredValue }.toDoubleArray()
+                    val fs = metadata.sampleRateHz
+                    
+                    // Compute STFT
+                    val faceStft = TimeFrequencyTooling.computeSTFT(faceArray, fs)
+                    val fingerStft = TimeFrequencyTooling.computeSTFT(fingerArray, fs)
+                    
+                    // Write CSVs
+                    zip.putNextEntry(ZipEntry("tf/tf_face_stft.csv"))
+                    zip.write(faceStft.toCsv().toByteArray())
+                    zip.closeEntry()
+                    
+                    zip.putNextEntry(ZipEntry("tf/tf_finger_stft.csv"))
+                    zip.write(fingerStft.toCsv().toByteArray())
                     zip.closeEntry()
                 }
                 
@@ -163,7 +189,9 @@ class ClinicianGradeExporter(private val context: Context) {
     private fun createClinicianJson(
         metadata: SessionMetadata,
         thermalTimeline: List<ThermalEvent>?,
-        threeAState: ThreeATimeline?
+        threeAState: ThreeATimeline?,
+        segments: List<ExportSegment>,
+        extras: ExportExtras?
     ): String {
         return JSONObject().apply {
             put("schema_version", "1.1")
@@ -220,6 +248,54 @@ class ClinicianGradeExporter(private val context: Context) {
                 put("sqi_combined", metadata.combinedSQI)
             })
             
+            // Harmonics (Session Level)
+            if (metadata.harmonicSummaryFace != null || metadata.harmonicSummaryFinger != null) {
+                put("harmonics_summary", JSONObject().apply {
+                    metadata.harmonicSummaryFace?.let { h ->
+                        put("face", JSONObject().apply {
+                            put("fundamental_hz", h.fundamentalHz)
+                            put("h2_h1_ratio", h.h2ToH1Ratio)
+                            put("spectral_entropy", h.spectralEntropy)
+                        })
+                    }
+                    metadata.harmonicSummaryFinger?.let { h ->
+                        put("finger", JSONObject().apply {
+                            put("fundamental_hz", h.fundamentalHz)
+                            put("h2_h1_ratio", h.h2ToH1Ratio)
+                            put("spectral_entropy", h.spectralEntropy)
+                        })
+                    }
+                })
+            }
+            
+            // Segments (GoodSync windows)
+            put("segments", JSONArray().apply {
+                segments.forEach { seg ->
+                    put(JSONObject().apply {
+                        put("start_time_s", seg.startTimeS)
+                        put("end_time_s", seg.endTimeS)
+                        put("ptt_ms", seg.pttMs)
+                        put("correlation", seg.correlation)
+                        put("sqi_face", seg.sqiFace)
+                        put("sqi_finger", seg.sqiFinger)
+                        
+                        // Diagnostics
+                        if (seg.pttMeanDenoised != null) {
+                            put("ptt_mean_denoised", seg.pttMeanDenoised)
+                            put("ptt_mean_raw", seg.pttMeanRaw)
+                        }
+                        
+                        if (seg.harmonicsFace != null) {
+                            put("harmonics_face", JSONObject().apply {
+                                put("fundamental_hz", seg.harmonicsFace.fundamentalHz)
+                                put("h2_h1_ratio", seg.harmonicsFace.h2ToH1Ratio)
+                                put("spectral_entropy", seg.harmonicsFace.spectralEntropy)
+                            })
+                        }
+                    })
+                }
+            })
+            
             // Processing parameters
             put("processing_params", JSONObject().apply {
                 put("filters", "detrend + bandpass(0.7-4.0 Hz) + z-normalize")
@@ -246,6 +322,28 @@ class ClinicianGradeExporter(private val context: Context) {
                             put("state", event.state)
                         })
                     }
+                })
+            }
+            
+            // Extras
+            extras?.vascularWaveProfile?.let { map ->
+                put("vascularWaveProfile", JSONObject().apply {
+                    map.forEach { (k, v) -> put(k, v) }
+                })
+            }
+            extras?.vascularTrendSummary?.let { map ->
+                put("vascularTrendSummary", JSONObject().apply {
+                    map.forEach { (k, v) -> put(k, v) }
+                })
+            }
+            extras?.biomarkerPanel?.let { map ->
+                put("biomarkerPanel", JSONObject().apply {
+                    map.forEach { (k, v) -> put(k, v) }
+                })
+            }
+            extras?.reactivityProtocol?.let { map ->
+                put("reactivityProtocol", JSONObject().apply {
+                    map.forEach { (k, v) -> put(k, v) }
                 })
             }
         }.toString(2)
@@ -465,4 +563,3 @@ data class ThreeATimeline(
     val awbLockedAtS: Double?,
     val afMode: String
 )
-

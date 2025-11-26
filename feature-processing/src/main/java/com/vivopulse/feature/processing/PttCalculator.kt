@@ -1,5 +1,6 @@
 package com.vivopulse.feature.processing
 
+import com.vivopulse.feature.processing.ptt.PttEngine
 import com.vivopulse.signal.CrossCorrelation
 import com.vivopulse.signal.LagStabilityResult
 
@@ -7,8 +8,7 @@ import com.vivopulse.signal.LagStabilityResult
  * Pulse Transit Time (PTT) calculator.
  *
  * Literature alignment:
- * - Computes dual-site optical PTT surrogate as the lag (ms) that maximizes
- *   normalized cross-correlation between proximal (face) and distal (finger) PPG-like signals.
+ * - Computes dual-site optical PTT surrogate using Consensus Engine (XCorr + Foot-to-Foot).
  * - Includes windowed stability check and plausibility gating.
  *
  * Safety:
@@ -40,24 +40,16 @@ object PttCalculator {
         val fingerSignal = processedSeries.fingerSignal
         val sampleRate = processedSeries.sampleRateHz
         
-        // Compute overall lag
-        val lagResult = CrossCorrelation.computeLag(
-            faceSignal,
-            fingerSignal,
-            sampleRateHz = sampleRate
+        // Compute PTT using PttEngine (Consensus)
+        val pttOutput = PttEngine.computePtt(
+            faceSig = faceSignal,
+            fingerSig = fingerSignal,
+            faceRaw = processedSeries.rawFaceSignal,
+            fingerRaw = processedSeries.rawFingerSignal,
+            fsHz = sampleRate
         )
         
-        if (!lagResult.isValid) {
-            return PttResult(
-                pttMs = 0.0,
-                correlationScore = 0.0,
-                stabilityMs = 0.0,
-                isValid = false,
-                message = "Cross-correlation failed"
-            )
-        }
-        
-        // Compute stability across sliding windows
+        // Compute stability across sliding windows (Legacy metric, still useful for variability)
         val stabilityResult = CrossCorrelation.computeLagStability(
             faceSignal,
             fingerSignal,
@@ -67,15 +59,15 @@ object PttCalculator {
         )
         
         return PttResult(
-            pttMs = if (stabilityResult.isValid) stabilityResult.meanLagMs else lagResult.lagMs,
-            correlationScore = if (stabilityResult.isValid) stabilityResult.meanCorrelation else lagResult.correlationScore,
+            pttMs = pttOutput.pttMs ?: 0.0,
+            correlationScore = pttOutput.corrScore,
             stabilityMs = if (stabilityResult.isValid) stabilityResult.stdLagMs else 0.0,
             windowCount = stabilityResult.windowCount,
-            isValid = true,
-            isReliable = lagResult.isReliable(),
-            isPlausible = lagResult.isPlausible(),
+            isValid = pttOutput.isValid,
+            isReliable = pttOutput.confidence >= 60.0,
+            isPlausible = pttOutput.pttMs != null,
             isStable = stabilityResult.isStable(),
-            message = stabilityResult.message.ifEmpty { lagResult.message }
+            message = pttOutput.guidance?.joinToString(", ") ?: stabilityResult.message
         )
     }
 }

@@ -32,6 +32,8 @@ class PTTConsensusTest {
             face = face,
             finger = finger,
             fsHz = fs,
+            hrFaceBpm = 60.0,
+            hrFingerBpm = 60.0,
             segment = Window(0, 2000)
         )
         
@@ -81,6 +83,8 @@ class PTTConsensusTest {
             face = faceSignal,
             finger = fingerSignal,
             fsHz = fs,
+            hrFaceBpm = 60.0,
+            hrFingerBpm = 60.0,
             segment = Window(0, 2000)
         )
         
