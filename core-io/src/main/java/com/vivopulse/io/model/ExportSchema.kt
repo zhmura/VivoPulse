@@ -1,6 +1,7 @@
 package com.vivopulse.io.model
 
 import android.os.Build
+import com.vivopulse.signal.HarmonicFeatureExtractor
 
 /**
  * Session metadata for export.
@@ -37,13 +38,17 @@ data class SessionMetadata(
     val driftMsPerSecond: Double,
     
     // Notes
-    val notes: String = ""
+    val notes: String = "",
+    
+    // New Harmonic Summaries (Session Level)
+    val harmonicSummaryFace: HarmonicFeatureExtractor.HarmonicFeatures? = null,
+    val harmonicSummaryFinger: HarmonicFeatureExtractor.HarmonicFeatures? = null
 ) {
     companion object {
         /**
          * Current export schema version.
          */
-        const val SCHEMA_VERSION = "1.0"
+        const val SCHEMA_VERSION = "1.1" // Bumped for harmonics
         
         /**
          * Create metadata from device info.
@@ -85,6 +90,23 @@ data class SessionMetadata(
 }
 
 /**
+ * GoodSync segment for export.
+ */
+data class ExportSegment(
+    val startTimeS: Double,
+    val endTimeS: Double,
+    val pttMs: Double,
+    val correlation: Double,
+    val sqiFace: Double,
+    val sqiFinger: Double,
+    // Diagnostics
+    val pttMeanRaw: Double? = null,
+    val pttMeanDenoised: Double? = null,
+    val harmonicsFace: HarmonicFeatureExtractor.HarmonicFeatures? = null,
+    val harmonicsFinger: HarmonicFeatureExtractor.HarmonicFeatures? = null
+)
+
+/**
  * Signal data point for CSV export.
  */
 data class SignalDataPoint(
@@ -113,4 +135,3 @@ data class SignalDataPoint(
         const val CSV_HEADER = "time_ms,raw_value,filtered_value,is_peak,phase_tag"
     }
 }
-

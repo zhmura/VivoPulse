@@ -2,6 +2,7 @@ package com.vivopulse.feature.processing.labmode
 
 import com.vivopulse.feature.processing.PttCalculator
 import com.vivopulse.signal.SignalQuality
+import com.vivopulse.signal.HarmonicFeatureExtractor
 import kotlin.math.abs
 
 /**
@@ -11,63 +12,7 @@ import kotlin.math.abs
  * reactivity levels (low/normal/high).
  */
 class ReactivityAnalyzer {
-    
-    /**
-     * Analyze reactivity across protocol phases.
-     * 
-     * @param phaseDataMap Map of phase ID to phase data
-     * @param protocol Protocol definition
-     * @param sampleRateHz Sample rate
-     * @return Reactivity analysis result
-     */
-    fun analyzeReactivity(
-        phaseDataMap: Map<String, PhaseData>,
-        protocol: Protocol,
-        sampleRateHz: Double
-    ): ReactivityAnalysis {
-        // Compute per-phase metrics
-        val phaseMetrics = mutableMapOf<String, PhaseMetrics>()
-        
-        for ((phaseId, phaseData) in phaseDataMap) {
-            phaseMetrics[phaseId] = computePhaseMetrics(phaseData, sampleRateHz)
-        }
-        
-        // Compute phase-to-phase deltas
-        val deltas = mutableListOf<PhaseDelta>()
-        
-        for ((phasePair, expectedDirection) in protocol.expectedChanges.pttDirection) {
-            val (phase1Id, phase2Id) = phasePair
-            val metrics1 = phaseMetrics[phase1Id]
-            val metrics2 = phaseMetrics[phase2Id]
-            
-            if (metrics1 != null && metrics2 != null) {
-                val delta = computePhaseDelta(
-                    phase1Id = phase1Id,
-                    phase2Id = phase2Id,
-                    metrics1 = metrics1,
-                    metrics2 = metrics2,
-                    expectedPttDirection = expectedDirection,
-                    expectedHrDirection = protocol.expectedChanges.hrDirection[phasePair]
-                )
-                deltas.add(delta)
-            }
-        }
-        
-        // Assess overall reactivity
-        val reactivityLevel = assessReactivityLevel(deltas)
-        
-        return ReactivityAnalysis(
-            phaseMetrics = phaseMetrics,
-            deltas = deltas,
-            reactivityLevel = reactivityLevel,
-            protocolId = protocol.id,
-            protocolName = protocol.name
-        )
-    }
-    
-    /**
-     * Compute metrics for a single phase.
-     */
+// ...
     private fun computePhaseMetrics(
         phaseData: PhaseData,
         sampleRateHz: Double
@@ -78,7 +23,9 @@ class ReactivityAnalyzer {
             faceSignal = phaseData.faceSignal,
             fingerSignal = phaseData.fingerSignal,
             sampleRateHz = sampleRateHz,
-            isValid = true
+            isValid = true,
+            mainHarmonicsFace = HarmonicFeatureExtractor.HarmonicFeatures.empty(),
+            mainHarmonicsFinger = HarmonicFeatureExtractor.HarmonicFeatures.empty()
         )
         val pttResult = PttCalculator.computePtt(faceProcessed)
         

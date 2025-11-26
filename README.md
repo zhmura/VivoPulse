@@ -220,6 +220,82 @@ The app requires the following permissions (declared in `AndroidManifest.xml`):
 
 - **Hilt**: 2.48.1 (Dagger-based DI for Android)
 
+## Signal Processing Pipeline
+
+VivoPulse implements a research-backed signal processing pipeline for PPG analysis:
+
+### 1. Preprocessing & Filtering
+- **Detrending**: High-pass IIR filter (0.5 Hz cutoff) removes baseline drift
+- **Bandpass Filtering**: 4th-order Butterworth (0.7-4.0 Hz) isolates cardiac frequencies
+  - Reference: *Elgendi, M. (2012). "On the analysis of fingertip photoplethysmogram signals." Current Cardiology Reviews, 8(1), 14-25.*
+
+### 2. Wavelet Denoising (Phase 2)
+- **Method**: Discrete Wavelet Transform (DWT) with Haar wavelet
+- **Application**: Conditional denoising for borderline SQI (40-80) signals
+- **Thresholding**: Soft thresholding with VisuShrink universal threshold
+  - Reference: *Donoho, D. L., & Johnstone, I. M. (1994). "Ideal spatial adaptation by wavelet shrinkage." Biometrika, 81(3), 425-455.*
+  - Reference: *Ram, M. R., et al. (2012). "A novel approach for motion artifact reduction in PPG signals based on AS-LMS adaptive filter." IEEE Transactions on Instrumentation and Measurement, 61(5), 1445-1457.*
+
+### 3. Signal Quality Assessment (SQI)
+- **Metrics**: SNR (signal-to-noise ratio), motion penalties, saturation checks
+- **IMU Integration**: Accelerometer-based motion gating
+  - Reference: *Li, Q., & Clifford, G. D. (2012). "Dynamic time warping and machine learning for signal quality assessment of pulsatile signals." Physiological Measurement, 33(9), 1491.*
+
+### 4. Time-Frequency Analysis (Phase 3)
+- **Method**: Short-Time Fourier Transform (STFT) with Hann windowing
+- **Application**: Offline analysis and research export
+- **Parameters**: 256-sample window, 50% overlap (128 samples)
+  - Reference: *Allen, J. (2007). "Photoplethysmography and its application in clinical physiological measurement." Physiological Measurement, 28(3), R1.*
+
+### 5. Walking Mode - Adaptive Notch Filtering (Phase 4)
+- **Step Detection**: Peak detection on accelerometer magnitude with autocorrelation
+- **Notch Filter**: IIR biquad notch at detected step frequency + 2nd harmonic
+- **Q-Factor**: 5.0 for narrow notch bandwidth
+  - Reference: *Poh, M. Z., et al. (2010). "Motion tolerant magnetic earring sensor and wireless earpiece for wearable photoplethysmography." IEEE Transactions on Information Technology in Biomedicine, 14(3), 786-794.*
+  - Reference: *Yousefi, R., et al. (2014). "A motion-tolerant adaptive algorithm for wearable photoplethysmographic biosensors." IEEE Journal of Biomedical and Health Informatics, 18(2), 670-681.*
+
+### 6. PTT Consensus Algorithm
+- **Method A**: Cross-correlation with parabolic interpolation (sub-frame precision)
+- **Method B**: Foot-to-foot detection using derivative threshold (10-20% amplitude)
+- **Consensus**: Median aggregation with IQR-based outlier rejection; agreement threshold ≤20ms
+  - Reference: *Nitzan, M., et al. (2002). "The measurement of oxygen saturation in arterial and venous blood." IEEE Instrumentation & Measurement Magazine, 5(4), 9-15.*
+  - Reference: *Muehlsteff, J., et al. (2006). "Continuous cuff-less measurement of arterial blood pressure using the pulse arrival time." IEEE EMBS Conference, 2006.*
+
+### 7. GoodSync Detection
+- **Criteria**: Multi-metric quality gating (SQI ≥70, correlation ≥0.70, HR delta ≤5 bpm, FWHM ≤120ms)
+- **Morphological Closing**: Bridges gaps ≤1s to create continuous high-quality segments
+- **Minimum Duration**: 5s segments for reliable PTT estimation
+  - Reference: *Clifford, G. D., et al. (2006). "Signal quality in cardiorespiratory monitoring." Physiological Measurement, 27(9), 155.*
+
+### Research References
+
+For detailed calculation methods and validation studies, see:
+- **Calculation Reference**: `docs/CALCULATION_REFERENCE.md`
+- **Technical Guide**: `docs/TECH_GUIDE.md`
+- **Functional Specification**: `docs/FUNCTIONAL_SPEC.md`
+
+### Key Publications
+
+1. **PPG Signal Processing**:
+   - Elgendi, M. (2012). "On the analysis of fingertip photoplethysmogram signals." *Current Cardiology Reviews*, 8(1), 14-25.
+   - Allen, J. (2007). "Photoplethysmography and its application in clinical physiological measurement." *Physiological Measurement*, 28(3), R1.
+
+2. **Wavelet Denoising**:
+   - Donoho, D. L., & Johnstone, I. M. (1994). "Ideal spatial adaptation by wavelet shrinkage." *Biometrika*, 81(3), 425-455.
+   - Ram, M. R., et al. (2012). "A novel approach for motion artifact reduction in PPG signals." *IEEE Trans. Instrumentation and Measurement*, 61(5), 1445-1457.
+
+3. **Motion Artifact Reduction**:
+   - Poh, M. Z., et al. (2010). "Motion tolerant magnetic earring sensor." *IEEE Trans. Information Technology in Biomedicine*, 14(3), 786-794.
+   - Yousefi, R., et al. (2014). "A motion-tolerant adaptive algorithm for wearable PPG biosensors." *IEEE J. Biomedical and Health Informatics*, 18(2), 670-681.
+
+4. **PTT Measurement**:
+   - Muehlsteff, J., et al. (2006). "Continuous cuff-less measurement of arterial blood pressure using pulse arrival time." *IEEE EMBS Conference*, 2006.
+   - Nitzan, M., et al. (2002). "The measurement of oxygen saturation in arterial and venous blood." *IEEE Instrumentation & Measurement Magazine*, 5(4), 9-15.
+
+5. **Signal Quality Assessment**:
+   - Li, Q., & Clifford, G. D. (2012). "Dynamic time warping and machine learning for signal quality assessment." *Physiological Measurement*, 33(9), 1491.
+   - Clifford, G. D., et al. (2006). "Signal quality in cardiorespiratory monitoring." *Physiological Measurement*, 27(9), 155.
+
 ## Testing
 
 ### Unit Tests

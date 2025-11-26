@@ -24,16 +24,18 @@ import com.vivopulse.feature.processing.ptt.HeartRate
 import com.vivopulse.feature.processing.ptt.PeakDetect
 import com.vivopulse.feature.processing.biomarker.BiomarkerComputer
 import com.vivopulse.feature.processing.biomarker.BiomarkerPanel
-import com.vivopulse.io.DataExporter
+import com.vivopulse.io.ClinicianGradeExporter
 import com.vivopulse.io.model.SessionMetadata
 import com.vivopulse.io.model.SignalDataPoint
 import com.vivopulse.io.model.ExportExtras
+import com.vivopulse.io.model.ExportSegment
 import com.vivopulse.signal.DspFunctions
 import com.vivopulse.signal.PerformanceMetrics
 import com.vivopulse.signal.PerformanceReport
 import com.vivopulse.signal.SignalQuality
 import com.vivopulse.app.trend.VascularTrendStore
 import com.vivopulse.app.trend.VascularTrendSummary
+import com.vivopulse.app.util.FeatureFlags
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.Dispatchers
@@ -54,7 +56,7 @@ class ProcessingViewModel @Inject constructor(
 ) : ViewModel() {
     
     private val tag = "ProcessingViewModel"
-    private val signalPipeline = SignalPipeline(targetSampleRateHz = 100.0)
+    private val signalPipeline = SignalPipeline(targetSampleRateHz = 100.0, walkingModeEnabled = FeatureFlags.isWalkingModeEnabled())
     
     private val _processedSeries = MutableStateFlow<ProcessedSeries?>(null)
     val processedSeries: StateFlow<ProcessedSeries?> = _processedSeries.asStateFlow()
@@ -98,7 +100,7 @@ class ProcessingViewModel @Inject constructor(
     private val _performanceReport = MutableStateFlow<PerformanceReport?>(null)
     val performanceReport: StateFlow<PerformanceReport?> = _performanceReport.asStateFlow()
     
-    private val dataExporter = DataExporter(context)
+    private val clinicianExporter = ClinicianGradeExporter(context)
     private val performanceMetrics = PerformanceMetrics()
     private val trendStore = VascularTrendStore(context)
     
@@ -188,7 +190,7 @@ class ProcessingViewModel @Inject constructor(
                     // Build and expose session summary
                     _sessionSummary.value = SessionSummary(
                         pttResult = ptt,
-                        pttOutput = null, // Not using PttEngine in this flow
+                        pttOutput = null, // Not using PttEngine in this flow (legacy?)
                         waveProfile = profile,
                         heartRate = hrResult,
                         faceSQI = quality.faceSQI,
@@ -287,7 +289,9 @@ class ProcessingViewModel @Inject constructor(
                         pttQuality = ptt.getQuality().name,
                         faceFps = faceFps,
                         fingerFps = fingerFps,
-                        driftMsPerSecond = 0.0 // Drift calculation requires clock sync analysis
+                        driftMsPerSecond = 0.0, // Drift calculation requires clock sync analysis
+                        harmonicSummaryFace = series.mainHarmonicsFace,
+                        harmonicSummaryFinger = series.mainHarmonicsFinger
                     )
                     
                     // Find peaks for marking
@@ -320,6 +324,21 @@ class ProcessingViewModel @Inject constructor(
                         )
                     }
                     
+                    // Create segments (session level)
+                    val segment = ExportSegment(
+                        startTimeS = 0.0,
+                        endTimeS = series.getDurationSeconds(),
+                        pttMs = ptt.pttMs,
+                        correlation = ptt.correlationScore,
+                        sqiFace = quality.faceSQI.score.toDouble(),
+                        sqiFinger = quality.fingerSQI.score.toDouble(),
+                        pttMeanRaw = ptt.pttMs,
+                        pttMeanDenoised = series.pttOutputDenoised?.pttMs,
+                        harmonicsFace = series.mainHarmonicsFace,
+                        harmonicsFinger = series.mainHarmonicsFinger
+                    )
+                    val segments = listOf(segment)
+                    
                     // Build extras
                     val extras = ExportExtras(
                         vascularWaveProfile = _waveProfile.value?.let { wp ->
@@ -350,7 +369,16 @@ class ProcessingViewModel @Inject constructor(
                     )
                     
                     // Export
-                    dataExporter.exportSession(metadata, faceData, fingerData, extras)
+                    clinicianExporter.exportSession(
+                        metadata = metadata,
+                        faceSignal = faceData,
+                        fingerSignal = fingerData,
+                        thermalTimeline = null,
+                        threeAState = null,
+                        includeTimeFrequency = FeatureFlags.ENABLE_TF_EXPORT,
+                        segments = segments,
+                        extras = extras
+                    )
                 }
                 
                 _exportPath.value = path
@@ -457,50 +485,4 @@ class ProcessingViewModel @Inject constructor(
         // Process through same pipeline as real data
         return signalPipeline.process(rawBuffer)
     }
-    
-    /**
-     * Generate synthetic PPG data (legacy method for backwards compatibility).
-     * 
-     * TODO: Remove once luma extraction is implemented.
-     */
-    private fun generateSyntheticDataLegacy(): ProcessedSeries {
-        val duration = 10.0 // 10 seconds
-        val originalRate = 30.0
-        val numSamples = (duration * originalRate).toInt()
-        
-        // Generate realistic PPG signals with noise and drift
-        val baseFreq = 1.2 // 72 BPM
-        val facePPG = DspFunctions.generateSineWave(baseFreq, duration, originalRate, amplitude = 0.8)
-        val fingerPPG = DspFunctions.generateSineWave(baseFreq + 0.1, duration, originalRate, amplitude = 0.7)
-        
-        // Add noise
-        val noise1 = DspFunctions.generateSineWave(15.0, duration, originalRate, amplitude = 0.2)
-        val noise2 = DspFunctions.generateSineWave(12.0, duration, originalRate, amplitude = 0.15)
-        
-        // Add drift
-        val noisyFace = facePPG.zip(noise1) { s, n -> s + n }.toDoubleArray()
-        val noisyFinger = fingerPPG.zip(noise2) { s, n -> s + n }.toDoubleArray()
-        
-        val driftedFace = DspFunctions.addLinearDrift(noisyFace, driftRate = 0.03)
-        val driftedFinger = DspFunctions.addLinearDrift(noisyFinger, driftRate = 0.025)
-        
-        // Create timestamped values
-        val faceData = (0 until numSamples).map { i ->
-            val t = i / originalRate
-            val timestampNs = (t * 1_000_000_000).toLong()
-            TimestampedValue(timestampNs, driftedFace[i])
-        }
-        
-        val fingerData = (0 until numSamples).map { i ->
-            val t = i / originalRate
-            val timestampNs = (t * 1_000_000_000).toLong()
-            TimestampedValue(timestampNs, driftedFinger[i])
-        }
-        
-        val rawBuffer = RawSeriesBuffer(faceData, fingerData)
-        
-        // Process through pipeline
-        return signalPipeline.process(rawBuffer)
-    }
 }
-
