@@ -126,6 +126,18 @@ class CaptureViewModel @Inject constructor(
             }
         }
 
+        // Auto-enable torch in CONCURRENT mode
+        viewModelScope.launch {
+            cameraController.cameraMode.collect { mode ->
+                if (mode == CameraMode.CONCURRENT && !_torchEnabled.value) {
+                    Log.d(tag, "Auto-enabling torch for CONCURRENT dual camera mode")
+                    _torchEnabled.value = true
+                    cameraController.setTorchEnabled(true)
+                    torchEnabledAt = System.currentTimeMillis()
+                }
+            }
+        }
+
         // Update FPS and drift periodically
         viewModelScope.launch {
             while (true) {
