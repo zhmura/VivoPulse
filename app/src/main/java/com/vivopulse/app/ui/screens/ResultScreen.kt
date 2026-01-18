@@ -20,6 +20,8 @@ import com.vivopulse.app.viewmodel.ProcessingViewModel
 import com.vivopulse.app.ui.education.EducationTextProvider
 import com.vivopulse.feature.processing.PttResult
 import com.vivopulse.feature.processing.SessionSummary
+import com.vivopulse.signal.SignalQuality
+import com.vivopulse.app.ui.components.PulseGraph
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -159,7 +161,10 @@ fun ResultScreen(
                         // For now, we'll just show a placeholder if we can't modify PttResult easily.
                         // Ideally: MetricRow("GoodSync Windows", "${ptt.goodSyncCount} (${String.format("%.0f", ptt.goodSyncPct)}%)")
                         Spacer(modifier = Modifier.height(8.dp))
-                        MetricRow("GoodSync Share", "N/A (Pending)") // Placeholder until we wire up the data
+                        val goodSyncDurationMs = ptt.goodSegments.sumOf { (it.window.tEndMs - it.window.tStartMs).toDouble() }
+                        val totalDuration = series.getDurationSeconds()
+                        val share = if (totalDuration > 0) ((goodSyncDurationMs / 1000.0) / totalDuration * 100.0).toInt() else 0
+                        MetricRow("GoodSync Share", "${share}%")
                         
                         Spacer(modifier = Modifier.height(16.dp))
                         
@@ -185,6 +190,36 @@ fun ResultScreen(
                                 color = Color(0xFF4CAF50)
                             )
                         }
+                    }
+                }
+                
+                Spacer(modifier = Modifier.height(16.dp))
+
+                // Graphs
+                Text("Pulse Waveforms", style = MaterialTheme.typography.titleMedium)
+                Spacer(modifier = Modifier.height(8.dp))
+                
+                Card(modifier = Modifier.fillMaxWidth()) {
+                    Column(modifier = Modifier.padding(16.dp)) {
+                         Text("Face Signal", style = MaterialTheme.typography.labelSmall)
+                         PulseGraph(
+                             data = series.faceSignal,
+                             timeMillis = series.timeMillis,
+                             peaks = remember(series) { SignalQuality.findPeaks(series.faceSignal, (series.sampleRateHz * 0.4).toInt()).toSet() },
+                             goodSyncSegments = ptt.goodSegments,
+                             modifier = Modifier.fillMaxWidth().height(100.dp)
+                         )
+                         
+                         Spacer(modifier = Modifier.height(16.dp))
+                         
+                         Text("Finger Signal", style = MaterialTheme.typography.labelSmall)
+                         PulseGraph(
+                             data = series.fingerSignal,
+                             timeMillis = series.timeMillis,
+                             peaks = remember(series) { SignalQuality.findPeaks(series.fingerSignal, (series.sampleRateHz * 0.4).toInt()).toSet() },
+                             goodSyncSegments = ptt.goodSegments,
+                             modifier = Modifier.fillMaxWidth().height(100.dp)
+                         )
                     }
                 }
                 

@@ -9,7 +9,12 @@ import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.lifecycle.LifecycleOwner
 import android.util.Log
+import androidx.camera.core.Camera
+import androidx.camera.core.ConcurrentCamera
+import androidx.camera.core.UseCaseGroup
 import com.vivopulse.feature.capture.model.Source
+import com.vivopulse.signal.AppLogger
+import kotlin.Pair
 
 /**
  * Camera binding helper with progressive fallback logic.
@@ -28,6 +33,10 @@ internal class CameraBindingHelper(
     private val processFrame: (androidx.camera.core.ImageProxy, Source) -> Unit
 ) {
     
+    // Store the last binding error for reporting
+    private var _lastBindingError: Exception? = null
+    val lastBindingError: Exception? get() = _lastBindingError
+    
     /**
      * Attempt to bind both cameras with progressive fallback.
      * 
@@ -40,15 +49,17 @@ internal class CameraBindingHelper(
         backPreviewView: PreviewView,
         currentMode: CameraMode,
         sequentialPrimary: SequentialPrimary,
-        resolutionIndex: Int
-    ): Pair<androidx.camera.core.Camera?, androidx.camera.core.Camera?>? {
+        resolutionIndex: Int,
+        targetFrontId: String? = null,
+        targetBackId: String? = null
+    ): Pair<Camera?, Camera?>? {
         
         val resolution = getResolutionForIndex(resolutionIndex)
-        Log.d(tag, "Attempting camera binding with mode=$currentMode, resolution=$resolution")
+        AppLogger.log(tag, "Attempting camera binding with mode=$currentMode, resolution=$resolution, frontId=$targetFrontId, backId=$targetBackId")
         
         return when (currentMode) {
             CameraMode.CONCURRENT, CameraMode.SAFE_MODE_REDUCED -> {
-                bindConcurrent(provider, lifecycleOwner, frontPreviewView, backPreviewView, resolution)
+                bindConcurrent(provider, lifecycleOwner, frontPreviewView, backPreviewView, resolution, targetFrontId, targetBackId)
             }
             CameraMode.SAFE_MODE_ANALYSIS_ONLY -> {
                 bindAnalysisOnly(provider, lifecycleOwner, resolution)
@@ -74,10 +85,32 @@ internal class CameraBindingHelper(
         lifecycleOwner: LifecycleOwner,
         frontPreviewView: PreviewView,
         backPreviewView: PreviewView,
-        resolution: Size
-    ): Pair<androidx.camera.core.Camera?, androidx.camera.core.Camera?>? {
+        resolution: Size,
+        frontId: String? = null,
+        backId: String? = null
+    ): Pair<Camera?, Camera?>? {
+        val frontSelector = if (frontId != null) {
+            createSelectorForId(frontId, CameraSelector.LENS_FACING_FRONT)
+        } else {
+            CameraSelector.DEFAULT_FRONT_CAMERA
+        }
+        
+        val backSelector = if (backId != null) {
+            createSelectorForId(backId, CameraSelector.LENS_FACING_BACK)
+        } else {
+            CameraSelector.DEFAULT_BACK_CAMERA
+        }
+
         return try {
-            // Front camera
+            // Check concurrent support
+            if (provider.availableConcurrentCameraInfos.isEmpty()) {
+                AppLogger.log(tag, "bindConcurrent: No concurrent camera infos found")
+                // Fallback or error? Let's treat as error for now in this mode
+            }
+
+            AppLogger.log(tag, "bindConcurrent: Configuring cameras at $resolution")
+
+            // FRONT Config
             val frontPreview = Preview.Builder()
                 .setTargetResolution(resolution)
                 .build()
@@ -93,15 +126,19 @@ internal class CameraBindingHelper(
                         processFrame(img, Source.FACE) 
                     })
                 }
-            
-            val frontCamera = provider.bindToLifecycle(
-                lifecycleOwner,
-                CameraSelector.DEFAULT_FRONT_CAMERA,
-                frontPreview,
-                frontAnalysis
+                
+            val frontUseCaseGroup = UseCaseGroup.Builder()
+                .addUseCase(frontPreview)
+                .addUseCase(frontAnalysis)
+                .build()
+                
+            val frontConfig = ConcurrentCamera.SingleCameraConfig(
+                frontSelector,
+                frontUseCaseGroup,
+                lifecycleOwner
             )
-            
-            // Back camera
+
+            // BACK Config
             val backPreview = Preview.Builder()
                 .setTargetResolution(resolution)
                 .build()
@@ -117,19 +154,39 @@ internal class CameraBindingHelper(
                         processFrame(img, Source.FINGER) 
                     })
                 }
-            
-            val backCamera = provider.bindToLifecycle(
-                lifecycleOwner,
-                CameraSelector.DEFAULT_BACK_CAMERA,
-                backPreview,
-                backAnalysis
+                
+            val backUseCaseGroup = UseCaseGroup.Builder()
+                .addUseCase(backPreview)
+                .addUseCase(backAnalysis)
+                .build()
+                
+            val backConfig = ConcurrentCamera.SingleCameraConfig(
+                backSelector,
+                backUseCaseGroup,
+                lifecycleOwner
             )
             
-            Log.d(tag, "Concurrent binding successful at $resolution")
+            AppLogger.log(tag, "bindConcurrent: Binding BOTH cameras (Unified API)...")
+            
+            val concurrentCamera = provider.bindToLifecycle(listOf(frontConfig, backConfig))
+            
+            val cameras = concurrentCamera.cameras
+            val frontCamera = cameras.find { it.cameraInfo.lensFacing == CameraSelector.LENS_FACING_FRONT }
+            val backCamera = cameras.find { it.cameraInfo.lensFacing == CameraSelector.LENS_FACING_BACK }
+            
+            if (frontCamera != null) {
+                AppLogger.log(tag, "bindConcurrent: Front camera bound successfully")
+            }
+            if (backCamera != null) {
+                AppLogger.log(tag, "bindConcurrent: Back camera bound successfully")
+            }
+            
+            AppLogger.log(tag, "Concurrent binding successful at $resolution")
             Pair(frontCamera, backCamera)
             
         } catch (e: Exception) {
-            Log.w(tag, "Concurrent binding failed at $resolution", e)
+            _lastBindingError = e
+            AppLogger.error(tag, "CONCURRENT BINDING FAILED at $resolution: ${e.javaClass.simpleName}: ${e.message}", e)
             null
         }
     }
@@ -141,9 +198,9 @@ internal class CameraBindingHelper(
         provider: ProcessCameraProvider,
         lifecycleOwner: LifecycleOwner,
         resolution: Size
-    ): Pair<androidx.camera.core.Camera?, androidx.camera.core.Camera?>? {
+    ): Pair<Camera?, Camera?>? {
         return try {
-            // Front Analysis
+            AppLogger.log(tag, "bindAnalysisOnly: Creating front analysis at $resolution")
             val frontAnalysis = ImageAnalysis.Builder()
                 .setTargetResolution(resolution)
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
@@ -155,13 +212,14 @@ internal class CameraBindingHelper(
                     })
                 }
             
+            AppLogger.log(tag, "bindAnalysisOnly: Binding FRONT camera...")
             val frontCamera = provider.bindToLifecycle(
                 lifecycleOwner,
                 CameraSelector.DEFAULT_FRONT_CAMERA,
                 frontAnalysis
             )
+            AppLogger.log(tag, "bindAnalysisOnly: FRONT camera bound successfully")
             
-            // Back Analysis
             val backAnalysis = ImageAnalysis.Builder()
                 .setTargetResolution(resolution)
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
@@ -173,17 +231,20 @@ internal class CameraBindingHelper(
                     })
                 }
             
+            AppLogger.log(tag, "bindAnalysisOnly: Binding BACK camera...")
             val backCamera = provider.bindToLifecycle(
                 lifecycleOwner,
                 CameraSelector.DEFAULT_BACK_CAMERA,
                 backAnalysis
             )
+            AppLogger.log(tag, "bindAnalysisOnly: BACK camera bound successfully")
             
-            Log.d(tag, "Analysis-only binding successful at $resolution")
+            AppLogger.log(tag, "Analysis-only binding successful at $resolution")
             Pair(frontCamera, backCamera)
             
         } catch (e: Exception) {
-            Log.w(tag, "Analysis-only binding failed at $resolution", e)
+            _lastBindingError = e
+            AppLogger.error(tag, "ANALYSIS-ONLY BINDING FAILED at $resolution: ${e.javaClass.simpleName}: ${e.message}", e)
             null
         }
     }
@@ -198,7 +259,7 @@ internal class CameraBindingHelper(
         backPreviewView: PreviewView,
         sequentialPrimary: SequentialPrimary,
         resolution: Size
-    ): Pair<androidx.camera.core.Camera?, androidx.camera.core.Camera?>? {
+    ): Pair<Camera?, Camera?>? {
         return try {
             val useFace = sequentialPrimary == SequentialPrimary.FACE
             val previewView = if (useFace) frontPreviewView else backPreviewView
@@ -232,7 +293,7 @@ internal class CameraBindingHelper(
                 analysis
             )
             
-            Log.d(tag, "Sequential binding successful (${sequentialPrimary.name.lowercase()}) at $resolution")
+            AppLogger.log(tag, "Sequential binding successful (${sequentialPrimary.name.lowercase()}) at $resolution")
             return if (useFace) {
                 Pair(camera, null)
             } else {
@@ -240,7 +301,8 @@ internal class CameraBindingHelper(
             }
             
         } catch (e: Exception) {
-            Log.w(tag, "Sequential binding failed at $resolution", e)
+            _lastBindingError = e
+            AppLogger.error(tag, "SEQUENTIAL BINDING FAILED at $resolution: ${e.javaClass.simpleName}: ${e.message}", e)
             null
         }
     }
@@ -255,5 +317,21 @@ internal class CameraBindingHelper(
             Size(480, 640)
         )
         return resolutions.getOrElse(index) { resolutions.last() }
+    }
+
+    @androidx.annotation.OptIn(androidx.camera.camera2.interop.ExperimentalCamera2Interop::class)
+    private fun createSelectorForId(id: String, facing: Int): CameraSelector {
+        return CameraSelector.Builder()
+            .requireLensFacing(facing)
+            .addCameraFilter { cameraInfos ->
+                cameraInfos.filter { 
+                    try {
+                        androidx.camera.camera2.interop.Camera2CameraInfo.from(it).cameraId == id
+                    } catch (e: Exception) {
+                        false
+                    }
+                }
+            }
+            .build()
     }
 }

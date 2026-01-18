@@ -10,19 +10,11 @@ import com.vivopulse.feature.processing.wavelet.WaveletDenoiser
 import com.vivopulse.feature.processing.motion.ImuMotionAnalyzer
 import com.vivopulse.feature.processing.motion.StepNotchFilter
 import com.vivopulse.signal.HarmonicFeatureExtractor
+import com.vivopulse.signal.PosExtractor
+import com.vivopulse.signal.ProcessedSignal
 
 /**
  * Signal processing pipeline for dual camera PPG signals.
- * 
- * Full processing chain:
- * 1. Timestamp resampling to unified 100 Hz timeline
- * 2. Detrending (remove baseline drift)
- * 3. Wavelet Denoising (conditional for diagnostics)
- * 4. Bandpass filtering (0.7-4.0 Hz for heart rate)
- * 5. Walking Mode: Adaptive Notch Filter (if enabled)
- * 6. Z-score normalization
- * 7. Harmonic Feature Extraction
- * 8. PTT-SQI confidence assessment (on main signal)
  */
 class SignalPipeline(
     private val targetSampleRateHz: Double = 100.0,
@@ -38,19 +30,16 @@ class SignalPipeline(
         val mainSignal: DoubleArray,
         val denoisedSignal: DoubleArray?,
         val mainHarmonics: HarmonicFeatureExtractor.HarmonicFeatures,
-        val denoisedHarmonics: HarmonicFeatureExtractor.HarmonicFeatures?
+        val denoisedHarmonics: HarmonicFeatureExtractor.HarmonicFeatures?,
+        val posSignal: DoubleArray? = null
     )
 
-    /**
-     * Process raw signal buffers into clean, aligned signals.
-     */
     fun process(
         rawBuffer: RawSeriesBuffer,
-        preProcessedSignals: List<com.vivopulse.signal.ProcessedSignal>? = null
+        preProcessedSignals: List<ProcessedSignal>? = null
     ): ProcessedSeries {
         Log.d(tag, "Starting pipeline process. Raw buffer size: ${rawBuffer.faceData.size} (face), ${rawBuffer.fingerData.size} (finger)")
         
-        // Calculate average SQI from real-time signals to guide processing
         var avgFaceSqi = 100
         var avgFingerSqi = 100
         if (preProcessedSignals != null && preProcessedSignals.isNotEmpty()) {
@@ -58,7 +47,6 @@ class SignalPipeline(
             avgFingerSqi = preProcessedSignals.map { it.fingerSqi }.average().toInt()
         }
         
-        // Resample both channels to unified 100 Hz timeline
         val resampled = TimestampSync.resampleToUnifiedTimeline(
             stream1Data = rawBuffer.faceData,
             stream2Data = rawBuffer.fingerData,
@@ -79,14 +67,11 @@ class SignalPipeline(
             )
         }
         
-        // Extract face and finger signals
         val rawFaceSignal = resampled.stream1Values.toDoubleArray()
         val rawFingerSignal = resampled.stream2Values.toDoubleArray()
         
-        // Convert timestamps to milliseconds
         val timeMillis = resampled.unifiedTimestamps.map { it / 1_000_000.0 }
         
-        // Resample metrics
         var faceMotion: DoubleArray = doubleArrayOf()
         var fingerSat: DoubleArray = doubleArrayOf()
         var imuRms: DoubleArray = doubleArrayOf()
@@ -94,7 +79,41 @@ class SignalPipeline(
         var fingerSqi: IntArray = intArrayOf()
         var consensusPtt: Double? = null
         
-        if (preProcessedSignals != null && preProcessedSignals.isNotEmpty()) {
+        if (rawBuffer.faceMotion != null && rawBuffer.fingerSaturation != null && resampled.isValid) {
+            // Priority 1: Use raw buffer metrics if available (resampled to unified timeline)
+            val interpMotion = TimestampSync.interpolateStream(rawBuffer.faceMotion, resampled.unifiedTimestamps)
+            val interpSat = TimestampSync.interpolateStream(rawBuffer.fingerSaturation, resampled.unifiedTimestamps)
+            val interpImu = if (rawBuffer.imuRms != null) {
+                TimestampSync.interpolateStream(rawBuffer.imuRms, resampled.unifiedTimestamps)
+            } else {
+                List(timeMillis.size) { 0.0 }
+            }
+            
+            faceMotion = interpMotion.toDoubleArray()
+            fingerSat = interpSat.toDoubleArray()
+            imuRms = interpImu.toDoubleArray()
+            
+            // Calculate simplistic SQI for now or reuse preProcessed if available
+            // If preProcessed passed, we might want to still use its SQI?
+            if (preProcessedSignals != null && preProcessedSignals.isNotEmpty()) {
+                 val sourceSize = preProcessedSignals.size
+                 val targetSize = timeMillis.size
+                 faceSqi = IntArray(targetSize)
+                 fingerSqi = IntArray(targetSize)
+                 for (i in 0 until targetSize) {
+                    val sourceIndex = (i.toDouble() / targetSize * sourceSize).toInt().coerceIn(0, sourceSize - 1)
+                    val signal = preProcessedSignals[sourceIndex]
+                    faceSqi[i] = signal.faceSqi
+                    fingerSqi[i] = signal.fingerSqi
+                 }
+                 consensusPtt = preProcessedSignals.mapNotNull { it.consensusPtt }.lastOrNull()
+            } else {
+                 faceSqi = IntArray(timeMillis.size) { avgFaceSqi }
+                 fingerSqi = IntArray(timeMillis.size) { avgFingerSqi }
+            }
+            
+        } else if (preProcessedSignals != null && preProcessedSignals.isNotEmpty()) {
+            // Priority 2: Use preProcessedSignals (Legacy path)
             faceMotion = DoubleArray(timeMillis.size)
             fingerSat = DoubleArray(timeMillis.size)
             imuRms = DoubleArray(timeMillis.size)
@@ -118,35 +137,17 @@ class SignalPipeline(
             consensusPtt = preProcessedSignals.mapNotNull { it.consensusPtt }.lastOrNull()
         }
         
-        // Analyze motion (Walking Mode)
         val motionFeatures = if (walkingModeEnabled && imuRms.isNotEmpty()) {
             imuAnalyzer.analyze(imuRms, targetSampleRateHz)
         } else {
             ImuMotionAnalyzer.MotionFeatures(null, 0.0, false)
         }
         
-        // Process FACE channel
-        val faceResult = processChannel(rawFaceSignal, avgFaceSqi, motionFeatures)
+        val rawFaceRgbList = rawBuffer.faceRgb?.let { interpolateRgb(it, resampled.unifiedTimestamps) }
+        val faceResult = processChannel(rawFaceSignal, avgFaceSqi, motionFeatures, rawFaceRgbList)
         
-        // Process FINGER channel
-        val fingerResult = processChannel(rawFingerSignal, avgFingerSqi, motionFeatures)
-        
-        // Compute PTT (Main Path - Raw/Standard Bandpass)
-        // Note: Phase 3 requires keeping main PTT logic unchanged (i.e. use standard bandpass if that was default)
-        // But we integrated Wavelet into "main" path in Phase 2.
-        // If we want to be strictly "Read-Only", we should use the "Main" path which is now the one without Wavelet?
-        // The previous implementation conditionally applied wavelet. 
-        // Here, processChannel returns 'mainSignal' which IS the processed signal (potentially with wavelet if configured).
-        // Wait, my previous implementation of processChannel returned ONE array.
-        // Now I'm returning ChannelResult with Main and Denoised.
-        // I should clarify what "Main" is.
-        // To support Phase 3 diagnostics, "Main" should be the standard pipeline (potentially with wavelet if Phase 2 is active).
-        // And "Denoised" should be the *explicitly* denoised one if "Main" wasn't?
-        // Or "Main" = Bandpass Only. "Denoised" = Wavelet + Bandpass.
-        // If Phase 2 is "active", then "Main" = Wavelet + Bandpass.
-        // But Phase 3 says "Do not change main PTT output logic yet".
-        // So I will set "Main" = Bandpass Only (Standard).
-        // And "Denoised" = Wavelet + Bandpass (Experimental).
+        val rawFingerRgbList = rawBuffer.fingerRgb?.let { interpolateRgb(it, resampled.unifiedTimestamps) }
+        val fingerResult = processChannel(rawFingerSignal, avgFingerSqi, motionFeatures, rawFingerRgbList)
         
         val pttOutput = PttEngine.computePtt(
             faceSig = faceResult.mainSignal,
@@ -158,7 +159,6 @@ class SignalPipeline(
             faceMotionPenalty = 100.0
         )
         
-        // Compute Diagnostic PTT (Denoised) if available
         var pttDenoised: PttOutput? = null
         if (faceResult.denoisedSignal != null && fingerResult.denoisedSignal != null) {
              pttDenoised = PttEngine.computePtt(
@@ -194,24 +194,46 @@ class SignalPipeline(
             mainHarmonicsFace = faceResult.mainHarmonics,
             mainHarmonicsFinger = fingerResult.mainHarmonics,
             denoisedHarmonicsFace = faceResult.denoisedHarmonics,
-            denoisedHarmonicsFinger = fingerResult.denoisedHarmonics
+            denoisedHarmonicsFinger = fingerResult.denoisedHarmonics,
+            rawFaceRgb = rawFaceRgbList,
+            rawFingerRgb = rawFingerRgbList,
+            faceSignalPos = faceResult.posSignal,
+            fingerSignalPos = fingerResult.posSignal
         )
+    }
+
+    private fun interpolateRgb(
+        rawRgb: List<Pair<Long, Triple<Double, Double, Double>>>?,
+        timestamps: List<Long>
+    ): List<Triple<Double, Double, Double>>? {
+        if (rawRgb == null || timestamps.isEmpty()) return null
+
+        val rStream = rawRgb.map { TimestampedValue(it.first, it.second.first) }
+        val gStream = rawRgb.map { TimestampedValue(it.first, it.second.second) }
+        val bStream = rawRgb.map { TimestampedValue(it.first, it.second.third) }
+
+        val rInterp = TimestampSync.interpolateStream(rStream, timestamps)
+        val gInterp = TimestampSync.interpolateStream(gStream, timestamps)
+        val bInterp = TimestampSync.interpolateStream(bStream, timestamps)
+
+        return rInterp.indices.map { i ->
+            Triple(rInterp[i], gInterp[i], bInterp[i])
+        }
     }
     
     private fun processChannel(
         rawSignal: DoubleArray, 
         sqi: Int = 100, 
-        motionFeatures: ImuMotionAnalyzer.MotionFeatures? = null
+        motionFeatures: ImuMotionAnalyzer.MotionFeatures? = null,
+        rgbTrace: List<Triple<Double, Double, Double>>? = null
     ): ChannelResult {
         if (rawSignal.isEmpty()) return ChannelResult(
             doubleArrayOf(), null, 
-            HarmonicFeatureExtractor.HarmonicFeatures.empty(), null
+            HarmonicFeatureExtractor.HarmonicFeatures.empty(), null, null
         )
         
-        // 1. Detrend
         val detrended = DspFunctions.detrendIIR(rawSignal, 0.5, targetSampleRateHz)
         
-        // Path A: Standard Bandpass (Main)
         var mainFiltered = DspFunctions.butterworthBandpass(
             signal = detrended,
             lowCutoffHz = lowCutoffHz,
@@ -220,8 +242,6 @@ class SignalPipeline(
             order = 4
         )
         
-        // Path B: Wavelet Denoised (Diagnostic / Conditional)
-        // Apply if SQI is borderline (40-80).
         var denoisedFiltered: DoubleArray? = null
         if (sqi in 40..80) {
             val waveletCleaned = WaveletDenoiser.denoise(detrended, WaveletDenoiser.Config(levels = 4))
@@ -234,7 +254,6 @@ class SignalPipeline(
             )
         }
         
-        // Apply Notch (Walking Mode) to both if active
         if (motionFeatures != null && walkingModeEnabled) {
             mainFiltered = StepNotchFilter.apply(mainFiltered, motionFeatures, targetSampleRateHz)
             if (denoisedFiltered != null) {
@@ -242,37 +261,61 @@ class SignalPipeline(
             }
         }
         
-        // Normalize
         val mainNormalized = DspFunctions.zscoreNormalize(mainFiltered)
         val denoisedNormalized = if (denoisedFiltered != null) DspFunctions.zscoreNormalize(denoisedFiltered) else null
         
-        // Harmonics
         val mainHarmonics = HarmonicFeatureExtractor.extractHarmonicFeatures(mainNormalized, targetSampleRateHz)
         val denoisedHarmonics = if (denoisedNormalized != null) {
             HarmonicFeatureExtractor.extractHarmonicFeatures(denoisedNormalized, targetSampleRateHz)
-        } else null
+        } else {
+            null
+        }
         
-        return ChannelResult(mainNormalized, denoisedNormalized, mainHarmonics, denoisedHarmonics)
+        var posSignal: DoubleArray? = null
+        if (rgbTrace != null && rgbTrace.isNotEmpty()) {
+            val r = rgbTrace.map { it.first }.toDoubleArray()
+            val g = rgbTrace.map { it.second }.toDoubleArray()
+            val b = rgbTrace.map { it.third }.toDoubleArray()
+            
+            val rawPos = PosExtractor.computePosSignal(r, g, b, targetSampleRateHz)
+            
+            val detrendedPos = DspFunctions.detrendIIR(rawPos, 0.5, targetSampleRateHz)
+            val filteredPos = DspFunctions.butterworthBandpass(
+                signal = detrendedPos, 
+                lowCutoffHz = lowCutoffHz, 
+                highCutoffHz = highCutoffHz, 
+                sampleRateHz = targetSampleRateHz
+            )
+            posSignal = DspFunctions.zscoreNormalize(filteredPos)
+        }
+        
+        return ChannelResult(mainNormalized, denoisedNormalized, mainHarmonics, denoisedHarmonics, posSignal)
     }
 }
 
 data class RawSeriesBuffer(
     val faceData: List<TimestampedValue>,
-    val fingerData: List<TimestampedValue>
+    val fingerData: List<TimestampedValue>,
+    val faceRgb: List<Pair<Long, Triple<Double, Double, Double>>>? = null,
+    val fingerRgb: List<Pair<Long, Triple<Double, Double, Double>>>? = null,
+    val faceMotion: List<TimestampedValue>? = null,
+    val fingerSaturation: List<TimestampedValue>? = null,
+    val imuRms: List<TimestampedValue>? = null,
+    val faceRoi: List<Pair<Long, android.graphics.Rect>>? = null
 )
 
 data class ProcessedSeries(
     val timeMillis: List<Double>,
-    val faceSignal: DoubleArray, // Main (Standard)
-    val fingerSignal: DoubleArray, // Main (Standard)
-    val faceSignalDenoised: DoubleArray? = null, // Diagnostic
-    val fingerSignalDenoised: DoubleArray? = null, // Diagnostic
+    val faceSignal: DoubleArray,
+    val fingerSignal: DoubleArray,
+    val faceSignalDenoised: DoubleArray? = null,
+    val fingerSignalDenoised: DoubleArray? = null,
     val rawFaceSignal: DoubleArray = doubleArrayOf(),
     val rawFingerSignal: DoubleArray = doubleArrayOf(),
     val sampleRateHz: Double,
     val isValid: Boolean,
     val pttOutput: PttOutput? = null,
-    val pttOutputDenoised: PttOutput? = null, // Diagnostic PTT
+    val pttOutputDenoised: PttOutput? = null,
     val message: String = "",
     val faceMotionRms: DoubleArray = doubleArrayOf(),
     val fingerSaturationPct: DoubleArray = doubleArrayOf(),
@@ -280,13 +323,16 @@ data class ProcessedSeries(
     val faceSqi: IntArray = intArrayOf(),
     val fingerSqi: IntArray = intArrayOf(),
     val consensusPtt: Double? = null,
-    // New Harmonic Features
-    val mainHarmonicsFace: HarmonicFeatureExtractor.HarmonicFeatures,
-    val mainHarmonicsFinger: HarmonicFeatureExtractor.HarmonicFeatures,
+    val mainHarmonicsFace: HarmonicFeatureExtractor.HarmonicFeatures = HarmonicFeatureExtractor.HarmonicFeatures.empty(),
+    val mainHarmonicsFinger: HarmonicFeatureExtractor.HarmonicFeatures = HarmonicFeatureExtractor.HarmonicFeatures.empty(),
     val denoisedHarmonicsFace: HarmonicFeatureExtractor.HarmonicFeatures? = null,
-    val denoisedHarmonicsFinger: HarmonicFeatureExtractor.HarmonicFeatures? = null
+    val denoisedHarmonicsFinger: HarmonicFeatureExtractor.HarmonicFeatures? = null,
+    val faceSignalPos: DoubleArray? = null,
+    val fingerSignalPos: DoubleArray? = null,
+    val rawFaceRgb: List<Triple<Double, Double, Double>>? = null,
+    val rawFingerRgb: List<Triple<Double, Double, Double>>? = null,
+    val faceRoi: List<android.graphics.Rect?>? = null
 ) {
-    // ... methods ...
     fun getSampleCount(): Int = timeMillis.size
     
     fun getDurationSeconds(): Double {

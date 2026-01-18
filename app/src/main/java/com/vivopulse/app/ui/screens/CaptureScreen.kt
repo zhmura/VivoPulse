@@ -1,15 +1,22 @@
 package com.vivopulse.app.ui.screens
 
 import android.Manifest
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.content.pm.PackageManager
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import android.view.ViewGroup
 import android.widget.FrameLayout
+import android.widget.Toast
 import androidx.camera.view.PreviewView
 import androidx.compose.foundation.background
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
@@ -21,6 +28,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
@@ -97,6 +105,15 @@ fun CaptureScreen(
     val qualityState by viewModel.qualityState.collectAsState()
     val controller = viewModel.getCameraController()
     val statusBanner by controller.statusBanner.collectAsState(initial = null)
+    val detailedError by controller.detailedError.collectAsState(initial = null)
+    var showErrorDialog by remember { mutableStateOf(false) }
+    
+    // Show error dialog when detailedError is set
+    LaunchedEffect(detailedError) {
+        if (detailedError != null) {
+            showErrorDialog = true
+        }
+    }
     
     Scaffold(
         topBar = {
@@ -420,6 +437,22 @@ fun CaptureScreen(
                     isConcurrentSupported = viewModel.isConcurrentCameraSupported()
                 )
             }
+            
+            // Scrollable error dialog
+            if (showErrorDialog && detailedError != null) {
+                ErrorDetailDialog(
+                    error = detailedError!!,
+                    onDismiss = {
+                        showErrorDialog = false
+                        controller.clearError()
+                    },
+                    onCopy = {
+                        val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                        clipboard.setPrimaryClip(ClipData.newPlainText("VivoPulse Error", detailedError))
+                        Toast.makeText(context, "Error copied to clipboard", Toast.LENGTH_SHORT).show()
+                    }
+                )
+            }
         }
     }
 }
@@ -669,6 +702,78 @@ fun DebugMenu(
         confirmButton = {
             TextButton(onClick = onDismiss) {
                 Text("Close")
+            }
+        }
+    )
+}
+
+@Composable
+fun ErrorDetailDialog(
+    error: String,
+    onDismiss: () -> Unit,
+    onCopy: () -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Icon(
+                    Icons.Default.Error,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.error
+                )
+                Text("Camera Error Details")
+            }
+        },
+        text = {
+            Column(
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text(
+                    text = "Tap 'Copy' to share this error report:",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                
+                // Scrollable, selectable error text
+                Card(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(300.dp),
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.surfaceVariant
+                    )
+                ) {
+                    SelectionContainer {
+                        Text(
+                            text = error,
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .verticalScroll(rememberScrollState())
+                                .padding(8.dp),
+                            style = MaterialTheme.typography.bodySmall.copy(
+                                fontFamily = FontFamily.Monospace
+                            ),
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            Button(onClick = onCopy) {
+                Icon(Icons.Default.ContentCopy, contentDescription = null)
+                Spacer(modifier = Modifier.width(4.dp))
+                Text("Copy")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Dismiss")
             }
         }
     )

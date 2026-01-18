@@ -6,7 +6,7 @@ plugins {
 
 android {
     namespace = "com.vivopulse.feature.capture"
-    compileSdk = 34
+    compileSdk = 35
 
     defaultConfig {
         minSdk = 29
@@ -62,14 +62,16 @@ dependencies {
     implementation("androidx.compose.material3:material3")
     
     // CameraX
-    implementation("androidx.camera:camera-core:1.3.1")
-    implementation("androidx.camera:camera-camera2:1.3.1")
-    implementation("androidx.camera:camera-lifecycle:1.3.1")
-    implementation("androidx.camera:camera-view:1.3.1")
-    implementation("androidx.camera:camera-extensions:1.3.1")
+    val cameraxVersion = "1.5.0-alpha06"
+    implementation("androidx.camera:camera-core:$cameraxVersion")
+    implementation("androidx.camera:camera-camera2:$cameraxVersion")
+    implementation("androidx.camera:camera-lifecycle:$cameraxVersion")
+    implementation("androidx.camera:camera-view:$cameraxVersion")
+    implementation("androidx.camera:camera-extensions:$cameraxVersion")
     
     // ML Kit Face Detection
-    implementation("com.google.mlkit:face-detection:16.1.5")
+    // ML Kit Face Detection
+    implementation("com.google.mlkit:face-detection:16.1.7")
     
     // Coroutines
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")

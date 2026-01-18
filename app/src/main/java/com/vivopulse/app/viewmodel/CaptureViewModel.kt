@@ -7,13 +7,12 @@ import androidx.camera.camera2.interop.ExperimentalCamera2Interop
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.vivopulse.app.reporting.QualityIndicatorReporter
+import com.vivopulse.app.manager.SessionManager
 import com.vivopulse.app.util.ErrorHandler
 import com.vivopulse.feature.capture.DualCameraController
 import com.vivopulse.feature.capture.camera.CameraMode
 import com.vivopulse.feature.capture.camera.SequentialPrimary
 import com.vivopulse.feature.capture.RecordingResult
-import com.vivopulse.feature.capture.model.Frame
-import com.vivopulse.feature.capture.model.Source
 import com.vivopulse.feature.capture.roi.FaceRoi
 import com.vivopulse.feature.processing.realtime.QualityStatus
 import com.vivopulse.feature.processing.realtime.RealTimeQualityEngine
@@ -33,41 +32,14 @@ import java.util.Locale
 import javax.inject.Inject
 
 /**
- * Shared recording result across ViewModels.
- * 
- * This is a simple way to pass data between screens.
- * In production, consider using a Repository pattern or Navigation arguments.
- */
-object SharedRecordingState {
-    private val _lastRecordingResult = MutableStateFlow<RecordingResult?>(null)
-    val lastRecordingResult: StateFlow<RecordingResult?> = _lastRecordingResult.asStateFlow()
-    
-    private val _lastProcessedSignals = MutableStateFlow<List<com.vivopulse.signal.ProcessedSignal>?>(null)
-    val lastProcessedSignals: StateFlow<List<com.vivopulse.signal.ProcessedSignal>?> = _lastProcessedSignals.asStateFlow()
-    
-    fun setRecordingResult(result: RecordingResult, signals: List<com.vivopulse.signal.ProcessedSignal>) {
-        Log.d(
-            "SharedRecordingState",
-            "setRecordingResult(): frames=${result.frames.size}, faceFrames=${result.frames.count { it.source == Source.FACE }}, fingerFrames=${result.frames.count { it.source == Source.FINGER }}, signals=${signals.size}"
-        )
-        _lastRecordingResult.value = result
-        _lastProcessedSignals.value = signals
-    }
-    
-    fun clearRecordingResult() {
-        _lastRecordingResult.value = null
-        _lastProcessedSignals.value = null
-    }
-}
-
-/**
  * ViewModel for camera capture screen.
  */
 @ExperimentalCamera2Interop
 @HiltViewModel
 class CaptureViewModel @Inject constructor(
     application: Application,
-    @ApplicationContext private val context: android.content.Context
+    @ApplicationContext private val context: android.content.Context,
+    private val sessionManager: SessionManager
 ) : AndroidViewModel(application) {
 
     private val tag = "CaptureViewModel"
@@ -110,7 +82,7 @@ class CaptureViewModel @Inject constructor(
     val statusBanner: StateFlow<String?> = _statusBanner.asStateFlow()
     val cameraMode: StateFlow<CameraMode> = cameraController.cameraMode
     val sequentialPrimary: StateFlow<SequentialPrimary> = cameraController.sequentialPrimary
-
+    
     private val _lastRecordingResult = MutableStateFlow<RecordingResult?>(null)
     val lastRecordingResult: StateFlow<RecordingResult?> = _lastRecordingResult.asStateFlow()
 
@@ -272,8 +244,8 @@ class CaptureViewModel @Inject constructor(
         _lastRecordingResult.value = result
         _recordingDuration.value = 0L
         
-        // Share recording result with other ViewModels
-        SharedRecordingState.setRecordingResult(result, recordedSignals.toList())
+        // Share recording result with SessionManager
+        sessionManager.onRecordingComplete(result, recordedSignals.toList())
         qualityReporter.writeReport(tipsLog.toList())
         tipsLog.clear()
     }

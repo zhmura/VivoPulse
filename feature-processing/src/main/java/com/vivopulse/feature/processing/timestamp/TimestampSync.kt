@@ -234,7 +234,10 @@ object TimestampSync {
     /**
      * Interpolates stream values at specified timestamps using linear interpolation.
      */
-    private fun interpolateStream(
+    /**
+     * Interpolates stream values at specified timestamps using linear interpolation.
+     */
+    fun interpolateStream(
         data: List<TimestampedValue>,
         targetTimestamps: List<Long>
     ): List<Double> {

@@ -1,5 +1,6 @@
 package com.vivopulse.feature.capture.model
 
+import com.vivopulse.feature.capture.RgbData
 import java.nio.ByteBuffer
 
 /**
@@ -30,7 +31,14 @@ data class Frame(
     val yuvPlanes: List<ByteBuffer>,
     val captureTimestamp: Long = System.currentTimeMillis(),
     val faceLuma: Double? = null,
-    val fingerLuma: Double? = null
+    val fingerLuma: Double? = null,
+    val faceRgb: RgbData? = null,
+    val fingerRgb: RgbData? = null,
+    // Detailed metrics for export/analysis
+    val faceMotionRms: Double? = null,
+    val fingerSaturationPct: Double? = null,
+    val imuRmsG: Double? = null,
+    val faceRoiRect: android.graphics.Rect? = null
 ) {
     /**
      * Get frame size in bytes (approximate).
@@ -44,8 +52,8 @@ data class Frame(
      */
     fun getLuma(): Double? {
         return when (source) {
-            Source.FACE -> faceLuma
-            Source.FINGER -> fingerLuma
+            Source.FACE -> faceLuma ?: faceRgb?.g
+            Source.FINGER -> fingerLuma ?: fingerRgb?.g
         }
     }
     
@@ -71,7 +79,13 @@ data class Frame(
         return copy(
             yuvPlanes = copiedPlanes,
             faceLuma = faceLuma,
-            fingerLuma = fingerLuma
+            fingerLuma = fingerLuma,
+            faceRgb = faceRgb,
+            fingerRgb = fingerRgb,
+            faceMotionRms = faceMotionRms,
+            fingerSaturationPct = fingerSaturationPct,
+            imuRmsG = imuRmsG,
+            faceRoiRect = faceRoiRect
         )
     }
 }

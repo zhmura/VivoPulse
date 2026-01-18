@@ -268,8 +268,8 @@ data class ChannelSQI(
     fun getQualityLevel(): QualityLevel {
         return when {
             score >= 80 -> QualityLevel.EXCELLENT
-            score >= 70 -> QualityLevel.GOOD
-            score >= 50 -> QualityLevel.FAIR
+            score >= 60 -> QualityLevel.GOOD
+            score >= 40 -> QualityLevel.FAIR
             else -> QualityLevel.POOR
         }
     }

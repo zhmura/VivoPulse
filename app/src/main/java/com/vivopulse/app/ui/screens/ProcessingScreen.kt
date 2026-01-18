@@ -29,6 +29,7 @@ fun ProcessingScreen(
     val isProcessing by viewModel.isProcessing.collectAsState()
     val showRaw by viewModel.showRawSignal.collectAsState()
     val simulationConfig by viewModel.simulationConfig.collectAsState()
+    val pttResult by viewModel.pttResult.collectAsState()
     
     var showSimPanel by remember { mutableStateOf(false) }
     
@@ -119,6 +120,8 @@ fun ProcessingScreen(
                         SignalChart(
                             signal = if (showRaw) series.rawFaceSignal else series.faceSignal,
                             color = Color(0xFF2196F3), // Blue
+                            durationSec = series.getDurationSeconds(),
+                            validSegments = pttResult?.goodSegments,
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .height(120.dp)
@@ -139,6 +142,8 @@ fun ProcessingScreen(
                         SignalChart(
                             signal = if (showRaw) series.rawFingerSignal else series.fingerSignal,
                             color = Color(0xFFE91E63), // Pink
+                            durationSec = series.getDurationSeconds(),
+                            validSegments = pttResult?.goodSegments,
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .height(120.dp)
@@ -180,7 +185,9 @@ fun ProcessingScreen(
 fun SignalChart(
     signal: DoubleArray,
     color: Color,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    durationSec: Double? = null,
+    validSegments: List<com.vivopulse.feature.processing.sync.GoodSyncSegment>? = null
 ) {
     if (signal.isEmpty()) {
         Box(modifier = modifier) {
@@ -205,6 +212,20 @@ fun SignalChart(
         if (range < 1e-10) {
             // Constant signal
             return@Canvas
+        }
+        
+        // Draw valid segments background
+        if (validSegments != null && durationSec != null && durationSec > 0) {
+            validSegments.forEach { segment ->
+                val startX = (segment.window.tStartMs / 1000.0 / durationSec * width).toFloat()
+                val endX = (segment.window.tEndMs / 1000.0 / durationSec * width).toFloat()
+                
+                drawRect(
+                    color = Color.Green.copy(alpha = 0.2f),
+                    topLeft = Offset(startX, 0f),
+                    size = androidx.compose.ui.geometry.Size(endX - startX, height)
+                )
+            }
         }
         
         // Build path

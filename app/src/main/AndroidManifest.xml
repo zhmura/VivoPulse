@@ -47,6 +47,12 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <activity
+            android:name=".ui.ErrorDisplayActivity"
+            android:theme="@android:style/Theme.DeviceDefault.Light.NoActionBar"
+            android:exported="false" />
+
     </application>
 
 </manifest>

@@ -5,7 +5,7 @@ import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.vivopulse.app.util.ErrorHandler
-import com.vivopulse.app.viewmodel.SharedRecordingState
+import com.vivopulse.app.manager.SessionManager
 import com.vivopulse.feature.capture.RecordingResult
 import com.vivopulse.feature.capture.model.Source
 import com.vivopulse.feature.processing.ProcessedSeries
@@ -52,7 +52,8 @@ import javax.inject.Inject
  */
 @HiltViewModel
 class ProcessingViewModel @Inject constructor(
-    @ApplicationContext private val context: Context
+    @ApplicationContext private val context: Context,
+    private val sessionManager: SessionManager
 ) : ViewModel() {
     
     private val tag = "ProcessingViewModel"
@@ -119,12 +120,12 @@ class ProcessingViewModel @Inject constructor(
                 val startTime = System.currentTimeMillis()
                 
                 // Check for real recording
-                val recordingResult = SharedRecordingState.lastRecordingResult.value
+                val recordingResult = sessionManager.lastRecordingResult.value
                 
                 val processedSeries = withContext(Dispatchers.Default) {
                     if (recordingResult != null && recordingResult.frames.isNotEmpty()) {
                         // Process real frames
-                        val signals = SharedRecordingState.lastProcessedSignals.value
+                        val signals = sessionManager.lastProcessedSignals.value
                         processRealFrames(recordingResult, signals)
                     } else {
                         // Fallback to synthetic data
@@ -136,6 +137,7 @@ class ProcessingViewModel @Inject constructor(
                 performanceMetrics.recordProcessingTime(processingTime)
                 
                 _processedSeries.value = processedSeries
+                sessionManager.onProcessingComplete(processedSeries)
                 
                 // Compute PTT
                 if (processedSeries.isValid) {
@@ -263,7 +265,7 @@ class ProcessingViewModel @Inject constructor(
             try {
                 val path = withContext(Dispatchers.IO) {
                     // Get recording stats if available
-                    val recordingStats = SharedRecordingState.lastRecordingResult.value?.stats
+                    val recordingStats = sessionManager.lastRecordingResult.value?.stats
                     val faceFps = recordingStats?.faceStats?.averageFps ?: 30f
                     val fingerFps = recordingStats?.fingerStats?.averageFps ?: 30f
                     
@@ -306,12 +308,17 @@ class ProcessingViewModel @Inject constructor(
                     ).toSet()
                     
                     // Create signal data points
+                    // Create signal data points
                     val faceData = series.timeMillis.indices.map { i ->
                         SignalDataPoint(
                             timeMs = series.timeMillis[i],
                             rawValue = series.rawFaceSignal.getOrNull(i) ?: 0.0,
                             filteredValue = series.faceSignal[i],
-                            isPeak = i in facePeaks
+                            isPeak = i in facePeaks,
+                            rgb = series.rawFaceRgb?.getOrNull(i),
+                            motion = series.faceMotionRms.getOrNull(i),
+                            saturation = null,
+                            imu = series.imuRmsG.getOrNull(i)
                         )
                     }
                     
@@ -320,7 +327,11 @@ class ProcessingViewModel @Inject constructor(
                             timeMs = series.timeMillis[i],
                             rawValue = series.rawFingerSignal.getOrNull(i) ?: 0.0,
                             filteredValue = series.fingerSignal[i],
-                            isPeak = i in fingerPeaks
+                            isPeak = i in fingerPeaks,
+                            rgb = series.rawFingerRgb?.getOrNull(i),
+                            motion = null,
+                            saturation = series.fingerSaturationPct.getOrNull(i),
+                            imu = series.imuRmsG.getOrNull(i)
                         )
                     }
                     
@@ -465,7 +476,51 @@ class ProcessingViewModel @Inject constructor(
             }
         }
         
-        val rawBuffer = RawSeriesBuffer(faceData, fingerData)
+        val faceRgb = if (faceFrames.isNotEmpty()) {
+            faceFrames.mapNotNull { frame ->
+                frame.faceRgb?.let { rgb ->
+                    Pair(frame.timestampNs, Triple(rgb.r, rgb.g, rgb.b))
+                }
+            }
+        } else null
+
+        val fingerRgb = if (fingerFrames.isNotEmpty()) {
+            fingerFrames.mapNotNull { frame ->
+                frame.fingerRgb?.let { rgb ->
+                    Pair(frame.timestampNs, Triple(rgb.r, rgb.g, rgb.b))
+                }
+            }
+        } else null
+
+        // Extract metrics
+        val faceMotion = if (faceFrames.isNotEmpty()) {
+            faceFrames.map { frame ->
+                TimestampedValue(frame.timestampNs, frame.faceMotionRms ?: 0.0)
+            }
+        } else null
+
+        val fingerSaturation = if (fingerFrames.isNotEmpty()) {
+            fingerFrames.map { frame ->
+                TimestampedValue(frame.timestampNs, frame.fingerSaturationPct ?: 0.0)
+            }
+        } else null
+
+        val imuSource = if (fingerFrames.isNotEmpty()) fingerFrames else faceFrames
+        val imuRms = if (imuSource.isNotEmpty()) {
+             imuSource.map { frame -> 
+                TimestampedValue(frame.timestampNs, frame.imuRmsG ?: 0.0)
+             }
+        } else null
+
+        val rawBuffer = RawSeriesBuffer(
+            faceData = faceData, 
+            fingerData = fingerData, 
+            faceRgb = faceRgb, 
+            fingerRgb = fingerRgb,
+            faceMotion = faceMotion,
+            fingerSaturation = fingerSaturation,
+            imuRms = imuRms
+        )
         
         // Process through pipeline with pre-processed signals
         return signalPipeline.process(rawBuffer, preProcessedSignals)

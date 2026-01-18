@@ -114,17 +114,29 @@ data class SignalDataPoint(
     val rawValue: Double,
     val filteredValue: Double,
     val isPeak: Boolean = false,
-    val phaseTag: String? = null  // Lab mode phase tag
+    val phaseTag: String? = null,
+    val rgb: Triple<Double, Double, Double>? = null,
+    // Detailed metrics
+    val motion: Double? = null,
+    val saturation: Double? = null,
+    val imu: Double? = null
 ) {
     /**
      * Convert to CSV row.
      */
     fun toCsvRow(): String {
         val baseRow = "${String.format("%.3f", timeMs)},${String.format("%.6f", rawValue)},${String.format("%.6f", filteredValue)},${if (isPeak) 1 else 0}"
-        return if (phaseTag != null) {
-            "$baseRow,$phaseTag"
+        val rgbPart = if (rgb != null) {
+            ",${String.format("%.3f", rgb.first)},${String.format("%.3f", rgb.second)},${String.format("%.3f", rgb.third)}"
         } else {
-            "$baseRow,"
+            ",,,"
+        }
+        val metricsPart = ",${String.format("%.4f", motion ?: 0.0)},${String.format("%.2f", saturation ?: 0.0)},${String.format("%.4f", imu ?: 0.0)}"
+        
+        return if (phaseTag != null) {
+            "$baseRow$rgbPart$metricsPart,$phaseTag"
+        } else {
+            "$baseRow$rgbPart$metricsPart,"
         }
     }
     
@@ -132,6 +144,6 @@ data class SignalDataPoint(
         /**
          * CSV header.
          */
-        const val CSV_HEADER = "time_ms,raw_value,filtered_value,is_peak,phase_tag"
+        const val CSV_HEADER = "time_ms,raw_value,filtered_value,is_peak,r,g,b,motion_rms,saturation_pct,imu_rms_g,phase_tag"
     }
 }

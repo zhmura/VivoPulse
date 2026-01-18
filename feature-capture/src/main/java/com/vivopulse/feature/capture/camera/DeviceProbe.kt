@@ -8,6 +8,7 @@ import android.hardware.camera2.CameraMetadata
 import android.os.Build
 import android.util.Log
 import android.util.Size
+import com.vivopulse.signal.AppLogger
 
 /**
  * Camera mode for dual-camera operation.
@@ -33,6 +34,7 @@ data class DeviceCapabilities(
     val supportsAntiFlicker: Boolean,
     val supportsAeLock: Boolean,
     val supportsAwbLock: Boolean,
+    val concurrentPair: Pair<String, String>?,
     val deviceInfo: String
 )
 
@@ -54,10 +56,14 @@ class DeviceProbe(private val context: Context) {
      */
     fun probe(): DeviceCapabilities {
         val hasConcurrent = checkConcurrentSupport()
+        AppLogger.log(tag, "Concurrent support check: $hasConcurrent")
+        
         val concurrentIds = getConcurrentCameraIds()
+        AppLogger.log(tag, "Concurrent IDs found: $concurrentIds")
         
         // Find front and back cameras
         val (frontId, backId) = findFrontAndBackCameras()
+        AppLogger.log(tag, "Cameras found - Front: $frontId, Back: $backId")
         
         // Get max resolutions
         val maxFrontRes = frontId?.let { getMaxResolution(it) }
@@ -66,13 +72,16 @@ class DeviceProbe(private val context: Context) {
         // Check 3A capabilities
         val (antiFlicker, aeLock, awbLock) = check3ACapabilities(frontId, backId)
         
-        // Recommend mode
-        val mode = recommendMode(hasConcurrent, concurrentIds, frontId, backId)
+        // Recommend mode and pair
+        val (mode, pair) = recommendMode(hasConcurrent, concurrentIds, frontId, backId)
         
         val deviceInfo = "${Build.MANUFACTURER} ${Build.MODEL} (API ${Build.VERSION.SDK_INT})"
         
         Log.i(tag, "Device probe complete: $deviceInfo")
         Log.i(tag, "Concurrent support: $hasConcurrent, Recommended mode: $mode")
+        if (pair != null) {
+            Log.i(tag, "Concurrent pair found: ${pair.first} + ${pair.second}")
+        }
         
         return DeviceCapabilities(
             hasConcurrentSupport = hasConcurrent,
@@ -85,6 +94,7 @@ class DeviceProbe(private val context: Context) {
             supportsAntiFlicker = antiFlicker,
             supportsAeLock = aeLock,
             supportsAwbLock = awbLock,
+            concurrentPair = pair,
             deviceInfo = deviceInfo
         )
     }
@@ -201,33 +211,75 @@ class DeviceProbe(private val context: Context) {
     
     /**
      * Recommend camera mode based on capabilities.
+     * Returns Mode and specific Concurrent Pair (frontId, backId) if applicable.
      */
     private fun recommendMode(
         hasConcurrent: Boolean,
         concurrentIds: Set<Set<String>>,
-        frontId: String?,
-        backId: String?
-    ): CameraMode {
-        // If no concurrent support, use sequential
+        defaultFrontId: String?,
+        defaultBackId: String?
+    ): Pair<CameraMode, Pair<String, String>?> {
+        // 0. Check for Emulator
+        if (isEmulator()) {
+            Log.w(tag, "Emulator detected. Forcing SAFE_MODE_SEQUENTIAL.")
+            AppLogger.log(tag, "Emulator detected. Forcing SAFE_MODE_SEQUENTIAL.")
+            return Pair(CameraMode.SAFE_MODE_SEQUENTIAL, null)
+        }
+
+        // 1. If no concurrent support, use sequential
         if (!hasConcurrent || concurrentIds.isEmpty()) {
             Log.i(tag, "Recommending SAFE_MODE_SEQUENTIAL (no concurrent support)")
-            return CameraMode.SAFE_MODE_SEQUENTIAL
+            return Pair(CameraMode.SAFE_MODE_SEQUENTIAL, null)
         }
         
-        // Check if our front/back pair is in concurrent sets
-        if (frontId != null && backId != null) {
-            val hasPair = concurrentIds.any { set ->
-                set.contains(frontId) && set.contains(backId)
+        // 2. Try to find a pair matching Default Front ("1") + Default Back ("0")
+        if (defaultFrontId != null && defaultBackId != null) {
+            val hasDefaultPair = concurrentIds.any { set ->
+                set.contains(defaultFrontId) && set.contains(defaultBackId)
+            }
+            if (hasDefaultPair) {
+                Log.i(tag, "Recommending CONCURRENT (default front+back supported)")
+                return Pair(CameraMode.CONCURRENT, Pair(defaultFrontId, defaultBackId))
+            }
+        }
+        
+        // 3. Try to find ANY valid Front + Back pair (navigating physical IDs)
+        // We iterate through all concurrent sets
+        for (set in concurrentIds) {
+            // Check if set has a front-facing and a back-facing camera
+            var front: String? = null
+            var back: String? = null
+            
+            for (id in set) {
+                try {
+                    val chars = cameraManager.getCameraCharacteristics(id)
+                    val facing = chars.get(CameraCharacteristics.LENS_FACING)
+                    if (facing == CameraCharacteristics.LENS_FACING_FRONT) front = id
+                    if (facing == CameraCharacteristics.LENS_FACING_BACK) back = id
+                } catch (e: Exception) {
+                    // Ignore
+                }
             }
             
-            if (hasPair) {
-                Log.i(tag, "Recommending CONCURRENT (front+back supported)")
-                return CameraMode.CONCURRENT
+            if (front != null && back != null) {
+                Log.i(tag, "Recommending CONCURRENT (found physical pair: $front + $back)")
+                return Pair(CameraMode.CONCURRENT, Pair(front, back))
             }
         }
         
-        // Fallback to sequential
-        Log.i(tag, "Recommending SAFE_MODE_SEQUENTIAL (front+back not in concurrent sets)")
-        return CameraMode.SAFE_MODE_SEQUENTIAL
+        // 4. Fallback to sequential
+        Log.i(tag, "Recommending SAFE_MODE_SEQUENTIAL (no valid front+back pair found)")
+        return Pair(CameraMode.SAFE_MODE_SEQUENTIAL, null)
+    }
+    
+    private fun isEmulator(): Boolean {
+        return (Build.FINGERPRINT.startsWith("generic")
+                || Build.FINGERPRINT.startsWith("unknown")
+                || Build.MODEL.contains("google_sdk")
+                || Build.MODEL.contains("Emulator")
+                || Build.MODEL.contains("Android SDK built for x86")
+                || Build.MANUFACTURER.contains("Genymotion")
+                || (Build.BRAND.startsWith("generic") && Build.DEVICE.startsWith("generic"))
+                || "google_sdk" == Build.PRODUCT)
     }
 }

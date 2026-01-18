@@ -1,6 +1,8 @@
 package com.vivopulse.feature.processing
 
 import com.vivopulse.feature.processing.ptt.PttEngine
+import com.vivopulse.feature.processing.sync.GoodSyncDetector
+import com.vivopulse.feature.processing.sync.GoodSyncSegment
 import com.vivopulse.signal.CrossCorrelation
 import com.vivopulse.signal.LagStabilityResult
 
@@ -58,6 +60,10 @@ object PttCalculator {
             overlapS = 5.0
         )
         
+        // Detect GoodSync segments for UI visualization and further analysis
+        val goodSyncDetector = GoodSyncDetector()
+        val segments = goodSyncDetector.detectSessionSegments(faceSignal, fingerSignal, sampleRate)
+        
         return PttResult(
             pttMs = pttOutput.pttMs ?: 0.0,
             correlationScore = pttOutput.corrScore,
@@ -67,7 +73,8 @@ object PttCalculator {
             isReliable = pttOutput.confidence >= 60.0,
             isPlausible = pttOutput.pttMs != null,
             isStable = stabilityResult.isStable(),
-            message = pttOutput.guidance?.joinToString(", ") ?: stabilityResult.message
+            message = pttOutput.guidance?.joinToString(", ") ?: stabilityResult.message,
+            goodSegments = segments
         )
     }
 }
@@ -84,7 +91,8 @@ data class PttResult(
     val isReliable: Boolean = false, // Correlation > 0.7
     val isPlausible: Boolean = false, // PTT in 30-200ms range
     val isStable: Boolean = false,    // Stability < 25ms
-    val message: String = ""
+    val message: String = "",
+    val goodSegments: List<GoodSyncSegment> = emptyList()
 ) {
     /**
      * Get quality indicator.

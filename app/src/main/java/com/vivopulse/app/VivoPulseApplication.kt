@@ -7,7 +7,9 @@ import dagger.hilt.android.HiltAndroidApp
 class VivoPulseApplication : Application() {
     override fun onCreate() {
         super.onCreate()
-        // Initialize any required libraries here
+        // Initialize logging and crash handling
+        com.vivopulse.signal.AppLogger.init(this, BuildConfig.VERSION_NAME)
+        com.vivopulse.app.util.CrashHandler.init(this)
     }
 }
 

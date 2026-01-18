@@ -4,10 +4,11 @@ import android.graphics.Rect
 import java.nio.ByteBuffer
 
 /**
- * Luma (brightness) extraction utilities for PPG signal generation.
- * 
- * Extracts average luma from YUV_420_888 frames for rPPG analysis.
+ * Utility for extracting average luma from YUV_420_888 frames.
+ *
+ * @deprecated Use RgbExtractor for RGB-based signal extraction.
  */
+@Deprecated("Use RgbExtractor instead")
 object LumaExtractor {
     
     /**
