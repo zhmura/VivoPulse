@@ -38,6 +38,20 @@ data class RealTimeQualityState(
 /**
  * Near-real-time quality engine that consumes lightweight [SignalSample]s
  * and produces UI-friendly quality indicators at ~2-4 Hz.
+ * 
+ * **MVP Requirements Validation:**
+ * - **FR-I1 (Finger Metrics):**
+ *   - Saturation% (Threshold > 98% good, < 90% bad)
+ *   - SNR (estimated via Peak detect)
+ *   - AC/DC Ratio
+ * - **FR-I2 (Face Metrics):**
+ *   - ROI Motion RMS (Threshold < 0.5px good)
+ *   - SNR
+ * - **FR-I3 (UI Indicators):** Aggregates metrics into Traffic Light status (Green/Yellow/Red) + User Tips.
+ * 
+ * **Reference Implementation:**
+ * - Uses rolling windows (e.g. 6s) to compute stability.
+ * - Hysteresis prevents frequent status flipping.
  */
 class RealTimeQualityEngine(
     bufferSeconds: Double = 20.0,
@@ -294,6 +308,13 @@ class RealTimeQualityEngine(
         return status to diagnostics
     }
 
+    /**
+     * Selects the most relevant instruction tip for the user.
+     * 
+     * **Requirements:**
+     * - **FR-I3:** Provides actionable feedback (e.g., "Hold still", "Increase pressure").
+     * - **Priority:** Address Red status first, then Yellow.
+     */
     private fun selectTip(
         face: ChannelQualityIndicator,
         finger: ChannelQualityIndicator,

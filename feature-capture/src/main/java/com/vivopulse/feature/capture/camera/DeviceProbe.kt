@@ -41,11 +41,14 @@ data class DeviceCapabilities(
 /**
  * Probes device camera capabilities for dual-site PPG.
  * 
- * Checks:
- * - Concurrent camera support (API 30+)
- * - Available camera IDs and characteristics
- * - Stream configuration support
- * - 3A capabilities
+ * **MVP Requirements Validation:**
+ * - **FR-C1 (Capability Check):** Deterministically checks `PackageManager.FEATURE_CAMERA_CONCURRENT`.
+ * - **NFR-C1 (Compatibility):** Filters cameras to find valid Front/Back pairs (ignoring auxiliary wide/tele lenses).
+ * - **FR-C5 (3A Locking):** Probes for `CONTROL_AE_LOCK_AVAILABLE` and `CONTROL_AWB_LOCK_AVAILABLE`.
+ * 
+ * **Functional Goal:**
+ * - Provide a single source of truth for "What can this phone do?".
+ * - Drive the `CameraBindingHelper` fallback logic with precise capability flags.
  */
 class DeviceProbe(private val context: Context) {
     private val tag = "DeviceProbe"

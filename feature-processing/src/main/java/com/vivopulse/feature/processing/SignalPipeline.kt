@@ -15,6 +15,16 @@ import com.vivopulse.signal.ProcessedSignal
 
 /**
  * Signal processing pipeline for dual camera PPG signals.
+ * 
+ * **MVP Requirements Validation:**
+ * - **FR-S1 (Preprocessing):** Orchestrates resampling (100Hz), detrending, and bandpass filtering (0.7-4.0Hz).
+ * - **FR-S4 (GoodSync):** Computes cross-correlation and quality gating to identify valid PTT windows.
+ * - **FR-P1/P2 (PTT):** Executes PTT algorithms (XCorr + Foot-to-Foot) and computes consensus.
+ * - **FR-E1 (Export):** Produces `ProcessedSeries` object structured for JSON/CSV export.
+ * 
+ * **Functional Goal:**
+ * - Transform loose `RawSeriesBuffer` (random timestamps) into a scientifically valid, aligned `ProcessedSeries`.
+ * - Act as the "Black Box" that takes raw frames and outputs clinical metrics.
  */
 class SignalPipeline(
     private val targetSampleRateHz: Double = 100.0,

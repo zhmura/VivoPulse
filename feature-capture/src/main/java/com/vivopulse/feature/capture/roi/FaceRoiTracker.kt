@@ -18,11 +18,15 @@ import kotlin.math.min
 /**
  * Tracks face ROI for rPPG signal extraction.
  * 
- * Features:
- * - ML Kit face detection
- * - Forehead ROI computation from landmarks
- * - Simple optical flow tracking (Lucas-Kanade approximation)
- * - Stable ROI with jitter reduction
+ * **MVP Requirements Validation:**
+ * - **FR-S2 (Signal Quality):** Provides stable ROI to minimize motion artifacts in signal extraction.
+ * - **NFR-P1 (Performance):** Efficient YUV processing (targets < 3ms avg).
+ * - **NFR-C2 (Orientation):** Handles device rotation and sensor orientation for correct ROI mapping.
+ * 
+ * **Features:**
+ * - ML Kit face detection (periodically).
+ * - Optical Flow tracking (inter-frame) for low-latency updates.
+ * - Jitter reduction via exponential smoothing.
  */
 class FaceRoiTracker(
     private val detectionInterval: Int = 5 // Detect face every N frames
@@ -69,20 +73,50 @@ class FaceRoiTracker(
      * @param height Frame height
      * @param rotation Image rotation
      */
-    fun processFrame(
-        yPlane: ByteArray,
-        width: Int,
-        height: Int,
-        rotation: Int = 0
-    ) {
+    /**
+     * Process a frame and update ROI.
+     * 
+     * **Requirements:**
+     * - **NFR-P1:** Optimized YUV extraction to stay within 3ms budget.
+     * - **FR-C2:** Handles ImageProxy lifecycle (does not close it, but consumes buffer efficiently).
+     * 
+     * @param image ImageProxy from camera
+     */
+    fun processFrame(image: androidx.camera.core.ImageProxy) {
+        val width = image.width
+        val height = image.height
+        val rotation = image.imageInfo.rotationDegrees
+        
+        // Extract Y plane for tracking (and detection Y component)
+        // We MUST handle stride here to ensure contiguous data for tracking
+        val yPlane = image.planes[0]
+        val yBuffer = yPlane.buffer
+        val stride = yPlane.rowStride
+        
+        val compactY = if (stride == width) {
+            val data = ByteArray(yBuffer.remaining())
+            yBuffer.get(data)
+            yBuffer.rewind() // Rewind for other consumers if needed
+            data
+        } else {
+            // Compact the rows
+            val data = ByteArray(width * height)
+            for (y in 0 until height) {
+                yBuffer.position(y * stride)
+                yBuffer.get(data, y * width, width)
+            }
+            yBuffer.rewind() // Reset
+            data
+        }
+        
         frameCount++
         
         // Detect face periodically or if lost
         if (frameCount % detectionInterval == 0 || currentRoi == null) {
-            detectFace(yPlane, width, height, rotation)
+            detectFace(image, compactY, width, height, rotation)
         } else {
             // Track existing ROI using optical flow approximation
-            trackRoi(yPlane, width, height)
+            trackRoi(compactY, width, height)
         }
         
         // Update state
@@ -91,26 +125,63 @@ class FaceRoiTracker(
     
     /**
      * Detect face using ML Kit.
+     * Requires full NV21 conversion.
      */
     private fun detectFace(
-        yPlane: ByteArray,
+        image: androidx.camera.core.ImageProxy,
+        compactY: ByteArray, // Pre-extracted Y plane
         width: Int,
         height: Int,
         rotation: Int
     ) {
         try {
-            // Convert Y plane to InputImage for ML Kit (copy to avoid buffer reuse issues)
-            val detectionBytes = yPlane.copyOf()
-            val buffer = ByteBuffer.wrap(detectionBytes)
-            val image = InputImage.fromByteBuffer(
+            // ML Kit requires NV21 (Y + VU interleaved)
+            // We already have Y (compactY). matches InputImage.IMAGE_FORMAT_NV21 expectations.
+            // But we need to append VU data.
+            
+            // Allocate full NV21 buffer: Y + V + U
+            // Size = width * height * 3 / 2
+            val nv21Size = width * height + 2 * (width / 2 * height / 2)
+            val nv21 = ByteArray(nv21Size)
+            
+            // 1. Copy Y
+            System.arraycopy(compactY, 0, nv21, 0, compactY.size)
+            
+            // 2. Interleave VU
+            val uPlane = image.planes[1]
+            val vPlane = image.planes[2]
+            val uBuffer = uPlane.buffer
+            val vBuffer = vPlane.buffer
+            val uStride = uPlane.rowStride
+            val vStride = vPlane.rowStride
+            val pixelStride = uPlane.pixelStride
+            
+            var pos = width * height
+            
+            // Iterate over V/U rows (height/2) and cols (width/2)
+            for (y in 0 until height / 2) {
+                for (x in 0 until width / 2) {
+                    val vIndex = y * vStride + x * pixelStride
+                    val uIndex = y * uStride + x * pixelStride
+                    
+                    if (vIndex < vBuffer.limit() && uIndex < uBuffer.limit()) {
+                        // NV21 is V then U
+                        nv21[pos++] = vBuffer.get(vIndex)
+                        nv21[pos++] = uBuffer.get(uIndex)
+                    }
+                }
+            }
+            
+            val buffer = ByteBuffer.wrap(nv21)
+            val inputImage = InputImage.fromByteBuffer(
                 buffer,
                 width,
                 height,
                 rotation,
-                InputImage.IMAGE_FORMAT_NV21 // ML Kit expects NV21 for single plane
+                InputImage.IMAGE_FORMAT_NV21
             )
             
-            detector.process(image)
+            detector.process(inputImage)
                 .addOnSuccessListener { faces ->
                     handleDetectionResult(faces, width, height)
                 }
@@ -119,7 +190,7 @@ class FaceRoiTracker(
                     handleLostFace()
                 }
             
-            storeLastFrame(yPlane, width, height)
+            storeLastFrame(compactY, width, height)
             
         } catch (e: Exception) {
             Log.e(tag, "Error processing frame", e)

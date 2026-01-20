@@ -17,13 +17,16 @@ import com.vivopulse.signal.AppLogger
 import kotlin.Pair
 
 /**
- * Camera binding helper with progressive fallback logic.
+ * Helper to manage CameraX lifecycle binding for dual streams.
  * 
- * Implements the fallback strategy:
- * 1. Try concurrent mode at target resolution
- * 2. Retry with smaller resolution
- * 3. Retry with YUV-only (no preview)
- * 4. Fall back to sequential mode
+ * **MVP Requirements Validation:**
+ * - **FR-C1 (Binding Fallback):** Implements the strict fallback hierarchy (Concurrent -> Reduced -> Analysis -> Sequential).
+ * - **NFR-R1 (Safe Mode):** Ensures application does not crash on device capability mismatch; downgrades gracefully.
+ * - **FR-C3 (Resolution):** Validates and applies target resolution (720p) or supported alternatives.
+ * 
+ * **Functional Goal:**
+ * - Abstract away the complexity of concurrent vs sequential binding.
+ * - Provide a unified error handling capability for the initial bind (startup) phase.
  */
 @Suppress("DEPRECATION")
 @SuppressLint("RestrictedApi")

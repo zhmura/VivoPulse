@@ -48,7 +48,18 @@ import android.graphics.Rect
 /**
  * Controller for dual camera capture (front and back cameras simultaneously).
  * 
- * Manages concurrent camera access, frame streaming, and recording sessions.
+ * **MVP Requirements Validation:**
+ * - **FR-C1 (Concurrent Capture):** Manages concurrent access to front (face) and back (finger) cameras.
+ *   Implements fallback logic: Concurrent -> Reduced Res -> Analysis Only -> Sequential.
+ * - **FR-C2 (ImageAnalysis):** Configures analysis with `STRATEGY_KEEP_ONLY_LATEST`.
+ * - **FR-C3 (Resolution):** Targets 720p (1280x720) @ 30fps for both streams.
+ * - **FR-C4 (Torch/Thermal):** Manages torch state with 60s timeout and thermal throttling monitoring.
+ * - **FR-I1/FR-I2 (Metrics):** Computes raw signal metrics (Sat%, Luma) for downstream quality estimation.
+ * - **NFR-R1 (Reliability):** Handles camera disconnects and binding failures with safe teardown/retry.
+ * 
+ * **Architecture:**
+ * - Uses a shared `FixedThreadPool(2)` for parallel frame analysis to avoid blocking.
+ * - separate flows for `frontFrames` and `backFrames` to decouple consumers.
  */
 @ExperimentalCamera2Interop
 class DualCameraController(
@@ -93,8 +104,8 @@ class DualCameraController(
     private var frontCamera: Camera? = null
     private var backCamera: Camera? = null
     
-    private val analyzerExecutor: ExecutorService = Executors.newSingleThreadExecutor { runnable ->
-        Thread(runnable, "VivoPulseAnalyzer").apply { priority = Thread.NORM_PRIORITY }
+    private val analyzerExecutor: ExecutorService = Executors.newFixedThreadPool(2) { runnable ->
+        Thread(runnable, "VivoPulseAnalyzer-${System.nanoTime()}").apply { priority = Thread.NORM_PRIORITY }
     }
     
     private val _frontFrames = MutableSharedFlow<Frame>(
@@ -199,6 +210,10 @@ class DualCameraController(
     // Store the last binding exception across retries
     private var lastBindingException: Exception? = null
     
+    private val consecutiveErrors = java.util.concurrent.ConcurrentHashMap<Source, Int>()
+    private val maxConsecutiveErrors = 30
+    @Volatile private var circuitBreakerTripped = false
+
     fun isConcurrentCameraSupported(): Boolean {
         val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
         return try {
@@ -287,6 +302,15 @@ class DualCameraController(
         sensorManager?.unregisterListener(sensorListener)
     }
 
+    /**
+     * Starts the camera capture session.
+     * 
+     * **Requirements:**
+     * - **FR-C1:** Probes strict concurrent capability.
+     * - **NFR-R1:** Safe Mode fallback if concurrency fails.
+     * 
+     * @param lifecycleOwner Lifecycle owner for camera binding.
+     */
     @SuppressLint("RestrictedApi")
     fun startCamera(
         lifecycleOwner: LifecycleOwner,
@@ -307,6 +331,8 @@ class DualCameraController(
         fingerFrameCounter = 0
         fingerRoiRect = null
         lastBindingException = null  // Clear previous errors
+        consecutiveErrors.clear()
+        circuitBreakerTripped = false
         
         try {
             when (_cameraMode.value) {
@@ -486,8 +512,25 @@ class DualCameraController(
             }
     }
     
+    /**
+     * Process incoming frames from ImageAnalysis.
+     * 
+     * **Requirements:**
+     * - **FR-C2:** Must close `ImageProxy` in `finally` block to prevent starvation.
+     * - **NFR-P2:** Total processing budget <= 8ms/frame.
+     * - **NFR-S2:** Raw frames are dropped; only metrics/signals extracted.
+     * 
+     * **Metrics Computed:**
+     * - **FR-I1 (Finger):** Luma, Saturation% (>250), ISO/Gain (implied).
+     * - **FR-I2 (Face):** Luma, ROI Motion RMS.
+     */
     @SuppressLint("UnsafeOptInUsageError")
     private fun processFrame(imageProxy: ImageProxy, source: Source) {
+        if (circuitBreakerTripped) {
+            imageProxy.close()
+            return
+        }
+
         val image = imageProxy.image
         if (image == null) {
             Log.w(tag, "processFrame: image is null for ${source.name}")
@@ -519,17 +562,7 @@ class DualCameraController(
             if (source == Source.FACE) {
                 try {
                     try {
-                        val planeCopy = yPlane.buffer.duplicate().apply { position(0) }
-                        val planeSize = planeCopy.remaining()
-                        val exactSizeBuffer = ByteArray(planeSize)
-                        planeCopy.get(exactSizeBuffer)
-
-                        faceRoiTracker.processFrame(
-                            yPlane = exactSizeBuffer,
-                            width = image.width,
-                            height = image.height,
-                            rotation = 0
-                        )
+                        faceRoiTracker.processFrame(imageProxy)
                     } catch (e: Exception) {
                         Log.w(tag, "Face ROI tracking failed (non-critical): ${e.message}")
                     }
@@ -644,8 +677,32 @@ class DualCameraController(
                     torchEnabled = torchEnabled
                 )
             )
+            
+            // Reset error count on success
+            consecutiveErrors[source] = 0
+            
         } catch (e: Exception) {
-            Log.e(tag, "Error processing frame from ${source.name}", e)
+            val count = (consecutiveErrors[source] ?: 0) + 1
+            consecutiveErrors[source] = count
+            
+            if (count > maxConsecutiveErrors && !circuitBreakerTripped) {
+                circuitBreakerTripped = true
+                val msg = "Processing failure for ${source.name} (x$count). Stopping."
+                Log.e(tag, msg, e)
+                _statusBanner.value = "Camera critical error. Please restart."
+                _detailedError.value = buildDetailedError(e, "CircuitBreaker:${source.name}")
+                // Stop recording if active to save what we have
+                if (isRecording) {
+                    stopRecording()
+                }
+            } else if (count % 10 == 0) {
+                 Log.e(tag, "Consecutive error for ${source.name}: $count", e)
+            }
+            
+            // Still log individual errors
+            if (count <= 5) { // Reduce log spam
+                Log.e(tag, "Error processing frame from ${source.name}", e)
+            }
         } finally {
             imageProxy.close()
         }
