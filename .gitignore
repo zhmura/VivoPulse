@@ -39,3 +39,6 @@ Thumbs.db
 *.sln.docstates
 
 
+
+# Embedded JDK
+.jdk/
