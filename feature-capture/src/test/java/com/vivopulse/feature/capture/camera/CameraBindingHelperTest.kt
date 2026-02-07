@@ -49,7 +49,7 @@ class CameraBindingHelperTest {
         
         // Verify FPS configuration is applied
         verify(exactly = 2) { 
-            configurator.setTargetFpsRange(any(), android.util.Range(30, 30))
+            configurator.setTargetFpsRange(any(), android.util.Range(15, 30))
         }
     }
 

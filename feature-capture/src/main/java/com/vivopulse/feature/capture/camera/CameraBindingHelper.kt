@@ -128,10 +128,11 @@ internal class CameraBindingHelper(
             // Best approach: Use a safe fixed range like [30, 30] which is universally supported,
             // OR [60, 60] only if we are sure.
             // 
-            // Given the issues seen (39fps vs 30fps), we should force [30, 30] as a baseline for stability.
-            // If the user wants 60fps, we'd need more complex capability querying.
-            // FOR NOW: Let's fallback to [30, 30] to fix the drift.
-            val targetRange = android.util.Range(30, 30)
+            // Given the issues seen (39fps vs 30fps) and massive frame drops/gaps (2s) when forcing [30, 30],
+            // we must relax the lower bound to allow the AE algorithm to increase exposure time without breaking stream.
+            // [15, 30] ensures we get AT LEAST 15fps (continuous), whereas [30, 30] caused 0fps (gaps).
+            // PPG is valid at >8Hz (Nyquist for 240bpm). 15fps is safe.
+            val targetRange = android.util.Range(15, 30)
             AppLogger.log(tag, "Forcing FPS Range: $targetRange")
 
             // FRONT Config

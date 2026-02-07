@@ -137,30 +137,71 @@ object TimestampSync {
         val stream1Count = stream1Timestamps.count { it in windowStart..windowEnd }
         val stream2Count = stream2Timestamps.count { it in windowStart..windowEnd }
         
-        // Drift is the difference in frame rate between streams
-        val stream1Rate = stream1Count.toDouble() / (windowSizeMs / 1000.0)
-        val stream2Rate = stream2Count.toDouble() / (windowSizeMs / 1000.0)
+        // Calculate drift using MEDIAN INTERVAL to be robust against frame drops.
+        // Using frame count (count / time) causes frame drops to look like slow clock drift.
+        // Median interval is unaffected by occasional gaps.
         
-        // Calculate relative drift (frames per second difference)
-        val frameDrift = abs(stream1Rate - stream2Rate)
+        val interval1Ms = estimateFrameInterval(stream1Timestamps)
+        val interval2Ms = estimateFrameInterval(stream2Timestamps)
+        
+        // Fallback to count-based if interval estimation fails
+        val stream1Rate = if (interval1Ms != null && interval1Ms > 0) 1000.0 / interval1Ms else stream1Count.toDouble() / (windowSizeMs / 1000.0)
+        val stream2Rate = if (interval2Ms != null && interval2Ms > 0) 1000.0 / interval2Ms else stream2Count.toDouble() / (windowSizeMs / 1000.0)
+        
+        // Calculate signed drift (positive if stream 2 is faster/more frames)
+        // drift frames per second
+        val frameDrift = stream2Rate - stream1Rate
+        
         
         // Estimate interval to convert frame drift to time drift
-        val interval1 = estimateFrameInterval(stream1Timestamps) ?: 33.33
-        val interval2 = estimateFrameInterval(stream2Timestamps) ?: 33.33
+        val interval1 = interval1Ms ?: 33.33
+        val interval2 = interval2Ms ?: 33.33
         val avgInterval = (interval1 + interval2) / 2.0
         
         // Drift in ms/s = frame rate difference * interval
+        // If stream 2 has HIGHER rate, it means its clock is running FASTER (more ticks per true second)
+        // OR it's just producing frames faster. 
+        // Sync Drift usually refers to Clock Drift.
+        // If Clock2 is faster than Clock1, T2 moves faster.
         val driftMsPerSecond = frameDrift * avgInterval
         
         logD("Drift calculation: stream1=$stream1Rate fps, stream2=$stream2Rate fps, drift=${"%.2f".format(driftMsPerSecond)} ms/s")
         
         return DriftResult(
-            driftMsPerSecond = driftMsPerSecond,
+            driftMsPerSecond = driftMsPerSecond, // Signed
             isValid = true,
             stream1Rate = stream1Rate,
             stream2Rate = stream2Rate,
-            message = "Drift: ${"%.2f".format(driftMsPerSecond)} ms/s"
+            message = "Drift: ${"%.2f".format(abs(driftMsPerSecond))} ms/s"
         )
+    }
+    
+    /**
+     * Compensate for clock drift in a stream.
+     * 
+     * Linearly scales timestamps to align rate with reference.
+     * 
+     * @param data Stream to correct
+     * @param referenceRateHz Target frame rate (reference)
+     * @param currentRateHz Current frame rate of the stream
+     * @return corrected stream
+     */
+    fun compensateDrift(
+        data: List<TimestampedValue>,
+        referenceRateHz: Double,
+        currentRateHz: Double
+    ): List<TimestampedValue> {
+        if (data.isEmpty() || referenceRateHz <= 0 || currentRateHz <= 0) return data
+        if (abs(referenceRateHz - currentRateHz) < 0.01) return data // Negligible
+        
+        val ratio = referenceRateHz / currentRateHz
+        val t0 = data.first().timestampNs
+        
+        return data.map { item ->
+            val dt = item.timestampNs - t0
+            val dtCorrected = (dt * ratio).toLong()
+            item.copy(timestampNs = t0 + dtCorrected)
+        }
     }
     
     /**

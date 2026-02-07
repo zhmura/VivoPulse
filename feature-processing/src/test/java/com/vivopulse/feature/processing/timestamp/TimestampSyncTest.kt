@@ -100,11 +100,10 @@ class TimestampSyncTest {
     }
     
     @Test
-    fun `computeDrift - positive drift +10ms per second`() {
+    fun `computeDrift - slower stream 2 (negative rate drift)`() {
         // Stream 1: 30 fps (33.33ms interval)
         // Stream 2: 29.7 fps (33.67ms interval) - slower by ~0.3 fps
-        // Over 6 seconds: 180 frames vs ~178 frames = ~2 frames = ~67ms drift
-        // Drift rate: ~11 ms/s
+        // Rate2 < Rate1, so drift is negative
         
         val stream1IntervalNs = 33_333_333L  // 30.0 fps
         val stream2IntervalNs = 33_670_034L  // 29.7 fps
@@ -114,19 +113,20 @@ class TimestampSyncTest {
         
         val result = TimestampSync.computeDrift(stream1, stream2, windowSizeMs = 5000)
         
-        println("Positive drift test: drift=${result.driftMsPerSecond}, isValid=${result.isValid}, stream1Rate=${result.stream1Rate}, stream2Rate=${result.stream2Rate}")
+        println("Slower drift test: drift=${result.driftMsPerSecond}, isValid=${result.isValid}")
         assertTrue("Drift calculation should be valid", result.isValid)
-        // Should detect positive drift around 10 ms/s
-        assertTrue("Drift should be > 5.0 ms/s, was: ${result.driftMsPerSecond}", 
-            result.driftMsPerSecond > 5.0)
-        assertTrue("Drift should be < 15.0 ms/s, was: ${result.driftMsPerSecond}", 
-            result.driftMsPerSecond < 15.0)
+        // Should detect negative drift around -10 ms/s
+        assertTrue("Drift should be < -5.0 ms/s, was: ${result.driftMsPerSecond}", 
+            result.driftMsPerSecond < -5.0)
+        assertTrue("Drift should be > -15.0 ms/s, was: ${result.driftMsPerSecond}", 
+            result.driftMsPerSecond > -15.0)
     }
     
     @Test
-    fun `computeDrift - negative drift -10ms per second`() {
+    fun `computeDrift - faster stream 2 (positive rate drift)`() {
         // Stream 1: 29.7 fps (slower)
         // Stream 2: 30.0 fps (faster)
+        // Rate2 > Rate1, so drift is positive
         
         val stream1IntervalNs = 33_670_034L  // 29.7 fps
         val stream2IntervalNs = 33_333_333L  // 30.0 fps
@@ -136,9 +136,9 @@ class TimestampSyncTest {
         
         val result = TimestampSync.computeDrift(stream1, stream2, windowSizeMs = 5000)
         
-        println("Negative drift test: drift=${result.driftMsPerSecond}, isValid=${result.isValid}, stream1Rate=${result.stream1Rate}, stream2Rate=${result.stream2Rate}")
+        println("Faster drift test: drift=${result.driftMsPerSecond}, isValid=${result.isValid}")
         assertTrue("Drift calculation should be valid", result.isValid)
-        // Should detect drift around 10 ms/s
+        // Should detect positive drift around 10 ms/s
         assertTrue("Drift should be > 5.0 ms/s, was: ${result.driftMsPerSecond}", 
             result.driftMsPerSecond > 5.0)
         assertTrue("Drift should be < 15.0 ms/s, was: ${result.driftMsPerSecond}", 
@@ -296,5 +296,38 @@ class TimestampSyncTest {
     }
     
     private fun abs(value: Double): Double = kotlin.math.abs(value)
+    @Test
+    fun `computeDrift - frame drops should NOT imply clock drift`() {
+        // Stream 1: 30 fps, perfect.
+        val interval = 33_333_333L
+        val stream1 = (0..99).map { TimestampedValue(it * interval, 1.0) }
+        
+        // Stream 2: 30 fps, but drops every 10th frame.
+        // Timestamps should be correct (multiples of interval), just missing indices.
+        val stream2 = (0..99).filter { it % 10 != 0 }.map { 
+             TimestampedValue(it * interval, 1.0) 
+        }
+        
+        // Count for stream 2 is 90% of stream 1.
+        // Current computeDrift logic uses (count / window).
+        // So rate2 will be 0.9 * rate1.
+        // It will report drift ~10%. (300 ms/s!)
+        
+        val result = TimestampSync.computeDrift(
+            stream1.map { it.timestampNs }, 
+            stream2.map { it.timestampNs }, 
+            windowSizeMs = 3500 // 3.5s
+        )
+        
+        // We WANT this to be FALSE or 0.0 drift.
+        // But current implementation will fail this.
+        // This test documents the flaw.
+        println("Frame Drop Test: Drift=${result.driftMsPerSecond}")
+        
+        // With corrected logic (using Median Interval), this should be robust.
+        // Expect drift < 1ms/s (basically zero)
+        assertTrue("Fixed logic should NOT find drift for drops, was: ${result.driftMsPerSecond}", 
+            kotlin.math.abs(result.driftMsPerSecond) < 1.0)
+    }
 }
 

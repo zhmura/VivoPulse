@@ -97,10 +97,29 @@ class SignalPipeline(
             avgFaceSqi = preProcessedSignals.map { it.faceSqi }.average().toInt()
             avgFingerSqi = preProcessedSignals.map { it.fingerSqi }.average().toInt()
         }
+        Log.d(tag, "SQI Baseline: Face=$avgFaceSqi, Finger=$avgFingerSqi")
         
+        // Calculate and Compensate Drift
+        val stream1Timestamps = filteredBuffer.faceData.map { it.timestampNs }
+        val stream2Timestamps = filteredBuffer.fingerData.map { it.timestampNs }
+        
+        val driftResult = TimestampSync.computeDrift(stream1Timestamps, stream2Timestamps)
+        Log.d(tag, "Drift Analysis: ${driftResult.message} (${driftResult.stream1Rate} vs ${driftResult.stream2Rate} fps)")
+        
+        val compensatedStream2 = if (driftResult.isValid && kotlin.math.abs(driftResult.driftMsPerSecond) > 1.0) {
+            Log.i(tag, "Applying drift compensation to Stream 2 (Finger)")
+            TimestampSync.compensateDrift(
+                data = filteredBuffer.fingerData,
+                referenceRateHz = driftResult.stream1Rate,
+                currentRateHz = driftResult.stream2Rate
+            )
+        } else {
+            filteredBuffer.fingerData
+        }
+
         val resampled = TimestampSync.resampleToUnifiedTimeline(
             stream1Data = filteredBuffer.faceData,
-            stream2Data = filteredBuffer.fingerData,
+            stream2Data = compensatedStream2,
             targetFrequencyHz = targetSampleRateHz
         )
         
