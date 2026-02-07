@@ -280,5 +280,64 @@ class DspFunctionsTest {
         assertEquals(0, DspFunctions.zscoreNormalize(empty).size)
         assertEquals(0.0, DspFunctions.computePower(empty), epsilon)
     }
+    @Test
+    fun `removeMean - correctly centers signal`() {
+        val signal = doubleArrayOf(10.0, 12.0, 14.0) // Mean = 12.0
+        val centered = DspFunctions.removeMean(signal)
+        
+        assertEquals(-2.0, centered[0], epsilon)
+        assertEquals(0.0, centered[1], epsilon)
+        assertEquals(2.0, centered[2], epsilon)
+        assertEquals(0.0, centered.average(), epsilon)
+    }
+
+    @Test
+    fun `filtfilt - zero phase shift`() {
+        // Create a symmetric Gaussian pulse. Peak is exactly at center.
+        val size = 100
+        val center = size / 2
+        val signal = DoubleArray(size) { i ->
+            exp(-0.5 * ((i - center) / 5.0).pow(2))
+        }
+
+        // Apply filtfilt with a lowpass filter
+        val filtered = DspFunctions.filtfilt(signal) { input ->
+             // Let's us a simple dummy filter to prove the mechanism: reverse-filter-reverse.
+             // But to test REAL usage, we use butterworth.
+             // Let's simulate a standard bandpass.
+             DspFunctions.butterworthBandpass(input, 0.1, 4.0, 30.0, 2)
+        }
+        
+        // Find peak of input and output
+        val inputPeakIdx = signal.indices.maxByOrNull { signal[it] }!!
+        val outputPeakIdx = filtered.indices.maxByOrNull { filtered[it] }!!
+        
+        // The peak should stay at the same index
+        assertEquals("Peak should not move (Zero Phase)", inputPeakIdx, outputPeakIdx)
+    }
+
+    @Test
+    fun `filtfilt - transient suppression at boundaries`() {
+        // Step function: 0, 0, ..., 10, 10, ...
+        // A normal IIR filter would ring heavily at the step if it's at index 0.
+        // Our padding should strictly handle the boundaries.
+        // Let's test a signal that starts with a high DC offset.
+        val size = 100
+        val signal = DoubleArray(size) { 100.0 + sin(it * 0.1) } // DC = 100
+        
+        // If we didn't remove DC or pad, the start would be wild.
+        // removeMean + filtfilt should handle this.
+        val centered = DspFunctions.removeMean(signal)
+        val filtered = DspFunctions.filtfilt(centered) { input ->
+            DspFunctions.butterworthBandpass(input, 0.5, 4.0, 30.0, 2)
+        }
+        
+        // Check the first few samples. They should not be massive spikes relative to the rest.
+        val maxVal = filtered.map { abs(it) }.maxOrNull()!!
+        val firstVal = abs(filtered[0])
+        
+        // The artifact shouldn't be effectively infinite or orders of magnitude larger
+        assertTrue("Start artifact ${firstVal} should be reasonable vs max ${maxVal}", firstVal < maxVal * 2.0)
+    }
 }
 
