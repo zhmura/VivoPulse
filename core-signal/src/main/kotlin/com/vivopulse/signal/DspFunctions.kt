@@ -354,28 +354,68 @@ object DspFunctions {
     }
 
     /**
-     * zero-phase filtering
+     * Remove mean from signal (Result has mean = 0).
+     */
+    fun removeMean(signal: DoubleArray): DoubleArray {
+        if (signal.isEmpty()) return doubleArrayOf()
+        val mean = signal.average()
+        return signal.map { it - mean }.toDoubleArray()
+    }
+
+    /**
+     * zero-phase filtering with padding to minimize boundary effects.
      * 
-     * Applies the given filter forward and then backward to eliminate phase shift.
-     * effectively squares the magnitude response (doubles filter order).
+     * Applies the given filter forward and then backward.
+     * Uses odd-symmetric extension (Gustafsson's method approx) at boundaries 
+     * to reduce startup transients.
      * 
      * @param signal Input signal
-     * @param filterFunc filtering function to apply (e.g. { sig -> butterworthBandpass(sig, ...) })
+     * @param filterFunc filtering function to apply
+     * @param padLength Number of samples to pad (default 30 or signal length/3)
      * @return Zero-phase filtered signal
      */
-    fun filtfilt(signal: DoubleArray, filterFunc: (DoubleArray) -> DoubleArray): DoubleArray {
+    fun filtfilt(
+        signal: DoubleArray, 
+        padLength: Int = 0,
+        filterFunc: (DoubleArray) -> DoubleArray
+    ): DoubleArray {
         if (signal.isEmpty()) return doubleArrayOf()
         
-        // 1. Filter forward
-        val forward = filterFunc(signal)
+        val n = signal.size
+        val pad = if (padLength > 0) padLength else min(n - 1, 30)
         
-        // 2. Reverse
+        // 1. Create padded signal with odd symmetry
+        // leftPad = 2*signal[0] - signal[pad..1]
+        // rightPad = 2*signal[end] - signal[end-1..end-pad]
+        val padded = DoubleArray(n + 2 * pad)
+        
+        // Left padding
+        val s0 = signal[0]
+        for (i in 0 until pad) {
+            padded[i] = 2 * s0 - signal[pad - i]
+        }
+        
+        // Center
+        System.arraycopy(signal, 0, padded, pad, n)
+        
+        // Right padding
+        val sEnd = signal[n - 1]
+        for (i in 0 until pad) {
+            padded[n + pad + i] = 2 * sEnd - signal[n - 2 - i]
+        }
+        
+        // 2. Filter forward
+        val forward = filterFunc(padded)
+        
+        // 3. Reverse
         val forwardReversed = forward.reversedArray()
         
-        // 3. Filter backward (technically forward on reversed signal)
+        // 4. Filter backward
         val backward = filterFunc(forwardReversed)
         
-        // 4. Reverse back to original orientation
-        return backward.reversedArray()
+        // 5. Reverse back and truncate padding
+        val resultReversed = backward.reversedArray()
+        
+        return resultReversed.sliceArray(pad until (pad + n))
     }
 }

@@ -116,6 +116,23 @@ internal class CameraBindingHelper(
 
             AppLogger.log(tag, "bindConcurrent: Configuring cameras at $resolution")
 
+            // Dynamic FPS Range Selection
+            val resolutionSize = resolution
+            // We need to find the best range for EACH camera, but ideally they match.
+            // Since we can't easily query per-camera capabilities here without a CameraInfo, 
+            // we will stick to a safer default or try to reuse the logic if we could access CameraCharacteristics.
+            // HOWEVER, we are inside bindConcurrent where we don't have easy access to the exact CameraInfo yet 
+            // BEFORE binding. 
+            //
+            // Best approach: Use a safe fixed range like [30, 30] which is universally supported,
+            // OR [60, 60] only if we are sure.
+            // 
+            // Given the issues seen (39fps vs 30fps), we should force [30, 30] as a baseline for stability.
+            // If the user wants 60fps, we'd need more complex capability querying.
+            // FOR NOW: Let's fallback to [30, 30] to fix the drift.
+            val targetRange = android.util.Range(30, 30)
+            AppLogger.log(tag, "Forcing FPS Range: $targetRange")
+
             // FRONT Config
             val frontPreview = Preview.Builder()
                 .setTargetResolution(resolution)
@@ -127,13 +144,12 @@ internal class CameraBindingHelper(
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                 .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
 
-            // Force 60 FPS range
             Camera2Interop.Extender(frontBuilder)
-                .setCaptureRequestOption(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, android.util.Range(60, 60))
+                .setCaptureRequestOption(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, targetRange)
 
             val frontAnalysis = frontBuilder.build().also { analysis ->
                 analysis.setAnalyzer(executor, com.vivopulse.feature.capture.analysis.SafeImageAnalyzer { img -> 
-                    com.vivopulse.signal.AppLogger.log(tag, "Front Frame: ${img.imageInfo.timestamp} | 60fps requested")
+                    // com.vivopulse.signal.AppLogger.log(tag, "Front Frame: ${img.imageInfo.timestamp}")
                     processFrame(img, Source.FACE) 
                 })
             }
@@ -160,9 +176,8 @@ internal class CameraBindingHelper(
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                 .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
 
-            // Force 60 FPS range
             Camera2Interop.Extender(backBuilder)
-                .setCaptureRequestOption(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, android.util.Range(60, 60))
+                .setCaptureRequestOption(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, targetRange)
 
             val backAnalysis = backBuilder.build().also { analysis ->
                 analysis.setAnalyzer(executor, com.vivopulse.feature.capture.analysis.SafeImageAnalyzer { img -> 

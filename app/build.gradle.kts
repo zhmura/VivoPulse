@@ -14,8 +14,8 @@ android {
         applicationId = "com.vivopulse.app"
         minSdk = 29
         targetSdk = 35
-        versionCode = 9
-        versionName = "1.0.10"
+        versionCode = 10
+        versionName = "1.0.13"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {

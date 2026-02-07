@@ -283,9 +283,14 @@ class SignalPipeline(
             HarmonicFeatureExtractor.HarmonicFeatures.empty(), null, null
         )
         
-        val detrended = DspFunctions.detrendIIR(rawSignal, 0.5, targetSampleRateHz)
+        // Remove mean first to minimize DC step response
+        val zeroMean = DspFunctions.removeMean(rawSignal)
+        val detrended = DspFunctions.detrendIIR(zeroMean, 0.5, targetSampleRateHz)
         
-        var mainFiltered = DspFunctions.filtfilt(detrended) { sig ->
+        var mainFiltered = DspFunctions.filtfilt(
+            signal = detrended,
+            padLength = 50 // Pad 0.5s
+        ) { sig ->
             DspFunctions.butterworthBandpass(
                 signal = sig,
                 lowCutoffHz = lowCutoffHz,
@@ -298,7 +303,10 @@ class SignalPipeline(
         var denoisedFiltered: DoubleArray? = null
         if (sqi in 40..80) {
             val waveletCleaned = WaveletDenoiser.denoise(detrended, WaveletDenoiser.Config(levels = 4))
-            denoisedFiltered = DspFunctions.filtfilt(waveletCleaned) { sig ->
+            denoisedFiltered = DspFunctions.filtfilt(
+                signal = waveletCleaned,
+                padLength = 50
+            ) { sig ->
                 DspFunctions.butterworthBandpass(
                     signal = sig,
                     lowCutoffHz = lowCutoffHz,
