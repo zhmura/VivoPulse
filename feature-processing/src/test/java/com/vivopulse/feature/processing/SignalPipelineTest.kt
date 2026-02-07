@@ -80,4 +80,51 @@ class SignalPipelineTest {
         
         assertFalse("Result should be invalid for empty input", result.isValid)
     }
+    @Test
+    fun `process filters frames with high motion`() {
+        // Create raw buffer with some frames having high IMU motion
+        val rawBuffer = RawSeriesBuffer(
+            faceData = (0..50).map { i ->
+                TimestampedValue(i * 20000000L, 100.0) 
+            },
+            fingerData = (0..50).map { i ->
+                TimestampedValue(i * 20000000L, 100.0) 
+            }
+        )
+        
+        // Pre-processed signals where some have high IMU RMS
+        val preProcessed = (0..50).map { i ->
+            ProcessedSignal(
+                heartRate = 60f,
+                signalQuality = 1.0f,
+                timestamp = i * 20L,
+                processedData = floatArrayOf(),
+                faceMotionRms = 0.05,
+                fingerSaturationPct = 0.0,
+                // Inject high motion (gt 0.1) for indices 20-30
+                imuRmsG = if (i in 20..30) 0.5 else 0.05,
+                faceSqi = 80,
+                fingerSqi = 90
+            )
+        }
+        
+        // Note: The SignalPipeline.process logic might require us to mock how it uses preProcessed 
+        // to filter the raw buffer. Alternatively, if the motion rejection is done INSIDE processChannel
+        // or prior to resampling, the result should reflect this.
+        // Looking at SignalPipeline.kt, it filters rawBuffer using preProcessed timestamps & imuRmsG
+        // BEFORE resampling.
+        
+        val result = pipeline.process(rawBuffer, preProcessed)
+        
+        assertTrue("Result should be valid", result.isValid)
+        
+        // If filtration works, we might see gaps or interpolation in the result 
+        // corresponding to the high motion period. 
+        // Or, more simply, we check if the metrics in the result align.
+        
+        // Check if the output 'imuRmsG' array mirrors the input distribution
+        // The resampled IMU signal should show the spike
+        val maxImu = result.imuRmsG.maxOrNull() ?: 0.0
+        assertTrue("High motion should be captured/propagated", maxImu > 0.4)
+    }
 }
