@@ -24,25 +24,10 @@ class CameraBindingHelperTest {
     private val backPreview = mockk<PreviewView>(relaxed = true)
     private val executor = mockk<ExecutorService>(relaxed = true)
     private val processFrame: (ImageProxy, Source) -> Unit = { _, _ -> }
+    private val configurator = mockk<Camera2Configurator>(relaxed = true)
 
-    private val helper = CameraBindingHelper("TestTag", executor, processFrame)
-    
-    /*
-    @org.junit.Before
-    fun setup() {
-        io.mockk.mockkStatic("androidx.camera.camera2.interop.Camera2Interop")
-        // T is ImageAnalysis, not Builder
-        val extender = mockk<androidx.camera.camera2.interop.Camera2Interop.Extender<androidx.camera.core.ImageAnalysis>>(relaxed = true)
-        io.mockk.every { androidx.camera.camera2.interop.Camera2Interop.Extender(any<androidx.camera.core.ImageAnalysis.Builder>()) } returns extender
-    }
+    private val helper = CameraBindingHelper("TestTag", executor, processFrame, configurator)
 
-    @org.junit.After
-    fun tearDown() {
-        io.mockk.unmockkAll()
-    }
-    */
-
-    @org.junit.Ignore("Failing due to Camera2Interop static mocking issues")
     @Test
     fun `bindCamerasWithFallback concurrent mode binds both cameras`() {
         helper.bindCamerasWithFallback(
@@ -56,15 +41,18 @@ class CameraBindingHelperTest {
         )
 
         // Verify binding logic calls appropriate provider methods
-        verify(atLeast = 2) { 
-            provider.bindToLifecycle(
-                any<LifecycleOwner>(), 
-                any<CameraSelector>(), 
-                any<UseCase>(), 
-                any<UseCase>()
-            ) 
+        // Verify binding logic calls appropriate provider methods
+        // bindConcurrent uses the list overload
+        verify(exactly = 1) { 
+            provider.bindToLifecycle(any<List<androidx.camera.core.ConcurrentCamera.SingleCameraConfig>>())
+        }
+        
+        // Verify FPS configuration is applied
+        verify(exactly = 2) { 
+            configurator.setTargetFpsRange(any(), android.util.Range(30, 30))
         }
     }
+
 
     @Test
     fun `bindCamerasWithFallback sequential face mode binds front camera only`() {

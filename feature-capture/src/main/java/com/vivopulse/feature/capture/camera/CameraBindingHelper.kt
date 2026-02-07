@@ -36,7 +36,8 @@ import androidx.camera.camera2.interop.Camera2Interop
 internal class CameraBindingHelper(
     private val tag: String,
     private val executor: java.util.concurrent.ExecutorService,
-    private val processFrame: (androidx.camera.core.ImageProxy, Source) -> Unit
+    private val processFrame: (androidx.camera.core.ImageProxy, Source) -> Unit,
+    private val configurator: Camera2Configurator = Camera2Configurator.Impl()
 ) {
     
     // Store the last binding error for reporting
@@ -144,8 +145,8 @@ internal class CameraBindingHelper(
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                 .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
 
-            Camera2Interop.Extender(frontBuilder)
-                .setCaptureRequestOption(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, targetRange)
+
+            configurator.setTargetFpsRange(frontBuilder, targetRange)
 
             val frontAnalysis = frontBuilder.build().also { analysis ->
                 analysis.setAnalyzer(executor, com.vivopulse.feature.capture.analysis.SafeImageAnalyzer { img -> 
@@ -176,8 +177,7 @@ internal class CameraBindingHelper(
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                 .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
 
-            Camera2Interop.Extender(backBuilder)
-                .setCaptureRequestOption(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, targetRange)
+            configurator.setTargetFpsRange(backBuilder, targetRange)
 
             val backAnalysis = backBuilder.build().also { analysis ->
                 analysis.setAnalyzer(executor, com.vivopulse.feature.capture.analysis.SafeImageAnalyzer { img -> 

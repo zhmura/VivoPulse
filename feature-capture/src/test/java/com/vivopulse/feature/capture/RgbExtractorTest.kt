@@ -8,6 +8,10 @@ import org.junit.Assert.assertEquals
 import org.junit.Test
 import java.nio.ByteBuffer
 
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
+
+@RunWith(RobolectricTestRunner::class)
 class RgbExtractorTest {
 
     @Test
