@@ -213,6 +213,35 @@ class DualCameraController(
     private val consecutiveErrors = java.util.concurrent.ConcurrentHashMap<Source, Int>()
     private val maxConsecutiveErrors = 30
     @Volatile private var circuitBreakerTripped = false
+    
+    private var frontExposureLocked = false
+    private var backExposureLocked = false
+
+    @androidx.annotation.OptIn(androidx.camera.camera2.interop.ExperimentalCamera2Interop::class)
+    private fun lockExposure(source: Source) {
+        val camera = if (source == Source.FACE) frontCamera else backCamera
+        if (camera == null) return
+
+        try {
+            val camera2Control = androidx.camera.camera2.interop.Camera2CameraControl.from(camera.cameraControl)
+            val captureRequestOptions = androidx.camera.camera2.interop.CaptureRequestOptions.Builder()
+                .setCaptureRequestOption(CaptureRequest.CONTROL_AE_LOCK, true)
+                .setCaptureRequestOption(CaptureRequest.CONTROL_AWB_LOCK, true)
+                .build()
+            
+            camera2Control.addCaptureRequestOptions(captureRequestOptions)
+            Log.i(tag, "AE+AWB Locked for ${source.name}")
+            AppLogger.log(tag, "Exposure locked for ${source.name} after calibration")
+            
+            // Update status when both cameras are locked
+            if (frontExposureLocked && backExposureLocked) {
+                _statusBanner.value = null // Clear "Calibrating..." message
+            }
+        } catch (e: Exception) {
+            Log.e(tag, "Failed to lock AE/AWB for ${source.name}", e)
+            AppLogger.error(tag, "Failed to lock exposure for ${source.name}", e)
+        }
+    }
 
     fun isConcurrentCameraSupported(): Boolean {
         val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
@@ -333,11 +362,13 @@ class DualCameraController(
         lastBindingException = null  // Clear previous errors
         consecutiveErrors.clear()
         circuitBreakerTripped = false
+        frontExposureLocked = false
+        backExposureLocked = false
         
         try {
             when (_cameraMode.value) {
                 com.vivopulse.feature.capture.camera.CameraMode.CONCURRENT -> {
-                    _statusBanner.value = null
+                    _statusBanner.value = "Calibrating exposure..."
                 }
                 com.vivopulse.feature.capture.camera.CameraMode.SAFE_MODE_SEQUENTIAL -> {
                     _statusBanner.value = "Safe Mode: Sequential camera operation"
@@ -640,6 +671,15 @@ class DualCameraController(
                 imuRmsG = imuRmsG,
                 faceRoiRect = if (source == Source.FACE) faceRoi.value?.rect else null
             )
+            
+            // Check for AE Lock (delayed)
+            if (source == Source.FACE && !frontExposureLocked && frontFpsTracker.totalFrames > 30) {
+                lockExposure(Source.FACE)
+                frontExposureLocked = true
+            } else if (source == Source.FINGER && !backExposureLocked && backFpsTracker.totalFrames > 30) {
+                lockExposure(Source.FINGER)
+                backExposureLocked = true
+            }
 
             val flowEmitted = if (source == Source.FACE) {
                 _frontFrames.tryEmit(frame)

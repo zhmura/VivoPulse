@@ -6,7 +6,7 @@ plugins {
 
 android {
     namespace = "com.vivopulse.feature.capture"
-    compileSdk = 35
+    compileSdk = 36
 
     defaultConfig {
         minSdk = 29
@@ -62,7 +62,7 @@ dependencies {
     implementation("androidx.compose.material3:material3")
     
     // CameraX
-    val cameraxVersion = "1.5.0-alpha06"
+    val cameraxVersion = "1.6.0-alpha01"
     implementation("androidx.camera:camera-core:$cameraxVersion")
     implementation("androidx.camera:camera-camera2:$cameraxVersion")
     implementation("androidx.camera:camera-lifecycle:$cameraxVersion")

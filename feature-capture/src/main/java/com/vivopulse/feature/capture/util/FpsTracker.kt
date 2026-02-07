@@ -11,6 +11,9 @@ class FpsTracker(private val source: Source) {
     private val tag = "FpsTracker_${source.name}"
     private val frameTimestamps = ArrayDeque<Long>(100)
     private var totalFramesReceived = 0
+    val totalFrames: Int
+        get() = totalFramesReceived
+        
     private var totalFramesDropped = 0
     private var lastLogTime = 0L
     private val logIntervalMs = 5000L // Log every 5 seconds

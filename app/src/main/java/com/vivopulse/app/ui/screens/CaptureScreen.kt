@@ -164,7 +164,7 @@ fun CaptureScreen(
                 ) {
                     Icon(
                         imageVector = Icons.Default.Camera,
-                        contentDescription = null,
+                        contentDescription = "Camera Permission Required",
                         modifier = Modifier.size(64.dp),
                         tint = MaterialTheme.colorScheme.primary
                     )
@@ -187,247 +187,310 @@ fun CaptureScreen(
                     }
                 }
             } else {
-                Column(
-                    modifier = Modifier.fillMaxSize()
-                ) {
-                    // Compact banners
-                    if (!isDeviceSupported) {
-                        Card(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(horizontal = 8.dp, vertical = 4.dp),
-                            colors = CardDefaults.cardColors(
-                                containerColor = MaterialTheme.colorScheme.errorContainer
-                            )
-                        ) {
-                            Text(
-                                text = "⚠️ Device not optimized",
-                                modifier = Modifier.padding(8.dp),
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onErrorContainer
-                            )
+                // Camera previews state
+                var frontPreviewView by remember { mutableStateOf<PreviewView?>(null) }
+                var backPreviewView by remember { mutableStateOf<PreviewView?>(null) }
+                
+                // Waveform state
+                val faceWave = remember { mutableStateListOf<Double>() }
+                val fingerWave = remember { mutableStateListOf<Double>() }
+                val maxSamples = 300
+                LaunchedEffect(Unit) {
+                    controller.faceWave.collect { v ->
+                        faceWave.add(v)
+                        if (faceWave.size > maxSamples) {
+                            repeat(faceWave.size - maxSamples) { faceWave.removeAt(0) }
                         }
                     }
-                    
-                    statusBanner?.let { banner ->
-                        Card(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(horizontal = 8.dp, vertical = 4.dp),
-                            colors = CardDefaults.cardColors(
-                                containerColor = MaterialTheme.colorScheme.secondaryContainer
-                            )
-                        ) {
-                            Text(
-                                text = banner,
-                                modifier = Modifier.padding(8.dp),
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSecondaryContainer
-                            )
+                }
+                LaunchedEffect(Unit) {
+                    controller.fingerWave.collect { v ->
+                        fingerWave.add(v)
+                        if (fingerWave.size > maxSamples) {
+                            repeat(fingerWave.size - maxSamples) { fingerWave.removeAt(0) }
                         }
                     }
+                }
+
+                // Determine layout based on WindowSizeClass (passed via composition local or parameter)
+                // Since we didn't pass WindowSizeClass to CaptureScreen yet, let's infer simply by configuration or assume Portrait for now
+                // but actually, we should update CaptureScreen signature to take windowSizeClass or use BoxWithConstraints.
+                // Given the constraints of this edit, let's use BoxWithConstraints for local responsiveness.
+                
+                BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
+                    val useLandscapeLayout = maxWidth > 600.dp && maxHeight < maxWidth
                     
-                    val sequentialModeActive = cameraMode == CameraMode.SAFE_MODE_SEQUENTIAL
-                    if (sequentialModeActive) {
-                        SequentialModeCard(
-                            selected = sequentialPrimary,
-                            enabled = !isRecording,
-                            onSelectionChanged = { viewModel.setSequentialPrimary(it) },
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(horizontal = 8.dp, vertical = 4.dp)
-                        )
-                    }
-                    
-                    // Camera previews
-                    var frontPreviewView by remember { mutableStateOf<PreviewView?>(null) }
-                    var backPreviewView by remember { mutableStateOf<PreviewView?>(null) }
-                    var cameraStarted by remember { mutableStateOf(false) }
-                    
-                    LaunchedEffect(frontPreviewView, backPreviewView, cameraPermissionGranted, sequentialPrimary, cameraMode) {
-                        if (cameraPermissionGranted && frontPreviewView != null && backPreviewView != null && !cameraStarted) {
-                            android.util.Log.d("CaptureScreen", "Starting camera - mode: $cameraMode, sequential: $sequentialPrimary")
-                            viewModel.getCameraController().startCamera(
-                                lifecycleOwner = lifecycleOwner,
-                                frontPreviewView = frontPreviewView!!,
-                                backPreviewView = backPreviewView!!
-                            )
-                            cameraStarted = true
-                        }
-                    }
-                    
-                    // Reset camera started flag when mode changes
-                    LaunchedEffect(cameraMode, sequentialPrimary) {
-                        cameraStarted = false
-                    }
-                    
-                    val faceWave = remember { mutableStateListOf<Double>() }
-                    val fingerWave = remember { mutableStateListOf<Double>() }
-                    val maxSamples = 300
-                    LaunchedEffect(Unit) {
-                        controller.faceWave.collect { v ->
-                            faceWave.add(v)
-                            if (faceWave.size > maxSamples) {
-                                repeat(faceWave.size - maxSamples) { faceWave.removeAt(0) }
-                            }
-                        }
-                    }
-                    LaunchedEffect(Unit) {
-                        controller.fingerWave.collect { v ->
-                            fingerWave.add(v)
-                            if (fingerWave.size > maxSamples) {
-                                repeat(fingerWave.size - maxSamples) { fingerWave.removeAt(0) }
-                            }
-                        }
-                    }
-                    
-                    // Camera previews - VERTICAL LAYOUT (Primary + Secondary)
-                    Column(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .weight(1f)
-                            .padding(horizontal = 4.dp, vertical = 4.dp),
-                        verticalArrangement = Arrangement.spacedBy(4.dp)
-                    ) {
-                        CameraPreviewCard(
-                            title = "Face (Front)",
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .weight(2f), // Primary preview takes more space
-                            showRoiOverlay = true,
-                            faceRoi = faceRoi,
-                            waveform = faceWave,
-                            quality = qualityState?.face
-                        ) { previewView ->
-                            frontPreviewView = previewView
-                        }
-                        
-                        CameraPreviewCard(
-                            title = "Finger (Back)",
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .weight(1f), // Secondary preview strip
-                            showTorchIndicator = torchEnabled,
-                            waveform = fingerWave,
-                            quality = qualityState?.finger
-                        ) { previewView ->
-                            backPreviewView = previewView
-                        }
-                    }
-                    
-                    // Compact controls at bottom
-                    Column(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .background(MaterialTheme.colorScheme.surface)
-                    ) {
-                        qualityState?.tip?.let {
-                            Card(
+                    if (useLandscapeLayout) {
+                        // Landscape / Tablet Layout: Row (Previews | Controls)
+                        Row(modifier = Modifier.fillMaxSize()) {
+                            // Camera previews take 60% width
+                            Column(
                                 modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(horizontal = 8.dp, vertical = 4.dp),
-                                colors = CardDefaults.cardColors(
-                                    containerColor = MaterialTheme.colorScheme.secondaryContainer
-                                )
+                                    .weight(0.6f)
+                                    .fillMaxHeight()
+                                    .padding(4.dp),
+                                verticalArrangement = Arrangement.spacedBy(4.dp)
                             ) {
-                                Row(
-                                    modifier = Modifier.padding(8.dp),
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    Icon(
-                                        Icons.Default.Lightbulb,
-                                        contentDescription = null,
-                                        modifier = Modifier.size(16.dp),
-                                        tint = MaterialTheme.colorScheme.onSecondaryContainer
+                                // Face Preview
+                                CameraPreviewCard(
+                                    title = "Face (Front)",
+                                    modifier = Modifier.weight(1f).fillMaxWidth(),
+                                    showRoiOverlay = true,
+                                    faceRoi = faceRoi,
+                                    waveform = faceWave,
+                                    quality = qualityState?.face
+                                ) { previewView -> frontPreviewView = previewView }
+                                
+                                // Finger Preview
+                                CameraPreviewCard(
+                                    title = "Finger (Back)",
+                                    modifier = Modifier.weight(1f).fillMaxWidth(),
+                                    showTorchIndicator = torchEnabled,
+                                    waveform = fingerWave,
+                                    quality = qualityState?.finger
+                                ) { previewView -> backPreviewView = previewView }
+                            }
+                            
+                            // Side Panel for Controls (40% width)
+                            Column(
+                                modifier = Modifier
+                                    .weight(0.4f)
+                                    .fillMaxHeight()
+                                    .verticalScroll(rememberScrollState())
+                                    .padding(8.dp),
+                                verticalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                // Status Banner
+                                statusBanner?.let { banner ->
+                                    Card(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer)
+                                    ) {
+                                        Text(
+                                            text = banner,
+                                            modifier = Modifier.padding(8.dp),
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSecondaryContainer
+                                        )
+                                    }
+                                }
+                                
+                                if (!isDeviceSupported) {
+                                    Card(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer)
+                                    ) {
+                                        Text(
+                                            text = "⚠️ Device not optimized",
+                                            modifier = Modifier.padding(8.dp),
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onErrorContainer
+                                        )
+                                    }
+                                }
+                                
+                                val sequentialModeActive = cameraMode == CameraMode.SAFE_MODE_SEQUENTIAL
+                                if (sequentialModeActive) {
+                                    SequentialModeCard(
+                                        selected = sequentialPrimary,
+                                        enabled = !isRecording,
+                                        onSelectionChanged = { viewModel.setSequentialPrimary(it) },
+                                        modifier = Modifier.fillMaxWidth()
                                     )
-                                    Spacer(modifier = Modifier.width(8.dp))
+                                }
+                                
+                                // Tip Card
+                                qualityState?.tip?.let {
+                                    Card(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer)
+                                    ) {
+                                        Row(
+                                            modifier = Modifier.padding(8.dp),
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            Icon(Icons.Default.Lightbulb, contentDescription = null, modifier = Modifier.size(16.dp))
+                                            Spacer(modifier = Modifier.width(8.dp))
+                                            Text(text = it, style = MaterialTheme.typography.bodySmall)
+                                        }
+                                    }
+                                }
+                                
+                                Spacer(modifier = Modifier.weight(1f))
+                                
+                                // Controls
+                                CaptureControls(
+                                    isRecording = isRecording,
+                                    recordingDuration = recordingDuration,
+                                    torchEnabled = torchEnabled,
+                                    torchButtonEnabled = !isRecording && !(sequentialModeActive && sequentialPrimary == SequentialPrimary.FACE),
+                                    onToggleTorch = { viewModel.toggleTorch() },
+                                    onRecordingAction = { if (isRecording) viewModel.stopRecording() else viewModel.startRecording() },
+                                    lastResult = lastResult,
+                                    onNavigateToProcessing = onNavigateToProcessing
+                                )
+                            }
+                        }
+                    } else {
+                        // Portrait / Phone Layout (Standard Column)
+                        Column(
+                            modifier = Modifier.fillMaxSize()
+                        ) {
+                            // Compact banners
+                            if (!isDeviceSupported) {
+                                Card(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(horizontal = 8.dp, vertical = 4.dp),
+                                    colors = CardDefaults.cardColors(
+                                        containerColor = MaterialTheme.colorScheme.errorContainer
+                                    )
+                                ) {
                                     Text(
-                                        text = it,
+                                        text = "⚠️ Device not optimized",
+                                        modifier = Modifier.padding(8.dp),
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onErrorContainer
+                                    )
+                                }
+                            }
+                            
+                            statusBanner?.let { banner ->
+                                Card(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(horizontal = 8.dp, vertical = 4.dp),
+                                    colors = CardDefaults.cardColors(
+                                        containerColor = MaterialTheme.colorScheme.secondaryContainer
+                                    )
+                                ) {
+                                    Text(
+                                        text = banner,
+                                        modifier = Modifier.padding(8.dp),
                                         style = MaterialTheme.typography.bodySmall,
                                         color = MaterialTheme.colorScheme.onSecondaryContainer
                                     )
                                 }
                             }
-                        }
-                        
-                        Card(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(4.dp)
-                        ) {
-                        Column(
-                            modifier = Modifier.padding(8.dp),
-                            horizontalAlignment = Alignment.CenterHorizontally
-                        ) {
-                            if (isRecording) {
-                                val seconds = (recordingDuration / 1000).toInt()
-                                Text(
-                                    text = String.format("Recording: %02d:%02d", seconds / 60, seconds % 60),
-                                    style = MaterialTheme.typography.titleMedium,
-                                    color = MaterialTheme.colorScheme.error
+                            
+                            val sequentialModeActive = cameraMode == CameraMode.SAFE_MODE_SEQUENTIAL
+                            if (sequentialModeActive) {
+                                SequentialModeCard(
+                                    selected = sequentialPrimary,
+                                    enabled = !isRecording,
+                                    onSelectionChanged = { viewModel.setSequentialPrimary(it) },
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(horizontal = 8.dp, vertical = 4.dp)
                                 )
-                                Spacer(modifier = Modifier.height(4.dp))
                             }
                             
-                            val torchButtonEnabled = !isRecording && !(sequentialModeActive && sequentialPrimary == SequentialPrimary.FACE)
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            // Camera previews - VERTICAL LAYOUT (Primary + Secondary)
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .weight(1f)
+                                    .padding(horizontal = 4.dp, vertical = 4.dp),
+                                verticalArrangement = Arrangement.spacedBy(4.dp)
                             ) {
-                                OutlinedButton(
-                                    onClick = { viewModel.toggleTorch() },
-                                    modifier = Modifier.weight(1f),
-                                    enabled = torchButtonEnabled
-                                ) {
-                                    Icon(
-                                        imageVector = if (torchEnabled) Icons.Default.FlashlightOn else Icons.Default.FlashlightOff,
-                                        contentDescription = "Torch"
-                                    )
-                                    Spacer(modifier = Modifier.width(4.dp))
-                                    Text(if (torchEnabled) "Torch On" else "Torch Off")
+                                CameraPreviewCard(
+                                    title = "Face (Front)",
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .weight(2f), // Primary preview takes more space
+                                    showRoiOverlay = true,
+                                    faceRoi = faceRoi,
+                                    waveform = faceWave,
+                                    quality = qualityState?.face
+                                ) { previewView ->
+                                    frontPreviewView = previewView
                                 }
                                 
-                                Button(
-                                    onClick = {
-                                        if (isRecording) {
-                                            viewModel.stopRecording()
-                                        } else {
-                                            viewModel.startRecording()
-                                        }
-                                    },
-                                    modifier = Modifier.weight(1f),
-                                    colors = if (isRecording) {
-                                        ButtonDefaults.buttonColors(
-                                            containerColor = MaterialTheme.colorScheme.error
-                                        )
-                                    } else {
-                                        ButtonDefaults.buttonColors()
-                                    }
-                                ) {
-                                    Icon(
-                                        imageVector = if (isRecording) Icons.Default.Stop else Icons.Default.FiberManualRecord,
-                                        contentDescription = if (isRecording) "Stop" else "Start"
-                                    )
-                                    Spacer(modifier = Modifier.width(4.dp))
-                                    Text(if (isRecording) "Stop" else "Start")
+                                CameraPreviewCard(
+                                    title = "Finger (Back)",
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .weight(1f), // Secondary preview strip
+                                    showTorchIndicator = torchEnabled,
+                                    waveform = fingerWave,
+                                    quality = qualityState?.finger
+                                ) { previewView ->
+                                    backPreviewView = previewView
                                 }
                             }
                             
-                            if (lastResult != null) {
-                                Spacer(modifier = Modifier.height(4.dp))
-                                Button(
-                                    onClick = { onNavigateToProcessing() },
-                                    modifier = Modifier.fillMaxWidth(),
-                                    enabled = !isRecording
+                            // Compact controls at bottom
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .background(MaterialTheme.colorScheme.surface)
+                            ) {
+                                qualityState?.tip?.let {
+                                    Card(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(horizontal = 8.dp, vertical = 4.dp),
+                                        colors = CardDefaults.cardColors(
+                                            containerColor = MaterialTheme.colorScheme.secondaryContainer
+                                        )
+                                    ) {
+                                        Row(
+                                            modifier = Modifier.padding(8.dp),
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            Icon(
+                                                Icons.Default.Lightbulb,
+                                                contentDescription = "Tip",
+                                                modifier = Modifier.size(16.dp),
+                                                tint = MaterialTheme.colorScheme.onSecondaryContainer
+                                            )
+                                            Spacer(modifier = Modifier.width(8.dp))
+                                            Text(
+                                                text = it,
+                                                style = MaterialTheme.typography.bodySmall,
+                                                color = MaterialTheme.colorScheme.onSecondaryContainer
+                                            )
+                                        }
+                                    }
+                                }
+                                
+                                Card(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(4.dp)
                                 ) {
-                                    Icon(Icons.Default.ArrowForward, contentDescription = null)
-                                    Spacer(modifier = Modifier.width(4.dp))
-                                    Text("Process ${lastResult!!.frames.size} Frames")
+                                    CaptureControls(
+                                        isRecording = isRecording,
+                                        recordingDuration = recordingDuration,
+                                        torchEnabled = torchEnabled,
+                                        torchButtonEnabled = !isRecording && !(sequentialModeActive && sequentialPrimary == SequentialPrimary.FACE),
+                                        onToggleTorch = { viewModel.toggleTorch() },
+                                        onRecordingAction = { if (isRecording) viewModel.stopRecording() else viewModel.startRecording() },
+                                        lastResult = lastResult,
+                                        onNavigateToProcessing = onNavigateToProcessing
+                                    )
                                 }
                             }
                         }
                     }
                 }
+            
+                // Camera Launch logic remains same
+                var cameraStarted by remember { mutableStateOf(false) }
+                LaunchedEffect(frontPreviewView, backPreviewView, cameraPermissionGranted, sequentialPrimary, cameraMode) {
+                    if (cameraPermissionGranted && frontPreviewView != null && backPreviewView != null && !cameraStarted) {
+                        android.util.Log.d("CaptureScreen", "Starting camera - mode: $cameraMode, sequential: $sequentialPrimary")
+                        viewModel.getCameraController().startCamera(
+                            lifecycleOwner = lifecycleOwner,
+                            frontPreviewView = frontPreviewView!!,
+                            backPreviewView = backPreviewView!!
+                        )
+                        cameraStarted = true
+                    }
+                }
+                
+                LaunchedEffect(cameraMode, sequentialPrimary) {
+                    cameraStarted = false
                 }
             }
             
@@ -452,6 +515,83 @@ fun CaptureScreen(
                         Toast.makeText(context, "Error copied to clipboard", Toast.LENGTH_SHORT).show()
                     }
                 )
+            }
+        }
+    }
+}
+
+@Composable
+fun CaptureControls(
+    isRecording: Boolean,
+    recordingDuration: Long,
+    torchEnabled: Boolean,
+    torchButtonEnabled: Boolean,
+    onToggleTorch: () -> Unit,
+    onRecordingAction: () -> Unit,
+    lastResult: com.vivopulse.feature.capture.RecordingResult?,
+    onNavigateToProcessing: () -> Unit
+) {
+    Column(
+        modifier = Modifier.padding(8.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        if (isRecording) {
+            val seconds = (recordingDuration / 1000).toInt()
+            Text(
+                text = String.format("Recording: %02d:%02d", seconds / 60, seconds % 60),
+                style = MaterialTheme.typography.titleMedium,
+                color = MaterialTheme.colorScheme.error
+            )
+            Spacer(modifier = Modifier.height(4.dp))
+        }
+        
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            OutlinedButton(
+                onClick = onToggleTorch,
+                modifier = Modifier.weight(1f),
+                enabled = torchButtonEnabled
+            ) {
+                Icon(
+                    imageVector = if (torchEnabled) Icons.Default.FlashlightOn else Icons.Default.FlashlightOff,
+                    contentDescription = "Torch"
+                )
+                Spacer(modifier = Modifier.width(4.dp))
+                Text(if (torchEnabled) "Torch On" else "Torch Off")
+            }
+            
+            Button(
+                onClick = onRecordingAction,
+                modifier = Modifier.weight(1f),
+                colors = if (isRecording) {
+                    ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.error
+                    )
+                } else {
+                    ButtonDefaults.buttonColors()
+                }
+            ) {
+                Icon(
+                    imageVector = if (isRecording) Icons.Default.Stop else Icons.Default.FiberManualRecord,
+                    contentDescription = if (isRecording) "Stop" else "Start"
+                )
+                Spacer(modifier = Modifier.width(4.dp))
+                Text(if (isRecording) "Stop" else "Start")
+            }
+        }
+        
+        if (lastResult != null) {
+            Spacer(modifier = Modifier.height(4.dp))
+            Button(
+                onClick = onNavigateToProcessing,
+                modifier = Modifier.fillMaxWidth(),
+                enabled = !isRecording
+            ) {
+                Icon(Icons.Default.ArrowForward, contentDescription = null)
+                Spacer(modifier = Modifier.width(4.dp))
+                Text("Process ${lastResult.frames.size} Frames")
             }
         }
     }

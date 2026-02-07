@@ -352,4 +352,30 @@ object DspFunctions {
         if (signal.isEmpty()) return 0.0
         return sqrt(signal.map { it * it }.average())
     }
+
+    /**
+     * zero-phase filtering
+     * 
+     * Applies the given filter forward and then backward to eliminate phase shift.
+     * effectively squares the magnitude response (doubles filter order).
+     * 
+     * @param signal Input signal
+     * @param filterFunc filtering function to apply (e.g. { sig -> butterworthBandpass(sig, ...) })
+     * @return Zero-phase filtered signal
+     */
+    fun filtfilt(signal: DoubleArray, filterFunc: (DoubleArray) -> DoubleArray): DoubleArray {
+        if (signal.isEmpty()) return doubleArrayOf()
+        
+        // 1. Filter forward
+        val forward = filterFunc(signal)
+        
+        // 2. Reverse
+        val forwardReversed = forward.reversedArray()
+        
+        // 3. Filter backward (technically forward on reversed signal)
+        val backward = filterFunc(forwardReversed)
+        
+        // 4. Reverse back to original orientation
+        return backward.reversedArray()
+    }
 }

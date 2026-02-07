@@ -29,7 +29,9 @@ class MainActivity : ComponentActivity() {
                             .padding(innerPadding),
                         color = MaterialTheme.colorScheme.background
                     ) {
-                        VivoPulseNavHost()
+                        @OptIn(androidx.compose.material3.windowsizeclass.ExperimentalMaterial3WindowSizeClassApi::class)
+                        val windowSizeClass = androidx.compose.material3.windowsizeclass.calculateWindowSizeClass(this)
+                        VivoPulseNavHost(windowSizeClass = windowSizeClass)
                     }
                 }
             }

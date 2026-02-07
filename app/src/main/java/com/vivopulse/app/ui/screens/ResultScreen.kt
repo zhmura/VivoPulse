@@ -115,7 +115,7 @@ fun ResultScreen(
                                     PttResult.Quality.EXCELLENT, PttResult.Quality.GOOD -> Icons.Default.CheckCircle
                                     else -> Icons.Default.Warning
                                 },
-                                contentDescription = null,
+                                contentDescription = "Quality: ${ptt.getQuality().name}",
                                 tint = when (ptt.getQuality()) {
                                     PttResult.Quality.EXCELLENT -> Color(0xFF4CAF50)
                                     PttResult.Quality.GOOD -> Color(0xFF2196F3)

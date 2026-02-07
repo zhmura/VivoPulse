@@ -31,10 +31,47 @@ class SignalPipeline(
     private val lowCutoffHz: Double = 0.7,
     private val highCutoffHz: Double = 4.0,
     private val correlationWindowSec: Double = 20.0,
-    private val walkingModeEnabled: Boolean = false
+    private val walkingModeEnabled: Boolean = false,
+    private val motionRejectionThresholdG: Double = 0.1
 ) {
     private val tag = "SignalPipeline"
     private val imuAnalyzer = ImuMotionAnalyzer()
+    
+    /**
+     * Filter out high-motion frames based on IMU RMS threshold.
+     * Returns a new buffer with only low-motion frames.
+     */
+    private fun applyMotionRejection(rawBuffer: RawSeriesBuffer): RawSeriesBuffer {
+        val imuData = rawBuffer.imuRms ?: return rawBuffer
+        if (imuData.isEmpty()) return rawBuffer
+        
+        // Build a set of valid timestamps (low motion)
+        val validTimestamps = imuData
+            .filter { it.value <= motionRejectionThresholdG }
+            .map { it.timestampNs }
+            .toSet()
+        
+        if (validTimestamps.isEmpty()) {
+            Log.w(tag, "Motion rejection: ALL frames exceeded threshold ($motionRejectionThresholdG G). Keeping all.")
+            return rawBuffer
+        }
+        
+        val rejectedCount = imuData.size - validTimestamps.size
+        val rejectionRate = (rejectedCount * 100.0 / imuData.size)
+        Log.d(tag, "Motion rejection: $rejectedCount frames (${"%.1f".format(rejectionRate)}%) exceeded ${motionRejectionThresholdG}G threshold")
+        
+        // Filter face data to only include valid timestamps (within 50ms tolerance)
+        val toleranceNs = 50_000_000L // 50ms
+        fun isNearValid(ts: Long): Boolean = validTimestamps.any { kotlin.math.abs(it - ts) < toleranceNs }
+        
+        return rawBuffer.copy(
+            faceData = rawBuffer.faceData.filter { isNearValid(it.timestampNs) },
+            fingerData = rawBuffer.fingerData.filter { isNearValid(it.timestampNs) },
+            faceMotion = rawBuffer.faceMotion?.filter { isNearValid(it.timestampNs) },
+            fingerSaturation = rawBuffer.fingerSaturation?.filter { isNearValid(it.timestampNs) },
+            imuRms = rawBuffer.imuRms?.filter { isNearValid(it.timestampNs) }
+        )
+    }
     
     data class ChannelResult(
         val mainSignal: DoubleArray,
@@ -50,6 +87,10 @@ class SignalPipeline(
     ): ProcessedSeries {
         Log.d(tag, "Starting pipeline process. Raw buffer size: ${rawBuffer.faceData.size} (face), ${rawBuffer.fingerData.size} (finger)")
         
+        // Motion rejection: filter out high-motion frames
+        val filteredBuffer = applyMotionRejection(rawBuffer)
+        Log.d(tag, "After motion rejection: ${filteredBuffer.faceData.size} (face), ${filteredBuffer.fingerData.size} (finger)")
+        
         var avgFaceSqi = 100
         var avgFingerSqi = 100
         if (preProcessedSignals != null && preProcessedSignals.isNotEmpty()) {
@@ -58,8 +99,8 @@ class SignalPipeline(
         }
         
         val resampled = TimestampSync.resampleToUnifiedTimeline(
-            stream1Data = rawBuffer.faceData,
-            stream2Data = rawBuffer.fingerData,
+            stream1Data = filteredBuffer.faceData,
+            stream2Data = filteredBuffer.fingerData,
             targetFrequencyHz = targetSampleRateHz
         )
         
@@ -244,24 +285,28 @@ class SignalPipeline(
         
         val detrended = DspFunctions.detrendIIR(rawSignal, 0.5, targetSampleRateHz)
         
-        var mainFiltered = DspFunctions.butterworthBandpass(
-            signal = detrended,
-            lowCutoffHz = lowCutoffHz,
-            highCutoffHz = highCutoffHz,
-            sampleRateHz = targetSampleRateHz,
-            order = 4
-        )
-        
-        var denoisedFiltered: DoubleArray? = null
-        if (sqi in 40..80) {
-            val waveletCleaned = WaveletDenoiser.denoise(detrended, WaveletDenoiser.Config(levels = 4))
-            denoisedFiltered = DspFunctions.butterworthBandpass(
-                signal = waveletCleaned,
+        var mainFiltered = DspFunctions.filtfilt(detrended) { sig ->
+            DspFunctions.butterworthBandpass(
+                signal = sig,
                 lowCutoffHz = lowCutoffHz,
                 highCutoffHz = highCutoffHz,
                 sampleRateHz = targetSampleRateHz,
                 order = 4
             )
+        }
+        
+        var denoisedFiltered: DoubleArray? = null
+        if (sqi in 40..80) {
+            val waveletCleaned = WaveletDenoiser.denoise(detrended, WaveletDenoiser.Config(levels = 4))
+            denoisedFiltered = DspFunctions.filtfilt(waveletCleaned) { sig ->
+                DspFunctions.butterworthBandpass(
+                    signal = sig,
+                    lowCutoffHz = lowCutoffHz,
+                    highCutoffHz = highCutoffHz,
+                    sampleRateHz = targetSampleRateHz,
+                    order = 4
+                )
+            }
         }
         
         if (motionFeatures != null && walkingModeEnabled) {

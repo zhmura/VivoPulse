@@ -9,39 +9,33 @@ import com.vivopulse.app.ui.screens.CaptureScreen
 import com.vivopulse.app.ui.screens.ProcessingScreen
 import com.vivopulse.app.ui.screens.ResultScreen
 import com.vivopulse.app.ui.screens.ReactivityProtocolScreen
-sealed class Screen(val route: String) {
-    object Capture : Screen("capture")
-    object Processing : Screen("processing")
-    object Result : Screen("result")
-    object Reactivity : Screen("reactivity")
-}
-
 @Composable
 fun VivoPulseNavHost(
+    windowSizeClass: androidx.compose.material3.windowsizeclass.WindowSizeClass,
     modifier: Modifier = Modifier
 ) {
     val navController = rememberNavController()
     
     NavHost(
         navController = navController,
-        startDestination = Screen.Capture.route,
+        startDestination = Route.Capture.path,
         modifier = modifier
     ) {
-        composable(Screen.Capture.route) {
+        composable(Route.Capture.path) {
             CaptureScreen(
                 onNavigateToProcessing = {
-                    navController.navigate(Screen.Processing.route)
+                    navController.navigate(Route.Processing.path)
                 },
                 onNavigateToReactivity = {
-                    navController.navigate(Screen.Reactivity.route)
+                    navController.navigate(Route.Reactivity.path)
                 }
             )
         }
         
-        composable(Screen.Processing.route) {
+        composable(Route.Processing.path) {
             ProcessingScreen(
                 onNavigateToResult = {
-                    navController.navigate(Screen.Result.route)
+                    navController.navigate(Route.Result.path)
                 },
                 onNavigateBack = {
                     navController.popBackStack()
@@ -49,18 +43,18 @@ fun VivoPulseNavHost(
             )
         }
         
-        composable(Screen.Result.route) {
+        composable(Route.Result.path) {
             ResultScreen(
                 onNavigateBack = {
-                    navController.popBackStack(Screen.Capture.route, inclusive = false)
+                    navController.popBackStack(Route.Capture.path, inclusive = false)
                 }
             )
         }
         
-        composable(Screen.Reactivity.route) {
+        composable(Route.Reactivity.path) {
             ReactivityProtocolScreen(
                 onNavigateBack = { navController.popBackStack() },
-                onNavigateToCapture = { navController.navigate(Screen.Capture.route) }
+                onNavigateToCapture = { navController.navigate(Route.Capture.path) }
             )
         }
     }

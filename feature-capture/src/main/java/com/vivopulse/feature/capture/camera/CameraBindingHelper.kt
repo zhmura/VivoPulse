@@ -14,7 +14,10 @@ import androidx.camera.core.ConcurrentCamera
 import androidx.camera.core.UseCaseGroup
 import com.vivopulse.feature.capture.model.Source
 import com.vivopulse.signal.AppLogger
+
 import kotlin.Pair
+import android.hardware.camera2.CaptureRequest
+import androidx.camera.camera2.interop.Camera2Interop
 
 /**
  * Helper to manage CameraX lifecycle binding for dual streams.
@@ -119,16 +122,21 @@ internal class CameraBindingHelper(
                 .build()
                 .also { it.setSurfaceProvider(frontPreviewView.surfaceProvider) }
             
-            val frontAnalysis = ImageAnalysis.Builder()
+            val frontBuilder = ImageAnalysis.Builder()
                 .setTargetResolution(resolution)
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                 .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
-                .build()
-                .also { 
-                    it.setAnalyzer(executor, com.vivopulse.feature.capture.analysis.SafeImageAnalyzer { img -> 
-                        processFrame(img, Source.FACE) 
-                    })
-                }
+
+            // Force 60 FPS range
+            Camera2Interop.Extender(frontBuilder)
+                .setCaptureRequestOption(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, android.util.Range(60, 60))
+
+            val frontAnalysis = frontBuilder.build().also { analysis ->
+                analysis.setAnalyzer(executor, com.vivopulse.feature.capture.analysis.SafeImageAnalyzer { img -> 
+                    com.vivopulse.signal.AppLogger.log(tag, "Front Frame: ${img.imageInfo.timestamp} | 60fps requested")
+                    processFrame(img, Source.FACE) 
+                })
+            }
                 
             val frontUseCaseGroup = UseCaseGroup.Builder()
                 .addUseCase(frontPreview)
@@ -147,16 +155,20 @@ internal class CameraBindingHelper(
                 .build()
                 .also { it.setSurfaceProvider(backPreviewView.surfaceProvider) }
             
-            val backAnalysis = ImageAnalysis.Builder()
+            val backBuilder = ImageAnalysis.Builder()
                 .setTargetResolution(resolution)
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                 .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
-                .build()
-                .also { 
-                    it.setAnalyzer(executor, com.vivopulse.feature.capture.analysis.SafeImageAnalyzer { img -> 
-                        processFrame(img, Source.FINGER) 
-                    })
-                }
+
+            // Force 60 FPS range
+            Camera2Interop.Extender(backBuilder)
+                .setCaptureRequestOption(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, android.util.Range(60, 60))
+
+            val backAnalysis = backBuilder.build().also { analysis ->
+                analysis.setAnalyzer(executor, com.vivopulse.feature.capture.analysis.SafeImageAnalyzer { img -> 
+                    processFrame(img, Source.FINGER) 
+                })
+            }
                 
             val backUseCaseGroup = UseCaseGroup.Builder()
                 .addUseCase(backPreview)
