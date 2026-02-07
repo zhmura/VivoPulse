@@ -18,6 +18,7 @@ import com.vivopulse.signal.AppLogger
 import kotlin.Pair
 import android.hardware.camera2.CaptureRequest
 import androidx.camera.camera2.interop.Camera2Interop
+import com.vivopulse.feature.capture.camera.Camera2Configurator
 
 /**
  * Helper to manage CameraX lifecycle binding for dual streams.

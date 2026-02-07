@@ -10,7 +10,7 @@ import androidx.camera.core.ImageAnalysis
  * Interface to wrap Camera2Interop calls for testability.
  * Camera2Interop relies on static methods and internal classes that are hard to mock in Robolectric.
  */
-internal interface Camera2Configurator {
+interface Camera2Configurator {
     fun setTargetFpsRange(builder: ImageAnalysis.Builder, range: Range<Int>)
 
     class Impl : Camera2Configurator {
