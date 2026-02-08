@@ -39,13 +39,17 @@ object PttEngine {
         windowSec: Double = 20.0,
         faceMotionPenalty: Double = 100.0
     ): PttOutput {
+        val tag = "PttEngine"
+        
         // 1. Detect peaks
         val facePeaks = PeakDetect.detectPeaks(faceSig, fsHz)
         val fingerPeaks = PeakDetect.detectPeaks(fingerSig, fsHz)
+        android.util.Log.d(tag, "Peaks: Face=${facePeaks.getPeakCount()}, Finger=${fingerPeaks.getPeakCount()}")
         
         // 2. Compute heart rate
         val hrFace = HeartRate.computeHeartRate(facePeaks)
         val hrFinger = HeartRate.computeHeartRate(fingerPeaks)
+        android.util.Log.d(tag, "HR: Face=${"%.1f".format(hrFace.hrBpm)} bpm (valid=${hrFace.isValid}), Finger=${"%.1f".format(hrFinger.hrBpm)} bpm (valid=${hrFinger.isValid})")
         
         // 3. Compute Consensus PTT
         val durationMs = (faceSig.size / fsHz * 1000).toLong()
@@ -61,6 +65,7 @@ object PttEngine {
         // Use median PTT from consensus
         val pttMsRaw = consensusResult.pttMsMedian
         val agreementScore = if (consensusResult.methodAgreeMs <= 50.0) 1.0 else 0.5
+        android.util.Log.d(tag, "Consensus: PTT=${"%.1f".format(pttMsRaw)} ms, Agreement=${"%.1f".format(consensusResult.methodAgreeMs)} ms (Score=$agreementScore)")
         
         // 4. Compute per-channel SQI
         val sqiFace = PttSqi.computeChannelSqi(
@@ -78,17 +83,10 @@ object PttEngine {
             peakResult = fingerPeaks,
             motionPenalty = 100.0 // Finger typically doesn't have motion
         )
+        android.util.Log.d(tag, "SQI: Face=${sqiFace.sqi} (SNR=${sqiFace.snrScore}), Finger=${sqiFinger.sqi} (SNR=${sqiFinger.snrScore})")
         
         // 5. Compute combined confidence
-        val confidence = PttSqi.computeCombinedConfidence(
-            sqiFace = sqiFace.sqi,
-            sqiFinger = sqiFinger.sqi,
-            corrScore = 0.8, // Placeholder corrScore, need to get from Consensus? No, SyncMetrics returns it inside Consensus
-            peakSharpness = 0.0 // Placeholder
-        ) * agreementScore
-        
-        // Re-calculate SyncMetrics for confidence inputs if needed, or expose them in ConsensusPtt
-        // Let's compute metrics directly for confidence:
+        // Re-calculate SyncMetrics for confidence inputs
         val syncMetrics = com.vivopulse.feature.processing.sync.SyncMetrics.computeMetrics(
             faceSig, fingerSig, hrFace.hrBpm, hrFinger.hrBpm, fsHz
         )
@@ -100,9 +98,15 @@ object PttEngine {
             peakSharpness = 0.5 // Simplified sharpness
         ) * agreementScore
         
+        android.util.Log.d(tag, "Confidence: ${"%.2f".format(finalConfidence)} (Corr=${"%.2f".format(syncMetrics.correlation)})")
+        
         // 6. Determine if PTT should be reported
         val shouldReport = PttSqi.shouldReportPtt(finalConfidence)
         val pttMs = if (shouldReport) pttMsRaw else null
+        
+        if (!shouldReport) {
+            android.util.Log.w(tag, "PTT Rejected: Confidence too low ($finalConfidence < 0.60)")
+        }
         
         // 7. Generate guidance if confidence low
         val guidance = if (!shouldReport) {

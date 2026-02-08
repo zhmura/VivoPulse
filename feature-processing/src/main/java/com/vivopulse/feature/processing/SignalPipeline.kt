@@ -106,16 +106,12 @@ class SignalPipeline(
         val driftResult = TimestampSync.computeDrift(stream1Timestamps, stream2Timestamps)
         Log.d(tag, "Drift Analysis: ${driftResult.message} (${driftResult.stream1Rate} vs ${driftResult.stream2Rate} fps)")
         
-        val compensatedStream2 = if (driftResult.isValid && kotlin.math.abs(driftResult.driftMsPerSecond) > 1.0) {
-            Log.i(tag, "Applying drift compensation to Stream 2 (Finger)")
-            TimestampSync.compensateDrift(
-                data = filteredBuffer.fingerData,
-                referenceRateHz = driftResult.stream1Rate,
-                currentRateHz = driftResult.stream2Rate
-            )
-        } else {
-            filteredBuffer.fingerData
-        }
+        // Drift Compensation is DISABLED.
+        // Reason: Android Camera2 timestamps (CLOCK_BOOTTIME) are accurate.
+        // Differing frame rates (e.g. 30fps vs 24fps in low light) resulted in "Drift ~223ms/s".
+        // Attempting to "compensate" (scale) this difference effectively stretched time, desynchronizing the signals.
+        // We now trust the timestamps and let resampleToUnifiedTimeline handle the rate conversion naturally.
+        val compensatedStream2 = filteredBuffer.fingerData
 
         val resampled = TimestampSync.resampleToUnifiedTimeline(
             stream1Data = filteredBuffer.faceData,
@@ -228,6 +224,7 @@ class SignalPipeline(
             windowSec = correlationWindowSec,
             faceMotionPenalty = 100.0
         )
+        Log.i(tag, "Pipeline Result: PTT=${pttOutput.pttMs} ms, Conf=${"%.2f".format(pttOutput.confidence)}, Valid=${pttOutput.isValid}")
         
         var pttDenoised: PttOutput? = null
         if (faceResult.denoisedSignal != null && fingerResult.denoisedSignal != null) {
