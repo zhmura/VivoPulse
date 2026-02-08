@@ -36,7 +36,6 @@ object PttEngine {
         faceRaw: DoubleArray,
         fingerRaw: DoubleArray,
         fsHz: Double,
-        windowSec: Double = 20.0,
         faceMotionPenalty: Double = 100.0
     ): PttOutput {
         val tag = "PttEngine"

@@ -3,7 +3,7 @@ package com.vivopulse.app.ui.screens
 import android.widget.Toast
 import androidx.compose.foundation.layout.*
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.FileDownload
 import androidx.compose.material.icons.filled.Warning
@@ -62,7 +62,7 @@ fun ResultScreen(
                 title = { Text("Results") },
                 navigationIcon = {
                     IconButton(onClick = onNavigateBack) {
-                        Icon(Icons.Default.ArrowBack, contentDescription = "Back")
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
                     }
                 }
             )
@@ -144,7 +144,7 @@ fun ResultScreen(
                         
                         Spacer(modifier = Modifier.height(16.dp))
                         
-                        Divider()
+                        HorizontalDivider()
                         
                         Spacer(modifier = Modifier.height(16.dp))
                         
@@ -264,7 +264,7 @@ fun ResultScreen(
                             // Suggestions
                             if (quality.suggestions.isNotEmpty()) {
                                 Spacer(modifier = Modifier.height(12.dp))
-                                Divider()
+                                HorizontalDivider()
                                 Spacer(modifier = Modifier.height(12.dp))
                                 
                                 Text(
@@ -325,7 +325,7 @@ fun ResultScreen(
                                 val rise = wp.meanRiseTimeMs?.let { String.format("%.0f ms", it) } ?: "—"
                                 val refl = wp.meanReflectionRatio?.let { String.format("%.2f", it) } ?: "—"
                                 Spacer(modifier = Modifier.height(8.dp))
-                                Divider()
+                                HorizontalDivider()
                                 Spacer(modifier = Modifier.height(8.dp))
                                 Text(
                                     text = "Wave metrics",
@@ -426,7 +426,7 @@ fun ResultScreen(
                                 )
                                 
                                 Spacer(modifier = Modifier.height(8.dp))
-                                Divider()
+                        HorizontalDivider()
                                 Spacer(modifier = Modifier.height(8.dp))
                                 
                                 MetricRow("Mean Processing Time", String.format("%.2f ms", report.meanProcessingMs))

@@ -69,7 +69,7 @@ class SignalPipeline(
             fingerData = rawBuffer.fingerData.filter { isNearValid(it.timestampNs) },
             faceMotion = rawBuffer.faceMotion?.filter { isNearValid(it.timestampNs) },
             fingerSaturation = rawBuffer.fingerSaturation?.filter { isNearValid(it.timestampNs) },
-            imuRms = rawBuffer.imuRms?.filter { isNearValid(it.timestampNs) }
+            imuRms = rawBuffer.imuRms.filter { isNearValid(it.timestampNs) }
         )
     }
     
@@ -221,7 +221,6 @@ class SignalPipeline(
             faceRaw = rawFaceSignal,
             fingerRaw = rawFingerSignal,
             fsHz = targetSampleRateHz,
-            windowSec = correlationWindowSec,
             faceMotionPenalty = 100.0
         )
         Log.i(tag, "Pipeline Result: PTT=${pttOutput.pttMs} ms, Conf=${"%.2f".format(pttOutput.confidence)}, Valid=${pttOutput.isValid}")
@@ -234,7 +233,6 @@ class SignalPipeline(
                 faceRaw = rawFaceSignal,
                 fingerRaw = rawFingerSignal,
                 fsHz = targetSampleRateHz,
-                windowSec = correlationWindowSec,
                 faceMotionPenalty = 100.0
             )
         }

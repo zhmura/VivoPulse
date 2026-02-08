@@ -19,6 +19,7 @@ import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
+import androidx.compose.material.icons.automirrored.filled.ArrowForward
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -48,7 +49,6 @@ import androidx.compose.material3.ColorScheme
 @Composable
 fun CaptureScreen(
     onNavigateToProcessing: () -> Unit,
-    onNavigateToReactivity: () -> Unit,
     viewModel: CaptureViewModel = hiltViewModel()
 ) {
     val context = LocalContext.current
@@ -589,7 +589,7 @@ fun CaptureControls(
                 modifier = Modifier.fillMaxWidth(),
                 enabled = !isRecording
             ) {
-                Icon(Icons.Default.ArrowForward, contentDescription = null)
+                Icon(Icons.AutoMirrored.Filled.ArrowForward, contentDescription = null)
                 Spacer(modifier = Modifier.width(4.dp))
                 Text("Process ${lastResult.frames.size} Frames")
             }
@@ -818,7 +818,7 @@ fun DebugMenu(
 
                 Spacer(modifier = Modifier.height(16.dp))
 
-                Divider()
+                HorizontalDivider()
 
                 Spacer(modifier = Modifier.height(16.dp))
 

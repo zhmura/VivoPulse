@@ -119,7 +119,6 @@ internal class CameraBindingHelper(
             AppLogger.log(tag, "bindConcurrent: Configuring cameras at $resolution")
 
             // Dynamic FPS Range Selection
-            val resolutionSize = resolution
             // We need to find the best range for EACH camera, but ideally they match.
             // Since we can't easily query per-camera capabilities here without a CameraInfo, 
             // we will stick to a safer default or try to reuse the logic if we could access CameraCharacteristics.

@@ -11,7 +11,6 @@ import com.vivopulse.app.ui.screens.ResultScreen
 import com.vivopulse.app.ui.screens.ReactivityProtocolScreen
 @Composable
 fun VivoPulseNavHost(
-    windowSizeClass: androidx.compose.material3.windowsizeclass.WindowSizeClass,
     modifier: Modifier = Modifier
 ) {
     val navController = rememberNavController()
@@ -25,9 +24,6 @@ fun VivoPulseNavHost(
             CaptureScreen(
                 onNavigateToProcessing = {
                     navController.navigate(Route.Processing.path)
-                },
-                onNavigateToReactivity = {
-                    navController.navigate(Route.Reactivity.path)
                 }
             )
         }

@@ -17,8 +17,8 @@ class GoodSyncDetectorImpl : GoodSyncDetector() {
     ): List<GoodSyncSegment> {
         val winSamples = (8.0 * fsHz).toInt()
         val stepSamples = (1.0 * fsHz).toInt()
-        val minSegmentSamples = (5.0 * fsHz).toInt()
-        val maxGapSamples = (1.0 * fsHz).toInt()
+        val minSegmentMs = 5000L
+        val maxGapMs = 1000L
         
         if (fullFace.size < winSamples || fullFinger.size < winSamples) {
             return emptyList()
@@ -69,7 +69,7 @@ class GoodSyncDetectorImpl : GoodSyncDetector() {
             val next = windows[i]
             val gap = next.window.tStartMs - currentEnd
             
-            if (gap <= 1000) { // Gap <= 1s (morphological closing)
+            if (gap <= maxGapMs) { // Gap <= 1s (morphological closing)
                 currentEnd = kotlin.math.max(currentEnd, next.window.tEndMs)
                 // Keep best correlation
                 if (next.corr > bestSegment.corr) {
@@ -77,7 +77,7 @@ class GoodSyncDetectorImpl : GoodSyncDetector() {
                 }
             } else {
                 // Segment finished
-                if (currentEnd - currentStart >= 5000) { // Min duration 5s
+                if (currentEnd - currentStart >= minSegmentMs) { // Min duration 5s
                     merged.add(bestSegment.copy(
                         window = Window(currentStart, currentEnd)
                     ))
@@ -89,7 +89,7 @@ class GoodSyncDetectorImpl : GoodSyncDetector() {
         }
         
         // Add last segment
-        if (currentEnd - currentStart >= 5000) {
+        if (currentEnd - currentStart >= minSegmentMs) {
             merged.add(bestSegment.copy(
                 window = Window(currentStart, currentEnd)
             ))

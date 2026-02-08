@@ -60,12 +60,12 @@ object FastFourierTransform {
             
             for (k in 0 until halfL) {
                 for (i in k until n step l) {
-                    val j = i + halfL
-                    val tempReal = wReal * xReal[j] - wImag * xImag[j]
-                    val tempImag = wReal * xImag[j] + wImag * xReal[j]
+                    val butterflyIndex = i + halfL
+                    val tempReal = wReal * xReal[butterflyIndex] - wImag * xImag[butterflyIndex]
+                    val tempImag = wReal * xImag[butterflyIndex] + wImag * xReal[butterflyIndex]
                     
-                    xReal[j] = xReal[i] - tempReal
-                    xImag[j] = xImag[i] - tempImag
+                    xReal[butterflyIndex] = xReal[i] - tempReal
+                    xImag[butterflyIndex] = xImag[i] - tempImag
                     xReal[i] += tempReal
                     xImag[i] += tempImag
                 }
