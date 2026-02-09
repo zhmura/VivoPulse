@@ -82,72 +82,110 @@ class TimestampSyncTest {
     }
     
     @Test
-    fun `computeDrift - zero drift streams`() {
+    fun `analyzeSynchronization - zero drift assumed`() {
         // Two streams with identical frame rates (30 fps) over 6 seconds
         val intervalNs = 33_333_333L
         val stream1 = (0..179).map { it * intervalNs } // 180 frames = 6 seconds at 30fps
         val stream2 = (0..179).map { it * intervalNs + 1000L } // Slight offset
         
-        val result = TimestampSync.computeDrift(stream1, stream2, windowSizeMs = 5000)
+        val result = TimestampSync.analyzeSynchronization(stream1, stream2, windowSizeMs = 5000)
         
         println("Zero drift test: drift=${result.driftMsPerSecond}, isValid=${result.isValid}")
-        assertTrue("Drift calculation should be valid", result.isValid)
-        // Drift should be very close to 0 (allow for windowing effects)
-        // Due to timestamp offset and finite window size, we may see small variations
-        // in frame counts (e.g., 30.0 vs 30.2 fps in a 5s window = ~6-7 ms/s drift)
-        assertTrue("Drift should be < 10.0 ms/s for identical rates, was: ${result.driftMsPerSecond}", 
-            abs(result.driftMsPerSecond) < 10.0)
+        assertTrue("Sync calculation should be valid", result.isValid)
+        // Drift should be exactly 0.0
+        assertEquals(0.0, result.driftMsPerSecond, 0.001)
+        assertEquals(30.0, result.stream1Rate, 0.5)
+        assertEquals(30.0, result.stream2Rate, 0.5)
     }
     
     @Test
-    fun `computeDrift - slower stream 2 (negative rate drift)`() {
+    fun `analyzeSynchronization - mixed frame rates (24 vs 30 fps)`() {
         // Stream 1: 30 fps (33.33ms interval)
-        // Stream 2: 29.7 fps (33.67ms interval) - slower by ~0.3 fps
-        // Rate2 < Rate1, so drift is negative
+        // Stream 2: 24 fps (41.67ms interval)
         
         val stream1IntervalNs = 33_333_333L  // 30.0 fps
-        val stream2IntervalNs = 33_670_034L  // 29.7 fps
+        val stream2IntervalNs = 41_666_667L  // 24.0 fps
         
         val stream1 = (0..179).map { it * stream1IntervalNs } // 180 frames = 6s
-        val stream2 = (0..177).map { it * stream2IntervalNs } // 178 frames = ~6s
+        val stream2 = (0..149).map { it * stream2IntervalNs } // 150 frames = ~6.25s
         
-        val result = TimestampSync.computeDrift(stream1, stream2, windowSizeMs = 5000)
+        val result = TimestampSync.analyzeSynchronization(stream1, stream2, windowSizeMs = 5000)
         
-        println("Slower drift test: drift=${result.driftMsPerSecond}, isValid=${result.isValid}")
-        assertTrue("Drift calculation should be valid", result.isValid)
-        // Should detect negative drift around -10 ms/s
-        assertTrue("Drift should be < -5.0 ms/s, was: ${result.driftMsPerSecond}", 
-            result.driftMsPerSecond < -5.0)
-        assertTrue("Drift should be > -15.0 ms/s, was: ${result.driftMsPerSecond}", 
-            result.driftMsPerSecond > -15.0)
+        assertTrue("Sync calculation should be valid", result.isValid)
+        
+        // Critical: Drift should be 0.0 despite rate difference!
+        assertEquals(0.0, result.driftMsPerSecond, 0.001)
+        
+        // Rates should be correctly reported
+        assertEquals(30.0, result.stream1Rate, 0.5)
+        assertEquals(24.0, result.stream2Rate, 0.5)
+        
+        // Drops should be 0 (clean rates)
+        assertEquals(0.0, result.stream1DropRate, 0.01)
+        assertEquals(0.0, result.stream2DropRate, 0.01)
+        
+        // Jitter should be negligible
+        assertEquals(0.0, result.stream1JitterMs, 0.1)
     }
     
     @Test
-    fun `computeDrift - faster stream 2 (positive rate drift)`() {
-        // Stream 1: 29.7 fps (slower)
-        // Stream 2: 30.0 fps (faster)
-        // Rate2 > Rate1, so drift is positive
+    fun `analyzeSynchronization - high jitter detection`() {
+        // Stream 1: 30 fps with random +/- 5ms jitter
+        val intervalNs = 33_333_333L
+        val random = java.util.Random(12345) // Fixed seed for reproducibility
         
-        val stream1IntervalNs = 33_670_034L  // 29.7 fps
-        val stream2IntervalNs = 33_333_333L  // 30.0 fps
+        val stream1 = (0..99).map { 
+            // Jitter between -5ms and +5ms
+            val jitter = (random.nextDouble() * 10_000_000 - 5_000_000).toLong()
+            it * intervalNs + jitter
+        }
+        val stream2 = (0..99).map { it * intervalNs } // Clean stream
         
-        val stream1 = (0..177).map { it * stream1IntervalNs } // 178 frames = ~6s
-        val stream2 = (0..179).map { it * stream2IntervalNs } // 180 frames = 6s
+        val result = TimestampSync.analyzeSynchronization(stream1, stream2, windowSizeMs = 3000)
         
-        val result = TimestampSync.computeDrift(stream1, stream2, windowSizeMs = 5000)
+        // Random jitter should produce measurable MAD > 0.5ms
+        assertTrue("Jitter should be detected > 0.5 ms, was ${result.stream1JitterMs}", result.stream1JitterMs > 0.5)
+    }
+
+    @Test
+    fun `analyzeSynchronization - robust offset calculation`() {
+        // Test that robust offset ignores outlier at the start
+        val intervalNs = 10_000_000L // 100 Hz
         
-        println("Faster drift test: drift=${result.driftMsPerSecond}, isValid=${result.isValid}")
-        assertTrue("Drift calculation should be valid", result.isValid)
-        // Should detect positive drift around 10 ms/s
-        assertTrue("Drift should be > 5.0 ms/s, was: ${result.driftMsPerSecond}", 
-            result.driftMsPerSecond > 5.0)
-        assertTrue("Drift should be < 15.0 ms/s, was: ${result.driftMsPerSecond}", 
-            result.driftMsPerSecond < 15.0)
+        // Stream 1 matches Stream 2 perfectly, EXCEPT first frame has huge error
+        val stream1 = (0..50).map { it * intervalNs }.toMutableList()
+        stream1[0] = -50_000_000L // First frame starts 50ms early (noise)
+        
+        val stream2 = (0..50).map { it * intervalNs }
+        
+        val result = TimestampSync.analyzeSynchronization(stream1, stream2)
+        
+        // Simple first-frame diff would be 0 - (-50) = 50ms
+        // Robust median offset should be closer to 0ms
+        assertEquals(0.0, result.offsetMs, 1.0)
     }
     
     @Test
-    fun `computeDrift - insufficient data`() {
-        val result = TimestampSync.computeDrift(
+    fun `analyzeSynchronization - drop rate detection`() {
+        // Stream with 10% drops
+        val intervalNs = 33_333_333L
+        val stream1 = (0..99).filter { it % 10 != 5 }.map { it * intervalNs }
+        val stream2 = (0..99).map { it * intervalNs }
+        
+        val result = TimestampSync.analyzeSynchronization(stream1, stream2, windowSizeMs = 3000)
+        
+        println("Drop rate test: drops1=${result.stream1DropRate}")
+        
+        // We dropped 10 frames out of 100.
+        // Inter-frame intervals at drop points will be 66ms (2x).
+        // Threshold is 1.5x (50ms). So these should count as drops.
+        // 10 drops / 90 intervals = ~11%
+        assertTrue("Drop rate should be > 0.05", result.stream1DropRate > 0.05)
+    }
+    
+    @Test
+    fun `analyzeSynchronization - insufficient data`() {
+        val result = TimestampSync.analyzeSynchronization(
             listOf(1000L),
             listOf(2000L),
             windowSizeMs = 5000
@@ -313,21 +351,21 @@ class TimestampSyncTest {
         // So rate2 will be 0.9 * rate1.
         // It will report drift ~10%. (300 ms/s!)
         
-        val result = TimestampSync.computeDrift(
+        val result = TimestampSync.analyzeSynchronization(
             stream1.map { it.timestampNs }, 
             stream2.map { it.timestampNs }, 
             windowSizeMs = 3500 // 3.5s
         )
         
-        // We WANT this to be FALSE or 0.0 drift.
-        // But current implementation will fail this.
-        // This test documents the flaw.
+        // Verified: New logic returns 0.0 drift appropriately!
         println("Frame Drop Test: Drift=${result.driftMsPerSecond}")
         
-        // With corrected logic (using Median Interval), this should be robust.
-        // Expect drift < 1ms/s (basically zero)
-        assertTrue("Fixed logic should NOT find drift for drops, was: ${result.driftMsPerSecond}", 
-            kotlin.math.abs(result.driftMsPerSecond) < 1.0)
+        // Assert exactly 0.0 drift
+        assertEquals(0.0, result.driftMsPerSecond, 0.001)
+        
+        // Verify rates are detected correctly despite drops (median interval handles it)
+        assertEquals(30.0, result.stream1Rate, 0.5)
+        assertEquals(30.0, result.stream2Rate, 0.5)
     }
 }
 

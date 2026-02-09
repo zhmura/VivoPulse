@@ -15,6 +15,8 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
+import androidx.navigation.NavController
+import com.vivopulse.app.navigation.PROCESSING_GRAPH_ROUTE
 import com.vivopulse.app.ui.components.QualityBadge
 import com.vivopulse.app.viewmodel.ProcessingViewModel
 import com.vivopulse.app.ui.education.EducationTextProvider
@@ -26,8 +28,11 @@ import com.vivopulse.app.ui.components.PulseGraph
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ResultScreen(
+    navController: NavController,
     onNavigateBack: () -> Unit,
-    viewModel: ProcessingViewModel = hiltViewModel()
+    viewModel: ProcessingViewModel = hiltViewModel(
+        navController.getBackStackEntry(PROCESSING_GRAPH_ROUTE)
+    )
 ) {
     val context = LocalContext.current
     val pttResult by viewModel.pttResult.collectAsState()

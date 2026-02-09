@@ -339,5 +339,51 @@ class DspFunctionsTest {
         // The artifact shouldn't be effectively infinite or orders of magnitude larger
         assertTrue("Start artifact ${firstVal} should be reasonable vs max ${maxVal}", firstVal < maxVal * 2.0)
     }
+
+    @Test
+    fun `filtfilt - window boundary invariance`() {
+        val fs = 100.0
+        // Generate 10s signal (1000 samples) — long enough for windows + padding
+        val totalDuration = 10.0
+        val totalSamples = (totalDuration * fs).toInt()
+        val s1 = DspFunctions.generateSineWave(1.2, totalDuration, fs, amplitude = 1.0)
+        val s2 = DspFunctions.generateSineWave(2.5, totalDuration, fs, amplitude = 0.5)
+        val signal = DoubleArray(totalSamples) { i -> s1[i] + s2[i] }
+        
+        // Window 1: 0..5s (500 samples)
+        val w1Len = 500
+        val w1 = signal.sliceArray(0 until w1Len)
+        
+        // Window 2: 0.5..5.5s (shift 50 samples)
+        val shift = 50
+        val w2 = signal.sliceArray(shift until (w1Len + shift))
+        
+        val filterOp: (DoubleArray) -> DoubleArray = { 
+            DspFunctions.butterworthBandpass(it, 0.7, 4.0, fs, 2)
+        }
+        
+        // padLength = 150 matches production SignalPipeline setting
+        val f1 = DspFunctions.filtfilt(w1, padLength = 150, filterOp)
+        val f2 = DspFunctions.filtfilt(w2, padLength = 150, filterOp)
+        
+        // Compare overlapping region in the safe middle.
+        // Overlap in absolute time: [0.5s, 5.0s].
+        // Skip first 1.5s of each window to avoid any edge effects.
+        // Compare absolute time [2.0s, 4.0s]:
+        //   w1 indices: 200..400
+        //   w2 indices: 150..350
+        
+        var maxDiff = 0.0
+        val compareLen = 200
+        for (i in 0 until compareLen) {
+            val v1 = f1[200 + i]
+            val v2 = f2[150 + i]
+            val diff = abs(v1 - v2)
+            if (diff > maxDiff) maxDiff = diff
+        }
+        
+        println("Window Invariance Max Diff: $maxDiff")
+        assertTrue("Invariance failed, maxDiff=$maxDiff > 0.01", maxDiff < 0.01)
+    }
 }
 

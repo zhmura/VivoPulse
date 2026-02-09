@@ -14,6 +14,8 @@ import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
+import androidx.navigation.NavController
+import com.vivopulse.app.navigation.PROCESSING_GRAPH_ROUTE
 import com.vivopulse.app.ui.components.SimulationPanel
 import com.vivopulse.app.util.FeatureFlags
 import com.vivopulse.app.viewmodel.ProcessingViewModel
@@ -21,9 +23,12 @@ import com.vivopulse.app.viewmodel.ProcessingViewModel
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ProcessingScreen(
+    navController: NavController,
     onNavigateToResult: () -> Unit,
     onNavigateBack: () -> Unit,
-    viewModel: ProcessingViewModel = hiltViewModel()
+    viewModel: ProcessingViewModel = hiltViewModel(
+        navController.getBackStackEntry(PROCESSING_GRAPH_ROUTE)
+    )
 ) {
     val processedSeries by viewModel.processedSeries.collectAsState()
     val isProcessing by viewModel.isProcessing.collectAsState()

@@ -35,24 +35,34 @@ class PTTConsensus {
         
         val beatLags = mutableListOf<Double>()
         
-        // Match feet
+        // Match feet (Causal: Face -> Finger, monotonic cursor)
+        // For each face foot, find the next finger foot that follows it.
+        // Cursor only advances forward to prevent re-pairing.
+        var fingerCursor = 0
         for (tFace in faceFeet) {
-            // Find closest finger foot after face foot (within reasonable PTT range e.g. 100-400ms)
-            // Or just closest.
-            val tFinger = fingerFeet.minByOrNull { abs(it - tFace) } ?: continue
-            
-            val lag = tFinger - tFace
-            // PTT should be positive (Face -> Finger)
-            // But depending on phase, it might wrap.
-            // Let's assume aligned signals where lag is roughly 200ms.
-            
-            if (lag in 50.0..500.0) {
-                beatLags.add(lag)
+            // Advance cursor past any finger feet that are at or before the face foot
+            while (fingerCursor < fingerFeet.size && fingerFeet[fingerCursor] <= tFace) {
+                fingerCursor++
+            }
+            // Check if the next causal finger foot produces a physiologically valid lag
+            if (fingerCursor < fingerFeet.size) {
+                val lag = fingerFeet[fingerCursor] - tFace
+                if (lag in 30.0..500.0) {
+                    beatLags.add(lag)
+                    fingerCursor++ // Consume this foot (one-to-one pairing)
+                }
             }
         }
         
         if (beatLags.isEmpty()) {
-            return ConsensusPtt(0.0, 0.0, 0.0, 0)
+            // Foot-to-foot failed — fall back to XCorr-only consensus.
+            // Agreement is unknown, so set methodAgreeMs high to signal reduced confidence.
+            return ConsensusPtt(
+                pttMsMedian = pttXCorr,
+                pttMsIqr = 0.0,
+                methodAgreeMs = Double.MAX_VALUE, // No agreement possible
+                nBeats = 0
+            )
         }
         
         val pttFootMedian = median(beatLags)
@@ -60,13 +70,11 @@ class PTTConsensus {
         
         val agreement = abs(pttXCorr - pttFootMedian)
         
-        // If agreement is bad, maybe return "uncertain"?
-        // For now, return stats.
+        // Use foot-to-foot median when both methods agree, XCorr otherwise
+        val bestPtt = if (agreement <= 50.0) pttFootMedian else pttXCorr
         
         return ConsensusPtt(
-            pttMsMedian = pttFootMedian, // Prefer foot-to-foot for beat-level precision? Or XCorr for robustness?
-            // Prompt says: "Agreement check: |PTT_xcorr - PTT_foot| <= 20 ms"
-            // If agrees, use median.
+            pttMsMedian = bestPtt,
             pttMsIqr = pttFootIqr,
             methodAgreeMs = agreement,
             nBeats = beatLags.size

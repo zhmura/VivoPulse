@@ -103,19 +103,30 @@ class SignalPipeline(
         val stream1Timestamps = filteredBuffer.faceData.map { it.timestampNs }
         val stream2Timestamps = filteredBuffer.fingerData.map { it.timestampNs }
         
-        val driftResult = TimestampSync.computeDrift(stream1Timestamps, stream2Timestamps)
-        Log.d(tag, "Drift Analysis: ${driftResult.message} (${driftResult.stream1Rate} vs ${driftResult.stream2Rate} fps)")
+        val driftResult = TimestampSync.analyzeSynchronization(stream1Timestamps, stream2Timestamps)
+        Log.d(tag, "Sync Analysis: ${driftResult.message}")
         
-        // Drift Compensation is DISABLED.
-        // Reason: Android Camera2 timestamps (CLOCK_BOOTTIME) are accurate.
-        // Differing frame rates (e.g. 30fps vs 24fps in low light) resulted in "Drift ~223ms/s".
-        // Attempting to "compensate" (scale) this difference effectively stretched time, desynchronizing the signals.
-        // We now trust the timestamps and let resampleToUnifiedTimeline handle the rate conversion naturally.
-        val compensatedStream2 = filteredBuffer.fingerData
+        // Log detailed metrics for debugging
+        if (!driftResult.isValid || driftResult.stream1DropRate > 0.1 || driftResult.stream2DropRate > 0.1) {
+            Log.w(tag, "Sync Warning: Jitter=${"%.1f".format(driftResult.stream1JitterMs)}/${"%.1f".format(driftResult.stream2JitterMs)} ms, " +
+                       "Drops=${"%.1f".format(driftResult.stream1DropRate*100)}%/${"%.1f".format(driftResult.stream2DropRate*100)}%")
+        }
+
+        // Low FPS Warning (Gating): PTT requires high temporal resolution.
+        // If effective rate < 25Hz, timing error > 40ms, which is too coarse for PTT.
+        if (driftResult.stream1Rate < 25.0 || driftResult.stream2Rate < 25.0) {
+            Log.w(tag, "Low FPS Warning: Rates ${"%.1f".format(driftResult.stream1Rate)}/${"%.1f".format(driftResult.stream2Rate)} fps. " +
+                       "PTT accuracy may be degraded. Ensure better lighting.")
+        }
+        
+        // Drift Compensation is NOT NEEDED.
+        // Android Camera2 timestamps (CLOCK_BOOTTIME) are accurate and shared.
+        // Differing frame rates (e.g. 30fps vs 24fps) do not imply clock drift.
+        // We trust the timestamps and let resampleToUnifiedTimeline handle the rate conversion naturally.
 
         val resampled = TimestampSync.resampleToUnifiedTimeline(
             stream1Data = filteredBuffer.faceData,
-            stream2Data = compensatedStream2,
+            stream2Data = filteredBuffer.fingerData,
             targetFrequencyHz = targetSampleRateHz
         )
         
@@ -237,6 +248,52 @@ class SignalPipeline(
             )
         }
         
+        var effectivePtt: PttOutput? = pttOutput
+        var effectivePttDenoised: PttOutput? = pttDenoised
+        var msg = "Processed ${timeMillis.size} samples"
+
+        // Timing Quality Gating (hierarchical: offset → FPS → jitter → drops)
+        val minRate = minOf(driftResult.stream1Rate, driftResult.stream2Rate)
+        if (!driftResult.offsetValid) {
+            effectivePtt = null
+            effectivePttDenoised = null
+            msg += " (Invalid Offset: PTT Gated)"
+            Log.w(tag, "Invalid timestamp offset (streams not synchronized). Gating PTT result.")
+        } else if (minRate < 25.0) {
+            effectivePtt = null // Strictly block PTT
+            effectivePttDenoised = null
+            
+            msg += " (Low FPS < 25Hz: PTT Gated)"
+            Log.w(tag, "Low FPS (${"%.1f".format(minRate)}Hz) detected. Gating PTT result.")
+        } else if (driftResult.stream1JitterMs > 5.0 || driftResult.stream2JitterMs > 5.0) {
+            effectivePtt = null
+            effectivePttDenoised = null
+            msg += " (High Jitter > 5ms: PTT Gated)"
+            Log.w(tag, "High Jitter (${"%.1f".format(driftResult.stream1JitterMs)}/${"%.1f".format(driftResult.stream2JitterMs)} ms) detected. Gating PTT result.")
+        } else if (driftResult.stream1DropRate > 0.1 || driftResult.stream2DropRate > 0.1) {
+             effectivePtt = null
+             effectivePttDenoised = null
+             msg += " (High Drop Rate > 10%: PTT Gated)"
+             Log.w(tag, "High Drop Rate (${"%.1f".format(driftResult.stream1DropRate*100)}%/${"%.1f".format(driftResult.stream2DropRate*100)}%) detected. Gating PTT result.")
+        }
+
+        // Per-session debug summary — one structured line for device-run analysis
+        val gateReason = when {
+            !driftResult.offsetValid -> "INVALID_OFFSET"
+            minRate < 25.0 -> "LOW_FPS"
+            driftResult.stream1JitterMs > 5.0 || driftResult.stream2JitterMs > 5.0 -> "HIGH_JITTER"
+            driftResult.stream1DropRate > 0.1 || driftResult.stream2DropRate > 0.1 -> "HIGH_DROPS"
+            else -> "NONE"
+        }
+        Log.i(tag, "SESSION_SUMMARY | " +
+            "fps=${"%.1f".format(driftResult.stream1Rate)}/${"%.1f".format(driftResult.stream2Rate)} | " +
+            "jitter=${"%.1f".format(driftResult.stream1JitterMs)}/${"%.1f".format(driftResult.stream2JitterMs)}ms | " +
+            "drops=${"%.0f".format(driftResult.stream1DropRate*100)}%/${"%.0f".format(driftResult.stream2DropRate*100)}% | " +
+            "offset=${"%.1f".format(driftResult.offsetMs)}ms (n=${driftResult.offsetPairs}) | " +
+            "nBeats=${effectivePtt?.nBeats ?: 0} | " + // Log foot-to-foot beats
+            "pttGated=$gateReason | " +
+            "pttMs=${effectivePtt?.pttMs?.let { "%.1f".format(it) } ?: "null"}")
+        
         return ProcessedSeries(
             timeMillis = timeMillis,
             faceSignal = faceResult.mainSignal,
@@ -247,9 +304,9 @@ class SignalPipeline(
             rawFingerSignal = rawFingerSignal,
             sampleRateHz = targetSampleRateHz,
             isValid = true,
-            pttOutput = pttOutput,
-            pttOutputDenoised = pttDenoised,
-            message = "Processed ${timeMillis.size} samples",
+            pttOutput = effectivePtt,
+            pttOutputDenoised = effectivePttDenoised,
+            message = msg,
             faceMotionRms = faceMotion,
             fingerSaturationPct = fingerSat,
             imuRmsG = imuRms,
@@ -301,9 +358,12 @@ class SignalPipeline(
         val zeroMean = DspFunctions.removeMean(rawSignal)
         val detrended = DspFunctions.detrendIIR(zeroMean, 0.5, targetSampleRateHz)
         
+        // Pad 1.5s (covers >1 period of 0.7Hz cutoff), clamped to signal length
+        val safePad = minOf(150, detrended.size - 1)
+        
         var mainFiltered = DspFunctions.filtfilt(
             signal = detrended,
-            padLength = 50 // Pad 0.5s
+            padLength = safePad
         ) { sig ->
             DspFunctions.butterworthBandpass(
                 signal = sig,
@@ -319,7 +379,7 @@ class SignalPipeline(
             val waveletCleaned = WaveletDenoiser.denoise(detrended, WaveletDenoiser.Config(levels = 4))
             denoisedFiltered = DspFunctions.filtfilt(
                 signal = waveletCleaned,
-                padLength = 50
+                padLength = safePad
             ) { sig ->
                 DspFunctions.butterworthBandpass(
                     signal = sig,

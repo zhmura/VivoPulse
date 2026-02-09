@@ -63,8 +63,13 @@ object PttEngine {
         
         // Use median PTT from consensus
         val pttMsRaw = consensusResult.pttMsMedian
-        val agreementScore = if (consensusResult.methodAgreeMs <= 50.0) 1.0 else 0.5
-        android.util.Log.d(tag, "Consensus: PTT=${"%.1f".format(pttMsRaw)} ms, Agreement=${"%.1f".format(consensusResult.methodAgreeMs)} ms (Score=$agreementScore)")
+        // Agreement score: 1.0 if methods agree (or only XCorr available), 0.5 if they disagree
+        val agreementScore = when {
+            consensusResult.nBeats == 0 -> 1.0     // XCorr-only fallback: no penalty
+            consensusResult.methodAgreeMs <= 50.0 -> 1.0  // Both methods agree
+            else -> 0.5                             // Methods disagree: halve confidence
+        }
+        android.util.Log.d(tag, "Consensus: PTT=${"%.1f".format(pttMsRaw)} ms, Agreement=${"%.1f".format(consensusResult.methodAgreeMs)} ms (Score=$agreementScore, nBeats=${consensusResult.nBeats})")
         
         // 4. Compute per-channel SQI
         val sqiFace = PttSqi.computeChannelSqi(
@@ -97,6 +102,8 @@ object PttEngine {
             peakSharpness = 0.5 // Simplified sharpness
         ) * agreementScore
         
+
+
         android.util.Log.d(tag, "Confidence: ${"%.2f".format(finalConfidence)} (Corr=${"%.2f".format(syncMetrics.correlation)})")
         
         // 6. Determine if PTT should be reported
@@ -122,9 +129,10 @@ object PttEngine {
             hrFingerBpm = hrFinger.hrBpm,
             sqiFace = sqiFace.sqi,
             sqiFinger = sqiFinger.sqi,
-            peakSharpness = 0.5,
+            peakSharpness = 0.5, // Simplified sharpness
             facePeakCount = facePeaks.getPeakCount(),
             fingerPeakCount = fingerPeaks.getPeakCount(),
+            nBeats = consensusResult.nBeats,
             guidance = guidance,
             isValid = finalConfidence > 0 && hrFace.isValid && hrFinger.isValid
         )
@@ -189,6 +197,7 @@ data class PttOutput(
     val peakSharpness: Double = 0.0,// Cross-correlation peak sharpness
     val facePeakCount: Int = 0,     // Number of face peaks detected
     val fingerPeakCount: Int = 0,   // Number of finger peaks detected
+    val nBeats: Int = 0,            // Number of valid foot-to-foot beats for PTT
     val guidance: List<String>? = null, // Low-confidence guidance tips
     val isValid: Boolean = false    // Overall validity
 ) {
