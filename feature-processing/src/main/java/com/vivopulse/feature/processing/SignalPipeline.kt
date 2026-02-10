@@ -38,39 +38,77 @@ class SignalPipeline(
     private val imuAnalyzer = ImuMotionAnalyzer()
     
     /**
-     * Filter out high-motion frames based on IMU RMS threshold.
-     * Returns a new buffer with only low-motion frames.
+     * Result of motion rejection with optional PTT gate.
      */
-    private fun applyMotionRejection(rawBuffer: RawSeriesBuffer): RawSeriesBuffer {
-        val imuData = rawBuffer.imuRms ?: return rawBuffer
-        if (imuData.isEmpty()) return rawBuffer
+    data class MotionRejectionResult(
+        val buffer: RawSeriesBuffer,
+        val pttGate: String? = null  // null = OK, "ALL_MOTION" = all frames exceeded threshold
+    )
+    
+    /**
+     * Filter out high-motion frames based on IMU RMS threshold.
+     * 
+     * P1-A: If ALL frames exceed threshold, do NOT keep them (old fail-safe was harmful).
+     * Instead, return empty buffer with ALL_MOTION gate to prevent garbage processing.
+     */
+    private fun applyMotionRejection(rawBuffer: RawSeriesBuffer): MotionRejectionResult {
+        val imuData = rawBuffer.imuRms ?: return MotionRejectionResult(rawBuffer)
+        if (imuData.isEmpty()) return MotionRejectionResult(rawBuffer)
         
-        // Build a set of valid timestamps (low motion)
-        val validTimestamps = imuData
-            .filter { it.value <= motionRejectionThresholdG }
-            .map { it.timestampNs }
-            .toSet()
+        // Compute windowed motion score for each IMU sample (±250ms window)
+        val windowNs = 250_000_000L // ±250ms
+        val imuTimestamps = imuData.map { it.timestampNs }
+        val imuValues = imuData.map { it.value }
         
-        if (validTimestamps.isEmpty()) {
-            Log.w(tag, "Motion rejection: ALL frames exceeded threshold ($motionRejectionThresholdG G). Keeping all.")
-            return rawBuffer
+        // For each IMU sample, compute mean RMS in the surrounding window
+        val windowedScores = DoubleArray(imuData.size)
+        for (i in imuData.indices) {
+            val center = imuTimestamps[i]
+            var sum = 0.0
+            var count = 0
+            // Scan outward from center
+            for (j in imuData.indices) {
+                if (kotlin.math.abs(imuTimestamps[j] - center) <= windowNs) {
+                    sum += imuValues[j]
+                    count++
+                }
+            }
+            windowedScores[i] = if (count > 0) sum / count else imuValues[i]
         }
         
-        val rejectedCount = imuData.size - validTimestamps.size
+        // Build set of timestamps where the ENTIRE window is calm
+        val calmTimestamps = imuData.indices
+            .filter { windowedScores[it] <= motionRejectionThresholdG }
+            .map { imuTimestamps[it] }
+            .toSet()
+        
+        if (calmTimestamps.isEmpty()) {
+            // P1-A: ALL windows exceeded threshold — do NOT process garbage.
+            val fingerDurationS = if (rawBuffer.fingerData.size >= 2) {
+                (rawBuffer.fingerData.last().timestampNs - rawBuffer.fingerData.first().timestampNs) / 1e9
+            } else 0.0
+            
+            Log.w(tag, "Motion rejection: ALL windows exceeded threshold ($motionRejectionThresholdG G). " +
+                  "PTT unavailable. Finger duration: ${"%.1f".format(fingerDurationS)}s")
+            
+            return MotionRejectionResult(rawBuffer, pttGate = "ALL_MOTION")
+        }
+        
+        val rejectedCount = imuData.size - calmTimestamps.size
         val rejectionRate = (rejectedCount * 100.0 / imuData.size)
-        Log.d(tag, "Motion rejection: $rejectedCount frames (${"%.1f".format(rejectionRate)}%) exceeded ${motionRejectionThresholdG}G threshold")
+        Log.d(tag, "Motion rejection (windowed ±250ms): $rejectedCount frames (${"%.1f".format(rejectionRate)}%) exceeded ${motionRejectionThresholdG}G threshold")
         
-        // Filter face data to only include valid timestamps (within 50ms tolerance)
-        val toleranceNs = 50_000_000L // 50ms
-        fun isNearValid(ts: Long): Boolean = validTimestamps.any { kotlin.math.abs(it - ts) < toleranceNs }
+        // Keep frames whose nearest calm IMU sample is within one window span
+        fun isInCalmWindow(ts: Long): Boolean = calmTimestamps.any { kotlin.math.abs(it - ts) <= windowNs }
         
-        return rawBuffer.copy(
-            faceData = rawBuffer.faceData.filter { isNearValid(it.timestampNs) },
-            fingerData = rawBuffer.fingerData.filter { isNearValid(it.timestampNs) },
-            faceMotion = rawBuffer.faceMotion?.filter { isNearValid(it.timestampNs) },
-            fingerSaturation = rawBuffer.fingerSaturation?.filter { isNearValid(it.timestampNs) },
-            imuRms = rawBuffer.imuRms.filter { isNearValid(it.timestampNs) }
+        val filtered = rawBuffer.copy(
+            faceData = rawBuffer.faceData.filter { isInCalmWindow(it.timestampNs) },
+            fingerData = rawBuffer.fingerData.filter { isInCalmWindow(it.timestampNs) },
+            faceMotion = rawBuffer.faceMotion?.filter { isInCalmWindow(it.timestampNs) },
+            fingerSaturation = rawBuffer.fingerSaturation?.filter { isInCalmWindow(it.timestampNs) },
+            imuRms = rawBuffer.imuRms.filter { isInCalmWindow(it.timestampNs) }
         )
+        return MotionRejectionResult(filtered)
     }
     
     data class ChannelResult(
@@ -87,9 +125,12 @@ class SignalPipeline(
     ): ProcessedSeries {
         Log.d(tag, "Starting pipeline process. Raw buffer size: ${rawBuffer.faceData.size} (face), ${rawBuffer.fingerData.size} (finger)")
         
-        // Motion rejection: filter out high-motion frames
-        val filteredBuffer = applyMotionRejection(rawBuffer)
-        Log.d(tag, "After motion rejection: ${filteredBuffer.faceData.size} (face), ${filteredBuffer.fingerData.size} (finger)")
+        // Motion rejection: filter out high-motion frames (P1-A)
+        val motionResult = applyMotionRejection(rawBuffer)
+        val filteredBuffer = motionResult.buffer
+        val motionGate = motionResult.pttGate
+        Log.d(tag, "After motion rejection: ${filteredBuffer.faceData.size} (face), ${filteredBuffer.fingerData.size} (finger)" +
+              if (motionGate != null) " [GATED: $motionGate]" else "")
         
         var avgFaceSqi = 100
         var avgFingerSqi = 100
@@ -119,15 +160,24 @@ class SignalPipeline(
                        "PTT accuracy may be degraded. Ensure better lighting.")
         }
         
-        // Drift Compensation is NOT NEEDED.
-        // Android Camera2 timestamps (CLOCK_BOOTTIME) are accurate and shared.
-        // Differing frame rates (e.g. 30fps vs 24fps) do not imply clock drift.
-        // We trust the timestamps and let resampleToUnifiedTimeline handle the rate conversion naturally.
+        // P2-A: Conditional resampling — choose effective rate based on actual FPS quality
+        val minFps = minOf(driftResult.stream1Rate, driftResult.stream2Rate)
+        val isClean = driftResult.stream1JitterMs <= 5.0 && driftResult.stream2JitterMs <= 5.0 &&
+                      driftResult.stream1DropRate <= 0.1 && driftResult.stream2DropRate <= 0.1
+        val effectiveSampleRateHz = when {
+            minFps >= 25.0 && isClean -> targetSampleRateHz  // 100Hz — full pipeline
+            minFps >= 15.0 -> minOf(50.0, 2.0 * minFps)     // 30-50Hz — reduced precision
+            else -> maxOf(20.0, minFps * 2.0)                // Minimal (safety floor: 20Hz)
+        }
+        val footDetectionAllowed = effectiveSampleRateHz >= 100.0
+        Log.i(tag, "RESAMPLE | minFps=${"%.1f".format(minFps)} | clean=$isClean | " +
+              "effectiveHz=${"%.0f".format(effectiveSampleRateHz)} | " +
+              "footDetection=$footDetectionAllowed | rateRatio=${"%.6f".format(driftResult.rateRatio)}")
 
         val resampled = TimestampSync.resampleToUnifiedTimeline(
             stream1Data = filteredBuffer.faceData,
             stream2Data = filteredBuffer.fingerData,
-            targetFrequencyHz = targetSampleRateHz
+            targetFrequencyHz = effectiveSampleRateHz
         )
         
         if (!resampled.isValid) {
@@ -136,7 +186,7 @@ class SignalPipeline(
                 timeMillis = emptyList(),
                 faceSignal = doubleArrayOf(),
                 fingerSignal = doubleArrayOf(),
-                sampleRateHz = targetSampleRateHz,
+                sampleRateHz = effectiveSampleRateHz,
                 isValid = false,
                 message = resampled.message,
                 mainHarmonicsFace = HarmonicFeatureExtractor.HarmonicFeatures.empty(),
@@ -215,7 +265,7 @@ class SignalPipeline(
         }
         
         val motionFeatures = if (walkingModeEnabled && imuRms.isNotEmpty()) {
-            imuAnalyzer.analyze(imuRms, targetSampleRateHz)
+            imuAnalyzer.analyze(imuRms, effectiveSampleRateHz)
         } else {
             ImuMotionAnalyzer.MotionFeatures(null, 0.0, false)
         }
@@ -231,8 +281,9 @@ class SignalPipeline(
             fingerSig = fingerResult.mainSignal,
             faceRaw = rawFaceSignal,
             fingerRaw = rawFingerSignal,
-            fsHz = targetSampleRateHz,
-            faceMotionPenalty = 100.0
+            fsHz = effectiveSampleRateHz,
+            faceMotionPenalty = 100.0,
+            footDetectionEnabled = footDetectionAllowed
         )
         Log.i(tag, "Pipeline Result: PTT=${pttOutput.pttMs} ms, Conf=${"%.2f".format(pttOutput.confidence)}, Valid=${pttOutput.isValid}")
         
@@ -243,48 +294,55 @@ class SignalPipeline(
                 fingerSig = fingerResult.denoisedSignal,
                 faceRaw = rawFaceSignal,
                 fingerRaw = rawFingerSignal,
-                fsHz = targetSampleRateHz,
-                faceMotionPenalty = 100.0
+                fsHz = effectiveSampleRateHz,
+                faceMotionPenalty = 100.0,
+                footDetectionEnabled = footDetectionAllowed
             )
+            
+            // P3-E DIAGNOSTIC: Compare main vs denoised PTT to detect wavelet foot-shift
+            val mainPtt = pttOutput.pttMs
+            val denoisedPtt = pttDenoised.pttMs
+            if (mainPtt != null && denoisedPtt != null) {
+                val shift = kotlin.math.abs(mainPtt - denoisedPtt)
+                Log.i(tag, "WAVELET_DIAG | mainPttMs=${"%.1f".format(mainPtt)} | denoisedPttMs=${"%.1f".format(denoisedPtt)} | " +
+                      "shiftMs=${"%.1f".format(shift)} | ${if (shift > 10.0) "⚠ SIGNIFICANT SHIFT > 10ms" else "OK"}")
+            } else {
+                Log.i(tag, "WAVELET_DIAG | mainPtt=${mainPtt?.let { "%.1f".format(it) } ?: "null"} | " +
+                      "denoisedPtt=${denoisedPtt?.let { "%.1f".format(it) } ?: "null"} | cannot compare")
+            }
         }
         
         var effectivePtt: PttOutput? = pttOutput
         var effectivePttDenoised: PttOutput? = pttDenoised
         var msg = "Processed ${timeMillis.size} samples"
 
-        // Timing Quality Gating (hierarchical: offset → FPS → jitter → drops)
+        // Timing Quality Gating (P2-C: collect ALL failing gates as bitmask)
         val minRate = minOf(driftResult.stream1Rate, driftResult.stream2Rate)
-        if (!driftResult.offsetValid) {
+        val failedGates = mutableListOf<String>()
+        
+        if (motionGate != null) failedGates += motionGate
+        if (!driftResult.offsetValid) failedGates += "INVALID_OFFSET"
+        if (minRate < 25.0) failedGates += "LOW_FPS"
+        if (driftResult.stream1JitterMs > 5.0 || driftResult.stream2JitterMs > 5.0) failedGates += "HIGH_JITTER"
+        if (driftResult.stream1DropRate > 0.1 || driftResult.stream2DropRate > 0.1) failedGates += "HIGH_DROPS"
+        // P1-B: Clock-domain hard gate — if rate ratio deviates > 100ppm, clocks aren't shared
+        val clockDrift = kotlin.math.abs(driftResult.rateRatio - 1.0)
+        if (clockDrift > 0.0001) {
+            failedGates += "CLOCK_DRIFT"
+            Log.w(tag, "CLOCK_DRIFT gate: rateRatio=${"%.8f".format(driftResult.rateRatio)} " +
+                  "(${"%+.1f".format(clockDrift * 1_000_000)}ppm) — non-shared clock domain suspected")
+        }
+        
+        if (failedGates.isNotEmpty()) {
             effectivePtt = null
             effectivePttDenoised = null
-            msg += " (Invalid Offset: PTT Gated)"
-            Log.w(tag, "Invalid timestamp offset (streams not synchronized). Gating PTT result.")
-        } else if (minRate < 25.0) {
-            effectivePtt = null // Strictly block PTT
-            effectivePttDenoised = null
-            
-            msg += " (Low FPS < 25Hz: PTT Gated)"
-            Log.w(tag, "Low FPS (${"%.1f".format(minRate)}Hz) detected. Gating PTT result.")
-        } else if (driftResult.stream1JitterMs > 5.0 || driftResult.stream2JitterMs > 5.0) {
-            effectivePtt = null
-            effectivePttDenoised = null
-            msg += " (High Jitter > 5ms: PTT Gated)"
-            Log.w(tag, "High Jitter (${"%.1f".format(driftResult.stream1JitterMs)}/${"%.1f".format(driftResult.stream2JitterMs)} ms) detected. Gating PTT result.")
-        } else if (driftResult.stream1DropRate > 0.1 || driftResult.stream2DropRate > 0.1) {
-             effectivePtt = null
-             effectivePttDenoised = null
-             msg += " (High Drop Rate > 10%: PTT Gated)"
-             Log.w(tag, "High Drop Rate (${"%.1f".format(driftResult.stream1DropRate*100)}%/${"%.1f".format(driftResult.stream2DropRate*100)}%) detected. Gating PTT result.")
+            val primary = failedGates.first()
+            msg += " ($primary: PTT Gated)"
+            Log.w(tag, "PTT gated: primary=$primary, all=${failedGates.joinToString("|")}")
         }
 
         // Per-session debug summary — one structured line for device-run analysis
-        val gateReason = when {
-            !driftResult.offsetValid -> "INVALID_OFFSET"
-            minRate < 25.0 -> "LOW_FPS"
-            driftResult.stream1JitterMs > 5.0 || driftResult.stream2JitterMs > 5.0 -> "HIGH_JITTER"
-            driftResult.stream1DropRate > 0.1 || driftResult.stream2DropRate > 0.1 -> "HIGH_DROPS"
-            else -> "NONE"
-        }
+        val gateReason = if (failedGates.isEmpty()) "NONE" else failedGates.joinToString("|")
         Log.i(tag, "SESSION_SUMMARY | " +
             "fps=${"%.1f".format(driftResult.stream1Rate)}/${"%.1f".format(driftResult.stream2Rate)} | " +
             "jitter=${"%.1f".format(driftResult.stream1JitterMs)}/${"%.1f".format(driftResult.stream2JitterMs)}ms | " +
@@ -302,7 +360,7 @@ class SignalPipeline(
             fingerSignalDenoised = fingerResult.denoisedSignal,
             rawFaceSignal = rawFaceSignal,
             rawFingerSignal = rawFingerSignal,
-            sampleRateHz = targetSampleRateHz,
+            sampleRateHz = effectiveSampleRateHz,
             isValid = true,
             pttOutput = effectivePtt,
             pttOutputDenoised = effectivePttDenoised,

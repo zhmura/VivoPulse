@@ -41,10 +41,19 @@ object PeakDetect {
             )
         }
         
-        // Compute adaptive threshold
+        // Compute adaptive threshold (current method)
         val mean = signal.average()
         val std = sqrt(signal.map { (it - mean).pow(2) }.average())
         val threshold = mean + thresholdFactor * std
+        
+        // P3-C DIAGNOSTIC: Compute MAD-based threshold for comparison
+        val sorted = signal.sorted()
+        val median = sorted[sorted.size / 2]
+        val mad = sorted.map { kotlin.math.abs(it - median) }.sorted()[sorted.size / 2]
+        val madThreshold = median + 2.0 * 1.4826 * mad  // 1.4826 = MAD→std conversion factor
+        android.util.Log.i("PeakDetect", "PEAK_DIAG | mean+0.3*std=${"%.4f".format(threshold)} | " +
+              "MAD-based=${"%.4f".format(madThreshold)} | delta=${"%.4f".format(madThreshold - threshold)} | " +
+              "mean=${"%.4f".format(mean)} std=${"%.4f".format(std)} median=${"%.4f".format(median)} mad=${"%.4f".format(mad)}")
         
         // Minimum distance between peaks (samples)
         val minDistanceSamples = (MIN_RR_MS / 1000.0 * fsHz).toInt()
@@ -52,7 +61,7 @@ object PeakDetect {
         val peaks = mutableListOf<Int>()
         var lastPeakIndex = -minDistanceSamples
         
-        // Find local maxima above threshold
+        // Find local maxima above threshold (current method)
         for (i in 1 until signal.size - 1) {
             if (signal[i] > signal[i - 1] &&
                 signal[i] > signal[i + 1] &&
@@ -62,6 +71,34 @@ object PeakDetect {
                 peaks.add(i)
                 lastPeakIndex = i
             }
+        }
+        
+        // P3-C DIAGNOSTIC: Count how many peaks MAD threshold would detect
+        val madPeaks = mutableListOf<Int>()
+        var madLastPeak = -minDistanceSamples
+        for (i in 1 until signal.size - 1) {
+            if (signal[i] > signal[i - 1] &&
+                signal[i] > signal[i + 1] &&
+                signal[i] > madThreshold &&
+                (i - madLastPeak) >= minDistanceSamples) {
+                madPeaks.add(i)
+                madLastPeak = i
+            }
+        }
+        
+        // P3-C DIAGNOSTIC: Compute prominence for detected peaks
+        if (peaks.isNotEmpty()) {
+            val prominences = peaks.map { idx ->
+                val leftMin = (maxOf(0, idx - minDistanceSamples) until idx).minOfOrNull { signal[it] } ?: signal[idx]
+                val rightMin = ((idx + 1)..minOf(signal.size - 1, idx + minDistanceSamples)).minOfOrNull { signal[it] } ?: signal[idx]
+                signal[idx] - maxOf(leftMin, rightMin)
+            }
+            val medianProm = prominences.sorted()[prominences.size / 2]
+            val lowPromCount = prominences.count { it < 0.3 * medianProm }
+            android.util.Log.i("PeakDetect", "PEAK_DIAG | currentPeaks=${peaks.size} madPeaks=${madPeaks.size} | " +
+                  "prominences: median=${"%.4f".format(medianProm)} lowPromCount=$lowPromCount (${if (lowPromCount > 0) "would reject $lowPromCount" else "all good"})")
+        } else {
+            android.util.Log.i("PeakDetect", "PEAK_DIAG | currentPeaks=0 madPeaks=${madPeaks.size}")
         }
         
         if (peaks.isEmpty()) {

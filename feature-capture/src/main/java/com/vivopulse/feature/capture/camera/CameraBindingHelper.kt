@@ -45,6 +45,10 @@ internal class CameraBindingHelper(
     private var _lastBindingError: Exception? = null
     val lastBindingError: Exception? get() = _lastBindingError
     
+    /** Whether the bound FPS range supports PTT (≥25Hz). False if we fell back to [15,30]. */
+    private var _pttCapable = true
+    val pttCapable: Boolean get() = _pttCapable
+    
     /**
      * Attempt to bind both cameras with progressive fallback.
      * 
@@ -87,6 +91,11 @@ internal class CameraBindingHelper(
     
     /**
      * Bind both cameras concurrently.
+     * 
+     * FPS strategy with fallback:
+     * 1. Try [25, 30] for PTT-quality frame rate (pttCapable = true)
+     * 2. If binding fails → retry with [15, 30] (pttCapable = false, HR-only mode)
+     * 3. If both fail → return null (escalate to mode fallback)
      */
     private fun bindConcurrent(
         provider: ProcessCameraProvider,
@@ -96,6 +105,59 @@ internal class CameraBindingHelper(
         resolution: Size,
         frontId: String? = null,
         backId: String? = null
+    ): Pair<Camera?, Camera?>? {
+        // Check concurrent support
+        if (provider.availableConcurrentCameraInfos.isEmpty()) {
+            AppLogger.log(tag, "bindConcurrent: No concurrent camera infos found")
+        }
+
+        AppLogger.log(tag, "bindConcurrent: Configuring cameras at $resolution")
+
+        // Strategy: Try PTT-quality range first, fall back to HR-only range
+        val pttRange = android.util.Range(25, 30)
+        val fallbackRange = android.util.Range(15, 30)
+
+        // Attempt 1: PTT-quality FPS [25, 30]
+        val pttResult = attemptConcurrentBinding(
+            provider, lifecycleOwner, frontPreviewView, backPreviewView,
+            resolution, frontId, backId, pttRange
+        )
+        if (pttResult != null) {
+            _pttCapable = true
+            AppLogger.log(tag, "Concurrent binding successful at $resolution with PTT-quality FPS $pttRange")
+            return pttResult
+        }
+
+        // Attempt 2: Fallback to HR-only FPS [15, 30]
+        AppLogger.log(tag, "PTT-quality FPS [$pttRange] binding failed, falling back to HR-only FPS $fallbackRange")
+        provider.unbindAll() // Clean up failed attempt
+        val fallbackResult = attemptConcurrentBinding(
+            provider, lifecycleOwner, frontPreviewView, backPreviewView,
+            resolution, frontId, backId, fallbackRange
+        )
+        if (fallbackResult != null) {
+            _pttCapable = false
+            AppLogger.log(tag, "Concurrent binding successful at $resolution with HR-only FPS $fallbackRange (PTT DISABLED)")
+            return fallbackResult
+        }
+
+        // Both failed
+        AppLogger.error(tag, "CONCURRENT BINDING FAILED at $resolution with both FPS ranges", null)
+        return null
+    }
+
+    /**
+     * Attempt a single concurrent binding with the given FPS range.
+     */
+    private fun attemptConcurrentBinding(
+        provider: ProcessCameraProvider,
+        lifecycleOwner: LifecycleOwner,
+        frontPreviewView: PreviewView,
+        backPreviewView: PreviewView,
+        resolution: Size,
+        frontId: String?,
+        backId: String?,
+        fpsRange: android.util.Range<Int>
     ): Pair<Camera?, Camera?>? {
         val frontSelector = if (frontId != null) {
             createSelectorForId(frontId, CameraSelector.LENS_FACING_FRONT)
@@ -110,30 +172,7 @@ internal class CameraBindingHelper(
         }
 
         return try {
-            // Check concurrent support
-            if (provider.availableConcurrentCameraInfos.isEmpty()) {
-                AppLogger.log(tag, "bindConcurrent: No concurrent camera infos found")
-                // Fallback or error? Let's treat as error for now in this mode
-            }
-
-            AppLogger.log(tag, "bindConcurrent: Configuring cameras at $resolution")
-
-            // Dynamic FPS Range Selection
-            // We need to find the best range for EACH camera, but ideally they match.
-            // Since we can't easily query per-camera capabilities here without a CameraInfo, 
-            // we will stick to a safer default or try to reuse the logic if we could access CameraCharacteristics.
-            // HOWEVER, we are inside bindConcurrent where we don't have easy access to the exact CameraInfo yet 
-            // BEFORE binding. 
-            //
-            // Best approach: Use a safe fixed range like [30, 30] which is universally supported,
-            // OR [60, 60] only if we are sure.
-            // 
-            // Given the issues seen (39fps vs 30fps) and massive frame drops/gaps (2s) when forcing [30, 30],
-            // we must relax the lower bound to allow the AE algorithm to increase exposure time without breaking stream.
-            // [15, 30] ensures we get AT LEAST 15fps (continuous), whereas [30, 30] caused 0fps (gaps).
-            // PPG is valid at >8Hz (Nyquist for 240bpm). 15fps is safe.
-            val targetRange = android.util.Range(15, 30)
-            AppLogger.log(tag, "Forcing FPS Range: $targetRange")
+            AppLogger.log(tag, "Attempting FPS Range: $fpsRange")
 
             // FRONT Config
             val frontPreview = Preview.Builder()
@@ -146,12 +185,10 @@ internal class CameraBindingHelper(
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                 .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
 
-
-            configurator.setTargetFpsRange(frontBuilder, targetRange)
+            configurator.setTargetFpsRange(frontBuilder, fpsRange)
 
             val frontAnalysis = frontBuilder.build().also { analysis ->
                 analysis.setAnalyzer(executor, com.vivopulse.feature.capture.analysis.SafeImageAnalyzer { img -> 
-                    // com.vivopulse.signal.AppLogger.log(tag, "Front Frame: ${img.imageInfo.timestamp}")
                     processFrame(img, Source.FACE) 
                 })
             }
@@ -178,7 +215,7 @@ internal class CameraBindingHelper(
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                 .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
 
-            configurator.setTargetFpsRange(backBuilder, targetRange)
+            configurator.setTargetFpsRange(backBuilder, fpsRange)
 
             val backAnalysis = backBuilder.build().also { analysis ->
                 analysis.setAnalyzer(executor, com.vivopulse.feature.capture.analysis.SafeImageAnalyzer { img -> 
@@ -212,12 +249,11 @@ internal class CameraBindingHelper(
                 AppLogger.log(tag, "bindConcurrent: Back camera bound successfully")
             }
             
-            AppLogger.log(tag, "Concurrent binding successful at $resolution")
             Pair(frontCamera, backCamera)
             
         } catch (e: Exception) {
             _lastBindingError = e
-            AppLogger.error(tag, "CONCURRENT BINDING FAILED at $resolution: ${e.javaClass.simpleName}: ${e.message}", e)
+            AppLogger.error(tag, "Binding attempt with FPS $fpsRange FAILED: ${e.javaClass.simpleName}: ${e.message}", e)
             null
         }
     }

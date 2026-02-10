@@ -8,7 +8,8 @@ data class ConsensusPtt(
     val pttMsMedian: Double,
     val pttMsIqr: Double,
     val methodAgreeMs: Double,
-    val nBeats: Int
+    val nBeats: Int,
+    val delayStabilityScore: Double = 1.0  // R3-B: 1.0 = stable across windows; 0.0 = unstable
 )
 
 class PTTConsensus {
@@ -19,14 +20,42 @@ class PTTConsensus {
         fsHz: Double,
         hrFaceBpm: Double,
         hrFingerBpm: Double,
-        @Suppress("UNUSED_PARAMETER") segment: Window
+        @Suppress("UNUSED_PARAMETER") segment: Window,
+        footDetectionEnabled: Boolean = true
     ): ConsensusPtt {
         // Method A: XCorr lag
-        // We can reuse SyncMetrics logic but we need just the lag
-        // Assuming face and finger are already windowed to 'segment'
-        
         val syncResult = SyncMetrics.computeMetrics(face, finger, hrFaceBpm, hrFingerBpm, fsHz)
         val pttXCorr = syncResult.lagMs
+        
+        // If foot detection is disabled (low sample rate), use GCC-PHAT (R3-A)
+        if (!footDetectionEnabled) {
+            // R3-A: Phase-based delay is more robust than amplitude xcorr at low FPS
+            val gccResult = CrossCorr.gccPhatLag(face, finger, fsHz)
+            
+            // R3-B: Multi-window consistency check
+            val multiResult = CrossCorr.multiWindowLag(face, finger, fsHz)
+            
+            // Use multi-window median if stable enough, otherwise single-window GCC-PHAT
+            val bestPtt = if (multiResult.isValid && multiResult.stabilityScore >= 0.5) {
+                multiResult.medianLagMs
+            } else {
+                gccResult.lagMs
+            }
+            
+            android.util.Log.i("PTTConsensus", "GCC_PHAT | footDetection=off @ ${fsHz}Hz | " +
+                  "gcc=${"%.1f".format(gccResult.lagMs)}ms | " +
+                  "multiWin=${"%.1f".format(multiResult.medianLagMs)}ms (MAD=${"%.1f".format(multiResult.madMs)}ms, " +
+                  "stability=${"%.2f".format(multiResult.stabilityScore)}) | " +
+                  "chosen=${"%.1f".format(bestPtt)}ms")
+            
+            return ConsensusPtt(
+                pttMsMedian = bestPtt,
+                pttMsIqr = multiResult.madMs * 1.4826, // MAD to IQR approximation
+                methodAgreeMs = kotlin.math.abs(gccResult.lagMs - multiResult.medianLagMs),
+                nBeats = 0,
+                delayStabilityScore = multiResult.stabilityScore
+            )
+        }
         
         // Method B: Foot-to-Foot
         // Detect feet (onset)
@@ -47,7 +76,8 @@ class PTTConsensus {
             // Check if the next causal finger foot produces a physiologically valid lag
             if (fingerCursor < fingerFeet.size) {
                 val lag = fingerFeet[fingerCursor] - tFace
-                if (lag in 30.0..500.0) {
+                // P3-B: Narrowed to [30,400]ms — aligned with XCorr ±400ms range
+                if (lag in 30.0..400.0) {
                     beatLags.add(lag)
                     fingerCursor++ // Consume this foot (one-to-one pairing)
                 }

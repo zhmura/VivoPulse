@@ -36,7 +36,8 @@ object PttEngine {
         faceRaw: DoubleArray,
         fingerRaw: DoubleArray,
         fsHz: Double,
-        faceMotionPenalty: Double = 100.0
+        faceMotionPenalty: Double = 100.0,
+        footDetectionEnabled: Boolean = true
     ): PttOutput {
         val tag = "PttEngine"
         
@@ -58,18 +59,13 @@ object PttEngine {
             fsHz = fsHz,
             hrFaceBpm = hrFace.hrBpm,
             hrFingerBpm = hrFinger.hrBpm,
-            segment = com.vivopulse.feature.processing.sync.Window(0, durationMs)
+            segment = com.vivopulse.feature.processing.sync.Window(0, durationMs),
+            footDetectionEnabled = footDetectionEnabled
         )
         
         // Use median PTT from consensus
         val pttMsRaw = consensusResult.pttMsMedian
-        // Agreement score: 1.0 if methods agree (or only XCorr available), 0.5 if they disagree
-        val agreementScore = when {
-            consensusResult.nBeats == 0 -> 1.0     // XCorr-only fallback: no penalty
-            consensusResult.methodAgreeMs <= 50.0 -> 1.0  // Both methods agree
-            else -> 0.5                             // Methods disagree: halve confidence
-        }
-        android.util.Log.d(tag, "Consensus: PTT=${"%.1f".format(pttMsRaw)} ms, Agreement=${"%.1f".format(consensusResult.methodAgreeMs)} ms (Score=$agreementScore, nBeats=${consensusResult.nBeats})")
+        android.util.Log.d(tag, "Consensus: PTT=${"%.1f".format(pttMsRaw)} ms, Agreement=${"%.1f".format(consensusResult.methodAgreeMs)} ms (nBeats=${consensusResult.nBeats}, stability=${"%.2f".format(consensusResult.delayStabilityScore)})")
         
         // 4. Compute per-channel SQI
         val sqiFace = PttSqi.computeChannelSqi(
@@ -89,22 +85,53 @@ object PttEngine {
         )
         android.util.Log.d(tag, "SQI: Face=${sqiFace.sqi} (SNR=${sqiFace.snrScore}), Finger=${sqiFinger.sqi} (SNR=${sqiFinger.snrScore})")
         
-        // 5. Compute combined confidence
+        // P3-A DIAGNOSTIC: Compute band-limited SQI alongside raw SQI for comparison
+        // Band-limited SQI uses filtered signal as both input and reference (no raw noise)
+        val bandSqiFace = PttSqi.computeChannelSqi(
+            filteredSignal = faceSig, rawSignal = faceSig, fsHz = fsHz,
+            peakResult = facePeaks, motionPenalty = faceMotionPenalty
+        )
+        val bandSqiFinger = PttSqi.computeChannelSqi(
+            filteredSignal = fingerSig, rawSignal = fingerSig, fsHz = fsHz,
+            peakResult = fingerPeaks, motionPenalty = 100.0
+        )
+        android.util.Log.i(tag, "SQI_DUAL_DIAG | face: raw=${sqiFace.sqi}(snr=${"%.1f".format(sqiFace.snrDb)}dB) band=${bandSqiFace.sqi}(snr=${"%.1f".format(bandSqiFace.snrDb)}dB) | " +
+              "finger: raw=${sqiFinger.sqi}(snr=${"%.1f".format(sqiFinger.snrDb)}dB) band=${bandSqiFinger.sqi}(snr=${"%.1f".format(bandSqiFinger.snrDb)}dB)")
+        
+        // P3-D DIAGNOSTIC: Log what adaptive bandpass cutoff would be
+        val adaptiveLowFace = if (hrFace.hrBpm > 0) maxOf(0.5, (hrFace.hrBpm / 60.0) * 0.5) else 0.7
+        val adaptiveLowFinger = if (hrFinger.hrBpm > 0) maxOf(0.5, (hrFinger.hrBpm / 60.0) * 0.5) else 0.7
+        android.util.Log.i(tag, "BANDPASS_DIAG | hrFace=${"%.0f".format(hrFace.hrBpm)}bpm → adaptiveLow=${"%.2f".format(adaptiveLowFace)}Hz | " +
+              "hrFinger=${"%.0f".format(hrFinger.hrBpm)}bpm → adaptiveLow=${"%.2f".format(adaptiveLowFinger)}Hz | currentLow=0.7Hz")
+        
+        // 5. Compute combined confidence (R3-B + R3-C integrated)
         // Re-calculate SyncMetrics for confidence inputs
         val syncMetrics = com.vivopulse.feature.processing.sync.SyncMetrics.computeMetrics(
             faceSig, fingerSig, hrFace.hrBpm, hrFinger.hrBpm, fsHz
         )
         
-        val finalConfidence = PttSqi.computeCombinedConfidence(
-            sqiFace = sqiFace.sqi,
-            sqiFinger = sqiFinger.sqi,
-            corrScore = syncMetrics.correlation,
-            peakSharpness = 0.5 // Simplified sharpness
-        ) * agreementScore
+        // R3-C: Photometric SQI (exposure steps + clipping detection)
+        val photoSqiFace = PttSqi.computePhotometricSqi(faceRaw)
+        val photoSqiFinger = PttSqi.computePhotometricSqi(fingerRaw)
+        android.util.Log.i(tag, "PHOTO_SQI | face: score=${photoSqiFace.score} steps=${photoSqiFace.stepCount} clip=${"%.1f".format(photoSqiFace.clipPercent)}% | " +
+              "finger: score=${photoSqiFinger.score} steps=${photoSqiFinger.stepCount} clip=${"%.1f".format(photoSqiFinger.clipPercent)}%")
         
-
-
-        android.util.Log.d(tag, "Confidence: ${"%.2f".format(finalConfidence)} (Corr=${"%.2f".format(syncMetrics.correlation)})")
+        // Blend photometric SQI into channel SQI (weighted average: 80% band SQI + 20% photometric)
+        val blendedSqiFace = ((sqiFace.sqi * 0.8 + photoSqiFace.score * 0.2).toInt()).coerceIn(0, 100)
+        val blendedSqiFinger = ((sqiFinger.sqi * 0.8 + photoSqiFinger.score * 0.2).toInt()).coerceIn(0, 100)
+        
+        val finalConfidence = PttSqi.computeCombinedConfidence(
+            sqiFace = blendedSqiFace,
+            sqiFinger = blendedSqiFinger,
+            corrScore = syncMetrics.correlation,
+            peakSharpness = 0.5, // Simplified sharpness
+            delayStabilityScore = consensusResult.delayStabilityScore,
+            methodAgreeMs = consensusResult.methodAgreeMs
+        )
+        
+        android.util.Log.d(tag, "Confidence: ${"%.2f".format(finalConfidence)} (Corr=${"%.2f".format(syncMetrics.correlation)}, " +
+              "Stability=${"%.2f".format(consensusResult.delayStabilityScore)}, " +
+              "SQI=face:$blendedSqiFace/finger:$blendedSqiFinger)")
         
         // 6. Determine if PTT should be reported
         val shouldReport = PttSqi.shouldReportPtt(finalConfidence)
@@ -127,9 +154,9 @@ object PttEngine {
             confidence = finalConfidence,
             hrFaceBpm = hrFace.hrBpm,
             hrFingerBpm = hrFinger.hrBpm,
-            sqiFace = sqiFace.sqi,
-            sqiFinger = sqiFinger.sqi,
-            peakSharpness = 0.5, // Simplified sharpness
+            sqiFace = blendedSqiFace,
+            sqiFinger = blendedSqiFinger,
+            peakSharpness = 0.5,
             facePeakCount = facePeaks.getPeakCount(),
             fingerPeakCount = fingerPeaks.getPeakCount(),
             nBeats = consensusResult.nBeats,

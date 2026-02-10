@@ -113,13 +113,62 @@ object PttSqi {
     }
     
     /**
-     * Compute combined PTT confidence.
+     * Compute photometric SQI (R3-C).
+     * 
+     * Detects exposure steps and signal clipping that corrupt PPG quality.
+     * 
+     * @param rawSignal Raw (unfiltered) signal
+     * @return PhotometricSqiResult with score, step count, clip percentage
+     */
+    fun computePhotometricSqi(rawSignal: DoubleArray): PhotometricSqiResult {
+        if (rawSignal.size < 10) {
+            return PhotometricSqiResult(score = 0, stepCount = 0, clipPercent = 0.0)
+        }
+        
+        // 1. Detect exposure steps: |Δsignal[i]| > 3×MAD(Δsignal)
+        val diffs = DoubleArray(rawSignal.size - 1) { i -> rawSignal[i + 1] - rawSignal[i] }
+        val absDiffs = diffs.map { kotlin.math.abs(it) }
+        val sortedAbsDiffs = absDiffs.sorted()
+        val medianDiff = if (sortedAbsDiffs.size % 2 == 0) {
+            (sortedAbsDiffs[sortedAbsDiffs.size / 2 - 1] + sortedAbsDiffs[sortedAbsDiffs.size / 2]) / 2.0
+        } else {
+            sortedAbsDiffs[sortedAbsDiffs.size / 2]
+        }
+        val madDiff = sortedAbsDiffs.map { kotlin.math.abs(it - medianDiff) }.sorted().let { sorted ->
+            if (sorted.size % 2 == 0) (sorted[sorted.size / 2 - 1] + sorted[sorted.size / 2]) / 2.0
+            else sorted[sorted.size / 2]
+        }
+        
+        val stepThreshold = medianDiff + 3.0 * madDiff
+        val stepCount = absDiffs.count { it > stepThreshold && stepThreshold > 1e-10 }
+        
+        // 2. Detect clipping: samples within 1% of min/max range
+        val minVal = rawSignal.minOrNull() ?: 0.0
+        val maxVal = rawSignal.maxOrNull() ?: 1.0
+        val range = maxVal - minVal
+        if (range < 1e-10) {
+            return PhotometricSqiResult(score = 0, stepCount = rawSignal.size, clipPercent = 100.0)
+        }
+        val clipMargin = range * 0.01
+        val clipCount = rawSignal.count { it <= minVal + clipMargin || it >= maxVal - clipMargin }
+        val clipPercent = (clipCount.toDouble() / rawSignal.size) * 100.0
+        
+        // Score: start at 100, penalize steps and clipping
+        val score = (100.0 - 20.0 * stepCount - 10.0 * clipPercent / 100.0 * 10.0)
+            .coerceIn(0.0, 100.0).toInt()
+        
+        return PhotometricSqiResult(score = score, stepCount = stepCount, clipPercent = clipPercent)
+    }
+
+    /**
+     * Compute combined PTT confidence (updated for R3-B + R3-C).
      * 
      * Formula:
-     * confidence = (min(SQI_face, SQI_finger) / 100) * corrScore * sharpnessNorm
-     * 
-     * Where:
-     * - sharpnessNorm = min(1.0, peakSharpness / 0.2)  (0.2 sharpness = full confidence)
+     * confidence = (min(SQI_face, SQI_finger) / 100)
+     *            × corrScore
+     *            × sharpnessNorm
+     *            × delayStability      ← R3-B: multi-window lag consistency
+     *            × agreementNorm        ← method agreement (xcorr vs foot-to-foot)
      * 
      * Threshold: confidence ≥ 0.60 to report PTT
      * 
@@ -127,13 +176,17 @@ object PttSqi {
      * @param sqiFinger Finger channel SQI (0-100)
      * @param corrScore Cross-correlation score (0-1)
      * @param peakSharpness Peak sharpness from cross-correlation
+     * @param delayStabilityScore R3-B: multi-window delay stability (0-1, default 1.0)
+     * @param methodAgreeMs Agreement between xcorr and foot-to-foot (ms)
      * @return Combined confidence (0-1)
      */
     fun computeCombinedConfidence(
         sqiFace: Int,
         sqiFinger: Int,
         corrScore: Double,
-        peakSharpness: Double
+        peakSharpness: Double,
+        delayStabilityScore: Double = 1.0,
+        methodAgreeMs: Double = 0.0
     ): Double {
         // Weakest link for SQI
         val minSqi = minOf(sqiFace, sqiFinger)
@@ -141,8 +194,19 @@ object PttSqi {
         // Normalize sharpness (0.2 = full confidence)
         val sharpnessNorm = minOf(1.0, peakSharpness / 0.2)
         
+        // R3-B: delay stability factor
+        val stabilityFactor = delayStabilityScore.coerceIn(0.0, 1.0)
+        
+        // Method agreement factor: 0ms = perfect (1.0), 50ms = 0.375, 80ms+ = 0.0
+        // MAX_VALUE = unknown (foot-to-foot failed) → penalize to 0.7
+        val agreementFactor = when {
+            methodAgreeMs == Double.MAX_VALUE -> 0.7 // Unknown agreement
+            methodAgreeMs <= 0.0 -> 1.0              // Perfect or default agreement
+            else -> (1.0 - (methodAgreeMs / 80.0)).coerceIn(0.0, 1.0)
+        }
+        
         // Combined confidence
-        val confidence = (minSqi / 100.0) * corrScore * sharpnessNorm
+        val confidence = (minSqi / 100.0) * corrScore * sharpnessNorm * stabilityFactor * agreementFactor
         
         return confidence.coerceIn(0.0, 1.0)
     }
@@ -170,3 +234,11 @@ data class ChannelSqiResult(
     val peakCount: Int              // Number of detected peaks
 )
 
+/**
+ * Photometric SQI result (R3-C).
+ */
+data class PhotometricSqiResult(
+    val score: Int,                 // Photometric SQI 0-100
+    val stepCount: Int,             // Number of detected exposure steps
+    val clipPercent: Double         // Percentage of clipped samples
+)

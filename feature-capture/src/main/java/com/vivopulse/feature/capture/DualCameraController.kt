@@ -181,6 +181,10 @@ class DualCameraController(
     private val _sequentialPrimary = MutableStateFlow(SequentialPrimary.FINGER)
     val sequentialPrimary: StateFlow<SequentialPrimary> = _sequentialPrimary.asStateFlow()
     
+    /** Whether camera FPS supports PTT (≥25Hz). False if fell back to [15,30] HR-only mode. */
+    private val _pttCapable = MutableStateFlow(true)
+    val pttCapable: StateFlow<Boolean> = _pttCapable.asStateFlow()
+    
     private var retryCount = 0
     private val maxRetries = 3
     private var currentResolutionIndex = 0
@@ -216,6 +220,61 @@ class DualCameraController(
     
     private var frontExposureLocked = false
     private var backExposureLocked = false
+    private var frontExposureSettled = true  // true = AE converged; false = timeout-forced
+    private var backExposureSettled = true
+
+    // P0-A: Stability-based AE lock — replace fixed 30-frame threshold
+    // Rolling luma windows per camera, lock when settled
+    private val frontLumaSamples = ArrayDeque<Double>()
+    private val backLumaSamples = ArrayDeque<Double>()
+    private companion object {
+        const val AE_STABILITY_WINDOW = 15       // ~500ms rolling window @ 30fps
+        const val AE_MIN_SAMPLES = 10            // ~330ms minimum before evaluating
+        const val AE_LUMA_CHANGE_EPSILON = 1.5   // Max mean shift between halves (~0.6% of 0-255)
+        const val AE_LUMA_VARIANCE_DELTA = 5.0   // Max variance within window
+        const val AE_MAX_WAIT_FRAMES = 90        // 3s hard timeout @ 30fps
+    }
+
+    /**
+     * Result of AE lock evaluation.
+     */
+    enum class AeLockResult { NOT_READY, SETTLED, TIMEOUT }
+
+    /**
+     * Evaluate whether AE has converged based on luma stability.
+     * Returns SETTLED when the rolling luma window shows settled mean + low variance,
+     * TIMEOUT when the hard timeout (3s) is reached, or NOT_READY otherwise.
+     */
+    private fun shouldLockExposure(luma: Double?, tracker: FpsTracker, samples: ArrayDeque<Double>): AeLockResult {
+        luma ?: return AeLockResult.NOT_READY
+        samples.addLast(luma)
+        if (samples.size > AE_STABILITY_WINDOW) samples.removeFirst()
+
+        // Hard timeout fallback (same as old 30-frame but extended to 3s)
+        if (tracker.totalFrames > AE_MAX_WAIT_FRAMES) {
+            Log.w(tag, "AE lock: TIMEOUT at ${tracker.totalFrames} frames — exposure may not have converged")
+            return AeLockResult.TIMEOUT
+        }
+
+        // Need enough samples for meaningful stability check
+        if (samples.size < AE_MIN_SAMPLES) return AeLockResult.NOT_READY
+
+        // Check stability: compare mean of first half vs second half
+        val half = samples.size / 2
+        val firstHalf = samples.take(half).average()
+        val secondHalf = samples.drop(half).average()
+        val meanChange = kotlin.math.abs(firstHalf - secondHalf)
+
+        // Check variance within window
+        val mean = samples.average()
+        val variance = samples.map { (it - mean) * (it - mean) }.average()
+
+        val settled = meanChange < AE_LUMA_CHANGE_EPSILON && variance < AE_LUMA_VARIANCE_DELTA
+        if (settled) {
+            Log.d(tag, "AE lock: luma settled (change=%.2f, var=%.2f) at frame ${tracker.totalFrames}".format(meanChange, variance))
+        }
+        return if (settled) AeLockResult.SETTLED else AeLockResult.NOT_READY
+    }
 
     @androidx.annotation.OptIn(androidx.camera.camera2.interop.ExperimentalCamera2Interop::class)
     private fun lockExposure(source: Source) {
@@ -364,6 +423,10 @@ class DualCameraController(
         circuitBreakerTripped = false
         frontExposureLocked = false
         backExposureLocked = false
+        frontExposureSettled = true
+        backExposureSettled = true
+        frontLumaSamples.clear()
+        backLumaSamples.clear()
         
         try {
             when (_cameraMode.value) {
@@ -423,11 +486,17 @@ class DualCameraController(
             frontCamera = result.first
             backCamera = result.second
             
+            // Propagate PTT capability from binding helper
+            _pttCapable.value = bindingHelper.pttCapable
+            if (!bindingHelper.pttCapable) {
+                Log.w(tag, "Camera bound in HR-only mode (PTT disabled due to FPS < 25Hz)")
+            }
+            
             if (torchEnabled && backCamera != null) {
                 backCamera?.cameraControl?.enableTorch(true)
             }
             
-            Log.d(tag, "Cameras started successfully in mode ${_cameraMode.value}")
+            Log.d(tag, "Cameras started successfully in mode ${_cameraMode.value}, pttCapable=${_pttCapable.value}")
         } else {
             // Use the actual binding error if available and store it at class level
             val actualError = bindingHelper.lastBindingError
@@ -573,6 +642,12 @@ class DualCameraController(
             val tracker = if (source == Source.FACE) frontFpsTracker else backFpsTracker
             tracker.onFrameReceived(image.timestamp)
 
+            // P1-B DIAGNOSTIC: Log Image.timestamp per source for clock domain analysis
+            // On-device: compare this with CaptureResult.SENSOR_TIMESTAMP when Camera2 capture callback is added
+            if (tracker.totalFrames <= 60 || tracker.totalFrames % 300 == 0) {
+                Log.d(tag, "CLOCK_DIAG | src=${source.name} | frame=${tracker.totalFrames} | imageTs=${image.timestamp} | elapsedNs=${if (tracker.totalFrames > 1) image.timestamp - (if (source == Source.FACE) _frontTimestamps.replayCache.lastOrNull() ?: image.timestamp else _backTimestamps.replayCache.lastOrNull() ?: image.timestamp) else 0}")
+            }
+
             if (source == Source.FACE) {
                 _frontTimestamps.tryEmit(image.timestamp)
             } else {
@@ -610,8 +685,12 @@ class DualCameraController(
                         )
                     }
                     
-                    faceRgb = RgbExtractor.extractAverageRgb(imageProxy, roiToUse)
-                    faceLuma = faceRgb?.g
+                    // P0-B: Use green-proxy instead of full RGB for face rPPG signal
+                    faceLuma = RgbExtractor.extractAverageGreenProxy(imageProxy, roiToUse)
+                    // Full RGB only for recording/debug (not every frame)
+                    if (isRecording || frontFpsTracker.totalFrames % 30 == 0) {
+                        faceRgb = RgbExtractor.extractAverageRgb(imageProxy, roiToUse)
+                    }
                     
                     if (currentRoi != null && !currentRoi.isEmpty) {
                         val motionBuffer = yPlane.buffer.duplicate().apply { position(0) }
@@ -640,8 +719,12 @@ class DualCameraController(
                         fingerRoiRect!!
                     }
 
-                    fingerRgb = RgbExtractor.extractAverageRgb(imageProxy, roi)
-                    fingerLuma = fingerRgb?.g
+                    // P0-B: Use luma-only for finger PPG (red dominates with torch)
+                    fingerLuma = RgbExtractor.extractAverageLuma(imageProxy, roi)
+                    // Full RGB only for recording/debug (not every frame)
+                    if (isRecording || backFpsTracker.totalFrames % 30 == 0) {
+                        fingerRgb = RgbExtractor.extractAverageRgb(imageProxy, roi)
+                    }
 
 
                     val satBuffer = yPlane.buffer.duplicate().apply { position(0) }
@@ -672,13 +755,27 @@ class DualCameraController(
                 faceRoiRect = if (source == Source.FACE) faceRoi.value?.rect else null
             )
             
-            // Check for AE Lock (delayed)
-            if (source == Source.FACE && !frontExposureLocked && frontFpsTracker.totalFrames > 30) {
-                lockExposure(Source.FACE)
-                frontExposureLocked = true
-            } else if (source == Source.FINGER && !backExposureLocked && backFpsTracker.totalFrames > 30) {
-                lockExposure(Source.FINGER)
-                backExposureLocked = true
+            // Check for AE Lock (stability-based, P0-A)
+            if (source == Source.FACE && !frontExposureLocked) {
+                val result = shouldLockExposure(faceLuma, frontFpsTracker, frontLumaSamples)
+                if (result != AeLockResult.NOT_READY) {
+                    lockExposure(Source.FACE)
+                    frontExposureLocked = true
+                    frontExposureSettled = (result == AeLockResult.SETTLED)
+                    if (!frontExposureSettled) {
+                        Log.w(tag, "AE_TIMEOUT_DIAG | Face exposure locked via TIMEOUT — SNR may be degraded")
+                    }
+                }
+            } else if (source == Source.FINGER && !backExposureLocked) {
+                val result = shouldLockExposure(fingerLuma, backFpsTracker, backLumaSamples)
+                if (result != AeLockResult.NOT_READY) {
+                    lockExposure(Source.FINGER)
+                    backExposureLocked = true
+                    backExposureSettled = (result == AeLockResult.SETTLED)
+                    if (!backExposureSettled) {
+                        Log.w(tag, "AE_TIMEOUT_DIAG | Finger exposure locked via TIMEOUT — SNR may be degraded")
+                    }
+                }
             }
 
             val flowEmitted = if (source == Source.FACE) {

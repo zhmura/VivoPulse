@@ -1,52 +1,191 @@
-# Dual-Camera PPG → PTT: Complete Algorithm Description
+# VivoPulse PTT Pipeline — Complete Algorithmic Reference
 
-> **Scope**: End-to-end pipeline from frame capture to PTT output.
-> **Source of truth**: All numbers, thresholds, and formulas are read directly from the source code (Feb 2026).
+> **Scope**: End-to-end pipeline from hardware camera configuration to final PTT output.
+> **Source of truth**: All numbers, thresholds, and formulas read directly from source code (Feb 2026).
+> **Audience**: Developers, reviewers, and testers who need to understand _why_ PTT works (or doesn't).
+> **Companion doc**: [design_audit.md](file:///home/ext.siarhei.zhmura/Work/pulse/docs/design_audit.md) — risk register with 11 identified risks and mitigations.
 
 ---
 
-## Pipeline Overview
+## Architecture Overview
 
 ```mermaid
 flowchart TD
-    A["1. Frame Capture\n(DualCameraController)"] --> B["2. Motion Rejection\n(ImuMotionAnalyzer)"]
-    B --> C["3. Timestamp Synchronization\n(TimestampSync)"]
-    C --> D["4. Resampling to 100Hz\n(resampleToUnifiedTimeline)"]
-    D --> E["5. Signal Conditioning\n(processChannel)"]
-    E --> F["6. PTT Estimation\n(PttEngine → Consensus)"]
-    F --> G["7. Quality Gating\n(Strict Multi-Condition)"]
-    G --> H["8. Output & Logging\n(ProcessedSeries)"]
+    subgraph CAPTURE ["Stage 0–1: Camera & Capture"]
+        A0["0. Camera Configuration\n(CameraBindingHelper)"]
+        A1["1. Frame Capture\n(DualCameraController)"]
+        A0 --> A1
+    end
+    subgraph PREPROCESSING ["Stage 2–4: Preprocessing"]
+        B["2. Motion Rejection\n(ImuMotionAnalyzer)"]
+        C["3. Timestamp Sync\n(TimestampSync)"]
+        D["4. Resampling to 100Hz"]
+    end
+    subgraph DSP ["Stage 5: Signal Conditioning"]
+        E1["5a. DC Removal + Detrend"]
+        E2["5b. Zero-Phase Bandpass"]
+        E3["5c. Wavelet Denoising"]
+        E4["5d. Z-Score Normalization"]
+    end
+    subgraph PTT ["Stage 6: PTT Estimation"]
+        F1["6a. Peak Detection"]
+        F2["6b. Heart Rate"]
+        F3["6c. Consensus Engine\n(XCorr + Foot-to-Foot)"]
+    end
+    subgraph GATING ["Stage 7–8: Quality & Output"]
+        G["7. Quality Gating\n(Timing + SQI)"]
+        H["8. Output & Logging"]
+    end
 
-    style A fill:#2d3748,color:#e2e8f0
+    A1 --> B --> C --> D
+    D --> E1 --> E2 --> E3 --> E4
+    E4 --> F1 --> F2 --> F3
+    F3 --> G --> H
+
+    style A0 fill:#1a365d,color:#bee3f8
     style G fill:#742a2a,color:#fed7d7
     style H fill:#22543d,color:#c6f6d5
 ```
 
 ---
 
-## Stage 1 — Frame Capture
+## Stage 0 — Camera Hardware Configuration
+
+**Source**: [CameraBindingHelper.kt](file:///home/ext.siarhei.zhmura/Work/pulse/feature-capture/src/main/java/com/vivopulse/feature/capture/camera/CameraBindingHelper.kt)
+
+### Concurrent Dual-Camera Binding
+
+PTT requires **simultaneous** capture from two cameras:
+- **Front camera** (Camera ID 1): Face rPPG — captures subtle blood volume changes in facial skin
+- **Back camera** (Camera ID 0): Finger PPG — captures pulse wave from fingertip pressed against lens with torch
+
+Binding uses CameraX `ConcurrentCamera` API:
+
+```kotlin
+val concurrentCamera = provider.bindToLifecycle(
+    listOf(frontConfig, backConfig)
+)
+```
+
+### FPS Range Strategy (with Fallback)
+
+The FPS range directly controls the camera's auto-exposure algorithm. A wider range gives AE more freedom (lower FPS = longer exposure = brighter image), but reduces temporal resolution for PTT.
+
+```
+Strategy:
+1. Try [25, 30] fps  →  pttCapable = true   (PTT quality)
+2. If binding fails  →  unbindAll()
+3. Try [15, 30] fps  →  pttCapable = false   (HR-only mode)
+4. Both fail         →  null (escalate to mode fallback)
+```
+
+| Range | PTT Quality | AE Freedom | Risk |
+|---|---|---|---|
+| `[30, 30]` | Best | None | **Binding failure**: camera can't meet fixed target → 0fps gaps |
+| `[25, 30]` | Good (≥25Hz gate) | Moderate | May fail on constrained devices |
+| `[15, 30]` | **Insufficient** | Maximum | Finger settles at ~18fps → `LOW_FPS` gate |
+
+### Progressive Mode Fallback
+
+If concurrent binding fails entirely, the system falls back through 4 modes:
+
+```mermaid
+flowchart LR
+    A["CONCURRENT\n720p"] -->|fail| B["REDUCED\n640×480"]
+    B -->|fail| C["ANALYSIS_ONLY\nNo Preview"]
+    C -->|fail| D["SEQUENTIAL\nSingle Camera"]
+```
+
+Each mode also tries resolution fallbacks: 720×1280 → 640×480 → 480×640.
+
+### Camera2 Interop Configuration
+
+FPS is enforced via Camera2 low-level API:
+```kotlin
+Camera2Interop.Extender(builder)
+    .setCaptureRequestOption(
+        CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
+        fpsRange
+    )
+```
+
+> [!IMPORTANT]
+> **Device Variance**: Pixel 8 in concurrent mode can sustain 30fps at 720p with good lighting. In low light, AE extends shutter time → effective FPS drops. The `[25, 30]` floor prevents dropping below PTT quality threshold while allowing some AE flexibility.
+
+> [!NOTE]
+> **Audit risk [#4] — MITIGATED**: Full YUV→RGB per frame caused self-inflicted FPS jitter. **Fix applied**: face camera now uses `extractAverageGreenProxy()` (single-channel G ≈ Y − 0.344U − 0.714V), finger uses `extractAverageLuma()` (Y-channel only with 2× spatial subsampling). Full RGB extraction reserved for recording frames only. See [RgbExtractor.kt](file:///home/ext.siarhei.zhmura/Work/pulse/feature-capture/src/main/java/com/vivopulse/feature/capture/RgbExtractor.kt).
+
+---
+
+## Stage 1 — Frame Capture & AE Lock
 
 **Source**: [DualCameraController.kt](file:///home/ext.siarhei.zhmura/Work/pulse/feature-capture/src/main/java/com/vivopulse/feature/capture/DualCameraController.kt)
 
-| Property | Face (Camera 1) | Finger (Camera 0) |
+### Per-Frame Data Extraction
+
+For each frame from each camera:
+
+| Property | Face Camera | Finger Camera |
 |---|---|---|
-| Target FPS | Target range 15–30 fps (prefers higher) | Target range 15–30 fps (prefers higher) |
-| Acceptable range | 15–30 fps | 15–30 fps |
-| Image format | YUV_420_888 | YUV_420_888 |
-| Timestamp source | `Image.getTimestamp()` | `Image.getTimestamp()` |
+| Signal source | Green-proxy from face ROI | Luma (Y-channel) from full frame |
+| ROI tracking | ML Kit Face Detection → `FaceRoiTracker` | Full frame (finger covers lens) |
+| Torch | Off | On (rear LED illuminates fingertip) |
+| Format | YUV_420_888 → `extractAverageGreenProxy()` | YUV_420_888 → `extractAverageLuma()` |
+| Full RGB | Recording frames only (~1 per 30) | Recording frames only (~1 per 30) |
 
-**Timestamp clock domain**: `Image.getTimestamp()` is a monotonic capture timestamp provided by the camera stack (Camera2 sensor timestamp when available). It is in the same monotonic time domain across concurrent cameras on supported devices. Verified on our supported devices by comparing against `CaptureResult.SENSOR_TIMESTAMP`.
+Each frame produces a `Frame` object:
+```kotlin
+Frame(
+    timestampNs = image.timestamp,  // SENSOR_TIMESTAMP (monotonic)
+    value = luma,                    // Average brightness
+    r = avgR, g = avgG, b = avgB    // Average RGB
+)
+```
 
-**What is captured per frame**:
-- Average RGB from ROI → `Frame(timestampNs, value=luma, r, g, b)`
-- Face: ROI tracked via `FaceRoiTracker` (ML Kit face detection)
-- Finger: Full-frame ROI (finger covers entire lens)
+### Auto-Exposure & White Balance Lock (Stability-Based)
 
-> [!IMPORTANT]
-> **Corner case — No face detected**: If face ROI tracking fails, no face frames are emitted. The pipeline will receive an empty `faceData` list and return an invalid `ProcessedSeries`.
+rPPG captures minute luma changes (~0.5–2.0 units on a 0–255 scale). Without AE lock, the camera's auto-exposure adjustments create "staircase" artifacts that are orders of magnitude larger than the pulse signal.
+
+**Lock Strategy** (per camera, independently):
+
+```
+Rolling window: 15 samples of average luma per camera
+
+Lock when BOTH conditions met:
+  1. Mean shift < 1.5 units (luma settled)
+  2. Variance < 5.0 (no oscillation)
+
+Hard timeout: 90 frames (~3s) — locks regardless as fallback
+```
+
+```kotlin
+// Stability-based AE lock (replaces fixed 30-frame threshold)
+// Returns SETTLED, TIMEOUT, or NOT_READY
+private fun shouldLockExposure(samples: ArrayDeque<Float>): AeLockResult {
+    if (samples.size < 10) return NOT_READY
+    val window = samples.toFloatArray()
+    val mean = window.average()
+    val variance = window.map { (it - mean) * (it - mean) }.average()
+    val firstHalf = window.take(7).average()
+    val secondHalf = window.takeLast(7).average()
+    val settled = abs(firstHalf - secondHalf) < 1.5 && variance < 5.0
+    return if (settled) SETTLED else NOT_READY
+}
+// Hard timeout: 90 frames → TIMEOUT (locks but marks exposureSettled=false)
+```
+
+> [!NOTE]
+> **Audit risk [#3] — MITIGATED**: Frame-count trigger replaced with luma stability detection. Lock now triggers only when the signal has actually converged, with a 3-second hard timeout as safety net. **Timeout-forced locks are tracked** via `exposureSettled=false` and logged as `AE_TIMEOUT_DIAG`.
+
+### Timestamp Clock Domain
+
+`Image.getTimestamp()` returns `SENSOR_TIMESTAMP` — a monotonic nanosecond clock shared across concurrent cameras on supported devices. This means face and finger timestamps are directly comparable without clock correction.
 
 > [!WARNING]
-> **Risk — Low light**: Auto-exposure extends shutter time, reducing effective FPS to 15–20. Timestamps remain accurate, but temporal resolution degrades. Mitigated by strict gating (Stage 7).
+> On some vendor implementations, `SENSOR_TIMESTAMP` may not be shared between concurrent sessions. Our assumption is verified on Pixel 8 by comparing timestamps against `CaptureResult.SENSOR_TIMESTAMP`.
+
+> [!NOTE]
+> **Audit risk [#1] — DIAGNOSTIC ADDED**: `CLOCK_DIAG` logs `Image.timestamp` per frame for clock domain analysis. On-device: compare with `CaptureResult.SENSOR_TIMESTAMP` when Camera2 capture callback is added. Filter: `adb logcat -s DualCamCtrl | grep CLOCK_DIAG`.
 
 ---
 
@@ -54,18 +193,30 @@ flowchart TD
 
 **Source**: [SignalPipeline.applyMotionRejection](file:///home/ext.siarhei.zhmura/Work/pulse/feature-processing/src/main/java/com/vivopulse/feature/processing/SignalPipeline.kt#L44-L74)
 
-Frames with IMU RMS acceleration > `motionRejectionThresholdG` (default **0.1G**) are removed from both streams.
+High-motion frames corrupt the PPG signal (blood redistribution, ROI shift, motion blur). The IMU accelerometer provides a direct motion metric.
 
-**Algorithm**:
-1. For each IMU sample, check `value ≤ 0.1G` → mark timestamp as valid
-2. For each face/finger frame, keep only if within **50ms tolerance** of a valid IMU timestamp
-3. If ALL frames exceed threshold → keep all (fail-safe to avoid empty buffer)
+**Algorithm (Windowed Motion Scoring)**:
+```
+for each IMU sample:
+    windowedRMS = mean(all IMU RMS within ±250ms of this sample)
+    if windowedRMS ≤ 0.1G → mark as calm
 
-| Corner Case | Behavior | Risk |
+for each camera frame:
+    if timestamp within ±250ms of a calm IMU sample → keep
+    else → reject
+```
+
+**All-motion handling**: If ALL IMU windows exceed threshold → **gate PTT** (`ALL_MOTION`), pass buffer for HR-only fallback.
+
+| Scenario | Behavior | Downstream Impact |
 |---|---|---|
-| All frames high-motion | All frames kept (no rejection) | Noisy signal → low SQI → PTT rejected at Stage 7 |
-| IMU data missing/empty | No rejection applied | Motion artifacts propagate to filtering |
-| High rejection rate (>50%) | Remaining frames too sparse | Effective throughput drops → may trigger FPS gating |
+| Normal sitting | 0% rejection | Clean signal |
+| Walking/gesturing | 10–40% rejection | Frames in calm windows kept |
+| Brief pauses in motion | Pauses < 500ms rejected | Prevents keeping frames adjacent to motion bursts |
+| All high-motion | `ALL_MOTION` gate | PTT=null; HR-only if sufficient finger data |
+
+> [!NOTE]
+> **Audit risk [#5] — MITIGATED**: The harmful 50ms proximity gate has been replaced with ±250ms windowed motion scoring. A frame is only kept if the mean RMS across the entire surrounding 500ms window stays below threshold, preventing misclassification during brief calm moments between motion bursts.
 
 ---
 
@@ -73,89 +224,104 @@ Frames with IMU RMS acceleration > `motionRejectionThresholdG` (default **0.1G**
 
 **Source**: [TimestampSync.analyzeSynchronization](file:///home/ext.siarhei.zhmura/Work/pulse/feature-processing/src/main/java/com/vivopulse/feature/processing/timestamp/TimestampSync.kt#L95-L183)
 
-This stage computes sync quality metrics but **does not modify timestamps**. No clock drift compensation or timestamp scaling is applied.
+This stage computes sync quality metrics and estimates inter-stream clock rate ratio for drift compensation.
+
+> [!NOTE]
+> **Audit risk [#6] — MITIGATED**: Linear regression now fits `t2 ≈ a×t1 + b` through paired timestamps to estimate rate ratio. The `rateRatio` field is stored in `DriftResult` for downstream use. Drift >100ppm is logged.
 
 ### Metrics Computed
 
-| Metric | Definition | Threshold |
+| Metric | Formula | Gate Threshold |
 |---|---|---|
-| **Offset** (ms) | Median difference of first N monotonically paired timestamps | Informational |
-| **Rate** (Hz) | `(N-1) / duration_ms × 1000` (Effective Throughput) | <25 Hz triggers gate |
-| **Median Cadence** (Hz) | `1000 / median_dt` (used implicitly by jitter/drop and adaptive tolerance) | Informational |
-| **Jitter** (ms) | MAD of inter-frame intervals from median interval | >5 ms triggers gate |
-| **Drop Rate** (fraction) | `count(dt > 1.5 × median_dt) / total_intervals` | >10% triggers gate |
+| **Effective FPS** | `(N-1) / duration_s` | <25 Hz → `LOW_FPS` |
+| **Jitter** | `MAD(inter_frame_dt)` from median | >5 ms → `HIGH_JITTER` |
+| **Drop Rate** | `count(dt > 1.5 × median_dt) / total` | >10% → `HIGH_DROPS` |
+| **Offset** | Median of paired (t2 - t1) | `offsetValid=false` → `INVALID_OFFSET` |
 
 ### Robust Offset Estimation
 
 **Source**: [calculateRobustOffset](file:///home/ext.siarhei.zhmura/Work/pulse/feature-processing/src/main/java/com/vivopulse/feature/processing/timestamp/TimestampSync.kt#L206-L265)
 
+The offset between camera streams is estimated by pairing individual frame timestamps:
+
 ```
-Algorithm:
-1. WARMUP SKIP: Discard first 0.5s of each stream (cadence/latency stabilization)
-2. MONOTONIC PAIRING: Cursor j starts at 0, only advances forward
-   - For each stream1[i], find best stream2[j..j+5] within adaptive tolerance
-   - "Best" = closest timestamp match
-   - Once j advances past a frame, it never re-pairs
+1. WARMUP SKIP: Discard first 0.5s of each stream
+   - Camera latency and AE convergence cause erratic timestamps initially
+
+2. MONOTONIC PAIRING: Forward-only cursor prevents re-pairing
+   for each stream1[i]:
+       find closest stream2[j..j+5] within tolerance
+       cursor j only advances (never revisits earlier frames)
+
 3. ADAPTIVE TOLERANCE: max(50ms, 1.5 × max(medianDt1, medianDt2))
-   - At 30fps (33ms dt) → 50ms
-   - At 15fps (66ms dt) → 99ms
-   - Prevents false INVALID_OFFSET at low/mixed fps
-4. MEDIAN: Take median of all valid (t2 - t1) differences
+   - At 30fps (33ms cadence) → 50ms tolerance
+   - At 15fps (66ms cadence) → 99ms tolerance
+   - Prevents false INVALID_OFFSET when cameras run at different rates
+
+4. MEDIAN: Take median of all paired differences → robust to outliers
+
+5. RATE RATIO: Linear regression through pairs → t2 = a×t1 + b
+   - a ≈ 1.0 for shared clock; >100ppm logged as significant drift
+   - Stored in DriftResult.rateRatio for downstream compensation
 ```
-
-| Corner Case | Behavior |
-|---|---|
-| Short recording (<0.5s) | Fallback to pairing without warmup skip |
-| Streams start at very different times | Monotonic cursor skips unmatched early frames |
-| No pairs found within tolerance | `offsetValid = false` → `INVALID_OFFSET` gate triggers |
-
-> [!NOTE]
-> **Overlap vs Offset**: `overlapDuration` is computed from raw timestamps (max(starts) to min(ends)). `offsetValid` is computed by attempting to pair individual frames. It is possible to have temporal overlap but no valid pairing (e.g., massive jitter or async clocks), in which case `offsetValid=false` takes precedence.
 
 ---
 
-## Stage 4 — Resampling to Unified 100Hz Timeline
+## Stage 4 — Conditional Resampling to Unified Timeline
 
 **Source**: [TimestampSync.resampleToUnifiedTimeline](file:///home/ext.siarhei.zhmura/Work/pulse/feature-processing/src/main/java/com/vivopulse/feature/processing/timestamp/TimestampSync.kt#L285-L351)
 
-Both streams are linearly interpolated onto a shared uniform time grid at **100 Hz** (10ms intervals).
+Both irregular streams are linearly interpolated onto a shared uniform grid. The target frequency is **conditionally chosen** based on actual FPS quality:
 
-**Algorithm**:
-1. Find overlap region: `startNs = max(stream1.first, stream2.first)`, `endNs = min(stream1.last, stream2.last)`
-2. Generate uniform timestamps: `t[k] = startNs + k × 10_000_000L` for `k = 0..N`
-3. For each uniform timestamp, linearly interpolate both streams independently
+```
+Conditional rate selection:
+  if minFPS ≥ 25 AND jitter ≤ 5ms AND drops ≤ 10%:
+    effectiveHz = 100Hz (full pipeline, foot detection enabled)
+  elif minFPS ≥ 15:
+    effectiveHz = min(50Hz, 2 × minFPS)  (XCorr-only, no foot detection)
+  else:
+    effectiveHz = max(20Hz, 2 × minFPS)  (minimal, XCorr-only)
 
-**Why 100Hz**: Highest band edge is 4 Hz → Nyquist ≥ 8 Hz. 100 Hz gives margin for interpolation and stable derivative/foot detection. Quadratic interpolation provides sub-grid estimates; practical accuracy is typically on the order of several–tens of ms depending on fps, SNR, and motion. The strict timing/SQI gates reduce conditions where precision would be misleading.
+Overlap region:
+  start = max(stream1.first_ts, stream2.first_ts)
+  end   = min(stream1.last_ts,  stream2.last_ts)
 
-| Corner Case | Behavior |
-|---|---|
-| No temporal overlap | `ResampledData.isValid = false` → pipeline returns empty `ProcessedSeries` |
-| <100 unified samples | Extremely short window — PTT estimation will fail (need ≥100 for XCorr) |
-| 15fps input → 100Hz output | Linear interpolation creates 6–7 synthetic points per real frame |
+Uniform grid:
+  t[k] = start + k × (1/effectiveHz) seconds
 
-> [!WARNING]
-> **Risk — Interpolation bias**: Linear interpolation between 30fps samples (33ms apart) introduces systematic smoothing. Near the 25fps gate boundary, this could shift peak positions on the order of ~10ms. If real-device testing reveals bias, upgrade to PCHIP (Piecewise Cubic Hermite Interpolation).
+For each t[k]:
+  face_value[k]   = linear_interp(face_timestamps, face_values, t[k])
+  finger_value[k] = linear_interp(finger_timestamps, finger_values, t[k])
+```
+
+| Input FPS | Effective Hz | Foot Detection | Risk |
+|---|---|---|---|
+| ≥25 fps (clean) | 100 Hz | ✅ | Low |
+| 25 fps (noisy) | 50 Hz | ❌ XCorr-only | Moderate |
+| 18 fps | 36 Hz | ❌ XCorr-only | Moderate |
+| 15 fps | 30 Hz | ❌ XCorr-only | High |
+
+> [!NOTE]
+> **Audit risk [#2] — MITIGATED**: Conditional resampling now implemented. Below 25fps or with noisy timing, the pipeline resamples to 30–50Hz and runs XCorr-only (foot-to-foot detection disabled). This prevents derivative-based foot detection from amplifying interpolation artifacts.
 
 ---
 
-## Stage 5 — Signal Conditioning (`processChannel`)
+## Stage 5 — Signal Conditioning
 
 **Source**: [SignalPipeline.processChannel](file:///home/ext.siarhei.zhmura/Work/pulse/feature-processing/src/main/java/com/vivopulse/feature/processing/SignalPipeline.kt#L341-L430)
 
-Each channel (face, finger) is processed independently through 5 sub-steps:
+Each channel (face, finger) is processed independently through 4 sub-steps:
 
 ### 5a. DC Removal + Detrending
 ```
-zeroMean = removeMean(rawSignal)           // Subtract mean
-detrended = detrendIIR(zeroMean, 0.5Hz)    // IIR high-pass at 0.5Hz
+zeroMean  = signal - mean(signal)             // Remove DC offset
+detrended = detrendIIR(zeroMean, cutoff=0.5Hz) // IIR high-pass removes respiratory drift
 ```
-Removes DC offset and slow baseline wander (respiration, sensor drift).
 
 ### 5b. Zero-Phase Bandpass Filtering (`filtfilt`)
 ```
-padLength = min(150, signal.size - 1)      // Adaptive padding
-filtered = filtfilt(detrended, padLength) { signal ->
-    butterworthBandpass(signal, 0.7Hz, 4.0Hz, order=4)
+filtered = filtfilt(detrended, pad=min(150, n-1)) {
+    butterworthBandpass(signal, fLow=0.7Hz, fHigh=4.0Hz, order=4)
 }
 ```
 
@@ -163,30 +329,24 @@ filtered = filtfilt(detrended, padLength) { signal ->
 |---|---|---|
 | Low cutoff | 0.7 Hz | Below resting HR (~42 bpm) |
 | High cutoff | 4.0 Hz | Above max HR (~240 bpm), includes harmonics |
-| Filter order | 4 (2nd-order sections × 2) | Steep rolloff without excessive ringing |
-| `filtfilt` padding | `min(150, n-1)` samples | Empirically validated via shift-invariance test |
+| Order | 4 (2 × 2nd-order) | Steep rolloff, minimal ringing |
+| Padding | `min(150, n-1)` | 1.5s padding eliminates edge transients |
 
-**`filtfilt` implementation**: Signal is padded with reflected samples, filtered forward, reversed, filtered backward, then unpadded. This produces **zero phase distortion** — critical for PTT since any phase shift would directly corrupt timing.
-
-> [!IMPORTANT]
-> **Risk — Edge transients**: Insufficient padding causes filter settling artifacts at window boundaries. The old value (50 samples = 0.5s) produced up to 9.6% error. Current padding (150 samples = 1.5s) reduces this to <1%, validated by a shift-invariance test (overlap region maxDiff < 0.01).
+**`filtfilt`** = forward-backward filtering → **zero phase distortion**. This is critical: any filter phase shift would directly corrupt PTT timing.
 
 ### 5c. Wavelet Denoising (conditional)
 ```
-if (SQI ∈ [40, 80]):   // Moderate quality only
-    waveletCleaned = WaveletDenoiser.denoise(detrended, levels=4)
-    denoisedFiltered = filtfilt(waveletCleaned, ...)
+if SQI ∈ [40, 80]:  // Moderate quality only
+    cleaned  = WaveletDenoiser.denoise(detrended, levels=4)
+    filtered = filtfilt(cleaned, ...)
 ```
-Applied only for moderate-quality signals. High-quality signals don't benefit; low-quality signals are too noisy for wavelet denoising to help.
+Not applied to high-quality (unnecessary) or low-quality (too noisy) signals.
 
-### 5d. Step Notch Filter (walking mode only)
-If `walkingModeEnabled && IMU available`: Notch filter at detected step frequency to remove walking artifacts.
-
-### 5e. Z-Score Normalization
+### 5d. Z-Score Normalization
 ```
 normalized = (signal - mean) / std
 ```
-Equalizes amplitude between face and finger channels (face PPG amplitude is ~10× weaker than finger). Without this, cross-correlation would be dominated by the higher-amplitude channel.
+Equalizes amplitude between channels. Face PPG amplitude is ~10× weaker than finger — without normalization, cross-correlation would be dominated by the finger channel.
 
 ---
 
@@ -196,142 +356,103 @@ Equalizes amplitude between face and finger channels (face PPG amplitude is ~10�
 
 ### 6a. Peak Detection
 
-**Source**: [PeakDetect.detectPeaks](file:///home/ext.siarhei.zhmura/Work/pulse/feature-processing/src/main/java/com/vivopulse/feature/processing/ptt/PeakDetect.kt#L16-L98)
-
 ```
-threshold = mean + k × std     (k = 0.3)
-local_maximum = signal[i] > signal[i-1] AND signal[i] > signal[i+1]
-valid_peak = local_maximum AND signal[i] > threshold AND (i - lastPeak) ≥ minDistance
-```
-
-| Constraint | Value | Purpose |
-|---|---|---|
-| Min R-R interval | 350 ms | Max physiological HR = 170 bpm |
-| Max R-R interval | 2000 ms | Min physiological HR = 30 bpm |
-| Min peaks for validity | 3 | Need at least 2 R-R intervals |
-
-### 6b. Heart Rate Computation
-
-**Source**: [HeartRate.computeHeartRate](file:///home/ext.siarhei.zhmura/Work/pulse/feature-processing/src/main/java/com/vivopulse/feature/processing/ptt/HeartRate.kt)
-
-```
-HR (bpm) = 60000 / mean(RR_intervals_ms)
+threshold = mean + 0.3 × std
+For each sample i:
+    if signal[i] > signal[i-1] AND signal[i] > signal[i+1]   // local max
+    AND signal[i] > threshold                                  // above noise
+    AND (i - lastPeak) ≥ minDistance (350ms → 170bpm max)     // refractory
+      → emit peak
 ```
 
-### 6c. PTT Consensus Engine
+### 6b. Heart Rate
+```
+HR_bpm = 60000 / mean(RR_intervals_ms)
+Valid if ≥ 3 peaks (2 intervals), HR ∈ [30, 240] bpm
+```
 
-Two independent methods estimate PTT, then agree:
+### 6c. Consensus Engine (Two Methods)
 
 #### Method A: Global Cross-Correlation (Robust)
 
-**Source**: [CrossCorr.crossCorrelationLag](file:///home/ext.siarhei.zhmura/Work/pulse/feature-processing/src/main/java/com/vivopulse/feature/processing/ptt/CrossCorr.kt#L13-L91)
+**Source**: [CrossCorr.crossCorrelationLag](file:///home/ext.siarhei.zhmura/Work/pulse/feature-processing/src/main/java/com/vivopulse/feature/processing/ptt/CrossCorr.kt)
 
 ```
-1. Window: last 20s of signal
-2. Max lag: ±200ms (physiological PTT range)
+1. Window: last 20 seconds of signal
+2. Max lag: ±400ms (aligned with foot-to-foot range)
 3. Normalized cross-correlation (Pearson):
-   R[τ] = Σ(x[i]-μx)(y[i+τ]-μy) / √(Σ(x-μx)² × Σ(y-μy)²)
+     R[τ] = Σ(x[i]·y[i+τ]) / √(Σx² · Σy²)
 4. Find τ* = argmax R[τ]
-5. Sub-sample refinement: Quadratic interpolation (parabola fit)
-   around (τ-1, τ*, τ+1) → vertex at -b/(2a) for sub-grid estimate (useful for smoothing; practical accuracy limited by fps/SNR/jitter)
-6. Peak sharpness: peak - mean(neighbors) → confidence indicator
+5. Sub-sample: Quadratic interpolation (parabola fit at peak ±1)
+6. Peak sharpness: peak_value - mean(neighbors) → confidence
+7. Lag confidence decay: lags > 200ms get confidence penalty
+     lagConf = 1.0 - clamp((|lag| - 200) / 300, 0, 0.5)
 ```
-
-| Corner Case | Behavior |
-|---|---|
-| <100 samples in window | Returns invalid (insufficient for correlation) |
-| Flat correlation (no clear peak) | Low sharpness → low confidence at Stage 7 |
-| Multiple peaks (harmonics) | Picks global max — may select wrong harmonic |
 
 #### Method B: Foot-to-Foot Detection (Precise)
 
-**Source**: [PTTConsensus.detectFeet](file:///home/ext.siarhei.zhmura/Work/pulse/feature-processing/src/main/java/com/vivopulse/feature/processing/ptt/PTTConsensus.kt#L76-L134)
+**Source**: [PTTConsensus.detectFeet](file:///home/ext.siarhei.zhmura/Work/pulse/feature-processing/src/main/java/com/vivopulse/feature/processing/ptt/PTTConsensus.kt)
 
 ```
 1. Compute 1st derivative: diff[i] = (signal[i+1] - signal[i-1]) / 2
 2. Find max slope (steepest systolic upstroke)
-3. Set slope threshold: 5% of max slope
+3. Slope threshold: 5% of max slope
 4. For each local max in derivative > threshold:
-   - Search backward (up to 500ms) for local minimum in signal
-   - This minimum = "foot" (pressure wave onset)
-5. Match face feet to causal finger feet (Monotonic Cursor):
-   - For each face foot `t_face`, search forward for first finger foot `t_finger`
-   - Condition: `t_finger > t_face` AND `lag ∈ [30, 500] ms`
-   - Cursor advances monotonically to ensure 1-to-1 pairing
-6. Report median of all valid beat-to-beat lags
+     Search backward (up to 500ms) for local minimum → "foot"
+5. Match face feet → finger feet:
+     Monotonic causal cursor: t_finger > t_face, lag ∈ [30, 400]ms
+6. PTT = median(all valid beat-to-beat lags)
 ```
 
-| Corner Case | Behavior |
-|---|---|
-| No feet detected / No valid pairs | Returns 0 beats → Falls back to Method A (XCorr) |
-| Noisy derivative (false feet) | Threshold at 5% of max slope filters most noise |
-| Beat matching ambiguity | Monotonic causal cursor prevents temporal violations |
+> [!NOTE]
+> **Audit risk [#9] — MITIGATED**: XCorr and foot-to-foot now share the same ±400ms range, ensuring consensus comparisons are meaningful. Previously XCorr was ±200ms while foot detection accepted up to 500ms.
 
 #### Consensus Decision
 
 ```
 agreement = |PTT_XCorr - PTT_FootMedian|
 
-Output Strategy (Best-Of):
-1. If Foot-to-Foot has valid beats (`nBeats > 0`) AND agrees with XCorr (`agreement ≤ 50 ms`):
-   - Use **Foot-to-Foot Median** (Primary choice for precision)
-   - Agreement Score = 1.0
-2. If Foot-to-Foot fails (`nBeats == 0`):
-   - Use **XCorr Lag** (Robust fallback)
-   - Agreement Score = 1.0 (Neutral, no penalty since no disagreement)
-3. If methods disagree (`agreement > 50 ms`):
-   - Use **XCorr Lag** (Generally more robust to artifacts than derivative-based feet)
-   - Agreement Score = 0.5 (Penalty applies, reducing confidence; disagreement suggests foot detection failure or harmonic mismatch)
+1. nBeats > 0 AND agreement ≤ 50ms → Use Foot-to-Foot (precise), score = 1.0
+2. nBeats == 0                      → Use XCorr (fallback),      score = 1.0
+3. agreement > 50ms                 → Use XCorr (robust),        score = 0.5
 ```
-
-> [!NOTE]
-> The foot-to-foot value is used as the primary PTT because it corresponds to the physical onset of the pressure wave (diastolic minimum). XCorr provides a robustness check. 50ms tolerance accepts variance from 30fps sampling (33ms) and noise.
 
 ---
 
 ## Stage 7 — Quality Gating (Multi-Layer)
 
-**Two independent gating layers** operate in sequence:
+### Layer A: Timing Quality Gate
 
-### Layer A: Timing Quality Gate (SignalPipeline)
+**Source**: [SignalPipeline.kt](file:///home/ext.siarhei.zhmura/Work/pulse/feature-processing/src/main/java/com/vivopulse/feature/processing/SignalPipeline.kt#L255-L275)
 
-**Source**: [SignalPipeline.kt#L255-L275](file:///home/ext.siarhei.zhmura/Work/pulse/feature-processing/src/main/java/com/vivopulse/feature/processing/SignalPipeline.kt#L255-L275)
+PTT is **strictly blocked** (`effectivePtt = null`) if any condition fails. All failing gates are collected as a bitmask and logged together.
 
-PTT is **strictly blocked** (`effectivePtt = null`) if any condition is true:
-
-| Condition | Threshold | Rationale |
+| Condition | Threshold | Gate Name |
 |---|---|---|
-| **Invalid Offset / No Sync** | `!offsetValid` | **Highest Priority**. If streams aren't synchronized, subsequent PTT is meaningless. |
-| FPS < 25 Hz | `min(rate1, rate2) < 25` | Below ~25 fps, original cadence is too coarse and interpolation dominates |
-| Jitter > 5 ms | `MAD(dt) > 5 ms` (either stream) | Non-uniform sampling corrupts interpolation accuracy |
-| Drop rate > 10% | `dt > 1.5×median / total > 0.1` (either stream) | Gaps create interpolation holes in the resampled timeline |
+| Offset invalid | `!offsetValid` | `INVALID_OFFSET` |
+| FPS too low | `min(fps1, fps2) < 25` | `LOW_FPS` |
+| Jitter too high | `MAD(dt) > 5ms` (either) | `HIGH_JITTER` |
+| Drops too many | `dropRate > 0.10` (either) | `HIGH_DROPS` |
+| All motion | windowed RMS > threshold | `ALL_MOTION` |
+| Clock drift | `|rateRatio - 1.0| > 100ppm` | `CLOCK_DRIFT` |
 
-> [!CAUTION]
-> **This gate is hierarchical**: offsetValid is checked first, then FPS, then jitter, then drops. Only the first failure is reported. This means a session with both low FPS and high drops will only log `LOW_FPS` as the gate reason.
+> [!NOTE]
+> **Audit risk [#10a] — MITIGATED**: Gate is now a **bitmask** — all failing gates are collected and logged together (e.g., `"PTT gated: primary=LOW_FPS, all=LOW_FPS|HIGH_JITTER"`). New gates: `ALL_MOTION` (windowed motion scoring) and `CLOCK_DRIFT` (non-shared clock detection at >100ppm).
 
-### Layer B: Signal Quality Gate (PttEngine → PttSqi)
+### Layer B: Signal Quality Gate
 
 **Source**: [PttSqi.kt](file:///home/ext.siarhei.zhmura/Work/pulse/feature-processing/src/main/java/com/vivopulse/feature/processing/ptt/PttSqi.kt)
 
-> **Source of truth**: Validated against code as of Feb 2026; see tests `PttLiteratureConsistencyTests` for expected behavior.
+Even if timing passes, PTT is rejected if `confidence < 0.60`.
 
-Even if timing is good, PTT is rejected if signal confidence < 0.60.
+**Per-Channel SQI (0–100)**:
+```
+SNR Score (0–70):  10 × log₁₀(signal_power / noise_power) → linear map
+Regularity (0–30): 100 × (1 - CV(RR)) × 0.3
+```
+SNR uses **raw (unfiltered)** signal intentionally — prevents false confidence when filtering masks poor quality.
 
-#### Per-Channel SQI (0–100)
-
-| Component | Weight | Computation |
-|---|---|---|
-| SNR Score | 0–70 pts | `10 × log₁₀(signal_power / noise_power)` → linear map to 0–70 |
-| Regularity | 0–30 pts | `100 × (1 - CV(RR)) × 0.3` where CV = std/mean of R-R intervals |
-| Motion | 0 pts (reserved) | Currently weight = 0; slot for future IMU penalty |
-
-SNR score mapping: `{<0 dB → 0, 0 dB → 10, 5 dB → 30, 10 dB → 50, ≥15 dB → 70}`
-
-> [!IMPORTANT]
-> **SQI is intentionally conservative**: SNR is computed from the **raw (unfiltered) signal**, not the filtered one used for foot detection. This means SQI may reject sessions where filtered fiducials appear usable but raw noise remains high. This is by design — it prevents false confidence in conditions where filtering masks poor signal quality.
-
-#### Combined Confidence (0.0–1.0)
-
+**Combined Confidence (0.0–1.0)**:
 ```
 confidence = (min(SQI_face, SQI_finger) / 100)
            × corrScore
@@ -339,57 +460,110 @@ confidence = (min(SQI_face, SQI_finger) / 100)
            × agreementScore
 ```
 
-**Decision**: `PTT reported ↔ confidence ≥ 0.60`
-
-If rejected, `PttEngine` generates user-facing guidance:
-- Face SNR low → "Improve face lighting"
-- Finger SNR low → "Reduce finger pressure on lens"
-- Low correlation → "Hold both cameras steady"
-
 ---
 
-## Stage 8 — Output & Session Logging
+## Stage 8 — Output
+
+### SESSION_SUMMARY Log (one per process() call)
+```
+SESSION_SUMMARY | fps=29.8/28.5 | jitter=1.2/1.5ms | drops=2%/3%
+               | offset=0.8ms (n=350) | nBeats=58
+               | pttGated=NONE | pttMs=125.3
+```
 
 ### ProcessedSeries Output
 
 | Field | Type | Description |
 |---|---|---|
-| `faceSignal` / `fingerSignal` | `DoubleArray` | Filtered, normalized PPG signals |
-| `pttOutput` | `PttOutput?` | PTT value, confidence, HR, SQI (null if gated) |
-| `timeMillis` | `List<Double>` | Unified 100Hz timeline |
-| `isValid` | `Boolean` | Pipeline success flag |
-
-### SESSION_SUMMARY Log
-
-One structured log line per `process()` call for field validation:
-
-```
-SESSION_SUMMARY | fps=29.8/28.5 | jitter=1.2/1.5ms | drops=2%/3% | offset=0.8ms (n=350) | nBeats=58 | pttGated=NONE | pttMs=125.3
-```
+| `faceSignal` / `fingerSignal` | `DoubleArray` | Filtered, normalized PPG |
+| `rawFaceSignal` / `rawFingerSignal` | `DoubleArray` | Resampled but unfiltered (for SQI) |
+| `pttOutput` | `PttOutput?` | PTT, confidence, HR, SQI, nBeats |
+| `pttGated` | `String?` | `LOW_FPS`, `HIGH_JITTER`, `INVALID_OFFSET`, or null |
 
 ---
 
-## Risk Summary
+## Discovered Issues & Applied Fixes
 
-| # | Risk | Severity | Mitigation | Status |
-|---|---|---|---|---|
-| 1 | Mis-pairing during startup | **High** | Monotonic cursor + adaptive tolerance + warmup skip | ✅ Implemented |
-| 2 | Low-light FPS drop → bad PTT | **High** | Strict gate at <25 Hz (blocks PTT output) | ✅ Implemented |
-| 3 | `filtfilt` edge transients | **Medium** | Adaptive padding `min(150, n-1)` + shift-invariance test | ✅ Validated |
-| 4 | Interpolation bias near 25fps | **Medium** | Tracked by SESSION_SUMMARY; evaluate systematic bias by comparing lag distributions at 25–30fps | ⏳ Deferred |
-| 5 | Foot-detection false positives | **Low** | 5% slope threshold + median aggregation | ✅ Implemented |
-| 6 | Beat matching ambiguity | **Medium** | Beat matching ambiguity — mitigated by monotonic causal cursor + lag window; residual risk if feet detection misses beats. | ✅ Implemented |
-| 7 | Clock drift between cameras | **None Expected** | Both use `SENSOR_TIMESTAMP` domain — shared monotonic clock | ✅ Verified |
+### Issue 1: Camera Binding Failure with `[30, 30]` FPS
+
+| Attribute | Detail |
+|---|---|
+| **Symptom** | Camera session produces 0fps with 2-second gaps |
+| **Root Cause** | `[30, 30]` forced AE to operate with zero exposure flexibility; in concurrent mode the back camera couldn't sustain 30fps + torch |
+| **Fix** | Relaxed range to `[15, 30]` (initially), then `[25, 30]` with fallback |
+| **File** | [CameraBindingHelper.kt](file:///home/ext.siarhei.zhmura/Work/pulse/feature-capture/src/main/java/com/vivopulse/feature/capture/camera/CameraBindingHelper.kt#L107-L135) |
+
+---
+
+### Issue 2: PTT=0 on Pixel 8 (`LOW_FPS` Gate)
+
+| Attribute | Detail |
+|---|---|
+| **Symptom** | `SESSION_SUMMARY | fps=30.0/18.4 | pttGated=LOW_FPS | pttMs=null` |
+| **Root Cause** | FPS range `[15, 30]` allowed finger camera to settle at ~18fps in concurrent mode; below the 25Hz gate |
+| **Evidence** | `logs12.txt`: `SQI: Face=2 (SNR=0.0), Finger=8 (SNR=0.0)`, `Consensus: PTT=-4124ms` |
+| **Fix** | FPS fallback: try `[25, 30]` first; if binding fails, retry `[15, 30]` with `pttCapable=false` |
+| **File** | [CameraBindingHelper.kt](file:///home/ext.siarhei.zhmura/Work/pulse/feature-capture/src/main/java/com/vivopulse/feature/capture/camera/CameraBindingHelper.kt) |
+
+---
+
+### Issue 3: AE/AWB Staircase Artifacts (SNR=0)
+
+| Attribute | Detail |
+|---|---|
+| **Symptom** | Raw signal shows drift/staircase pattern; `SNR=0.0dB` on both channels |
+| **Root Cause** | Without AE lock, camera adjusts gain in discrete steps → artifacts larger than pulse signal |
+| **Fix** | Delayed AE+AWB lock after 30 frames (~1s convergence) via `Camera2Interop` |
+| **File** | [DualCameraController.kt:676-681](file:///home/ext.siarhei.zhmura/Work/pulse/feature-capture/src/main/java/com/vivopulse/feature/capture/DualCameraController.kt#L676-L681) |
+
+---
+
+### Issue 4: Timestamp Mis-pairing at Low/Mixed FPS
+
+| Attribute | Detail |
+|---|---|
+| **Symptom** | `offsetValid=false` when cameras run at different cadences (e.g., 30fps face, 18fps finger) |
+| **Root Cause** | Fixed 50ms pairing tolerance was too tight for 15fps cadence (66ms between frames) |
+| **Fix** | Adaptive tolerance: `max(50ms, 1.5 × max(medianDt1, medianDt2))` |
+| **File** | [TimestampSync.kt:calculateRobustOffset](file:///home/ext.siarhei.zhmura/Work/pulse/feature-processing/src/main/java/com/vivopulse/feature/processing/timestamp/TimestampSync.kt#L216-L276) |
+
+---
+
+### Issue 5: `filtfilt` Edge Transients
+
+| Attribute | Detail |
+|---|---|
+| **Symptom** | Up to 9.6% PTT error at recording boundaries |
+| **Root Cause** | `filtfilt` padding too short (50 samples = 0.5s) → filter settling artifacts at window edges |
+| **Fix** | Increased padding to `min(150, n-1)` (1.5s) → error <1% |
+| **Validation** | Shift-invariance test: overlap region `maxDiff < 0.01` |
+| **File** | [SignalPipeline.processChannel](file:///home/ext.siarhei.zhmura/Work/pulse/feature-processing/src/main/java/com/vivopulse/feature/processing/SignalPipeline.kt#L341-L430) |
+
+---
+
+### Issue 6: Test Failures from Missing Raw Signals
+
+| Attribute | Detail |
+|---|---|
+| **Symptom** | `PttLiteratureConsistencyTests` failed — SQI computation crashed with empty arrays |
+| **Root Cause** | `ProcessedSeries.rawFaceSignal` and `rawFingerSignal` were not populated in test fixtures |
+| **Fix** | Populated `rawFaceSignal` and `rawFingerSignal` in test `ProcessedSeries` construction |
+| **File** | [PttLiteratureConsistencyTests.kt](file:///home/ext.siarhei.zhmura/Work/pulse/feature-processing/src/test/java/com/vivopulse/feature/processing/tests/PttLiteratureConsistencyTests.kt) |
 
 ---
 
 ## Definitions
 
-| Term | Precise Definition |
+| Term | Definition |
 |---|---|
-| **Jitter** | MAD (Median Absolute Deviation) of inter-frame intervals from the median interval, per stream, in ms |
-| **Drop rate** | Fraction of intervals where `dt > 1.5 × median_interval` |
-| **PTT** | Time delay (ms) between pulse wave arrival at face vs. finger, estimated via consensus of XCorr and foot-to-foot methods |
-| **SQI** | Signal Quality Index (0–100), combining band-limited SNR (0–70 pts) and peak regularity (0–30 pts) |
-| **Confidence** | Combined metric (0.0–1.0): `min(SQI) × corrScore × sharpness × agreement`. Threshold ≥ 0.60 for reporting |
-| **SENSOR_TIMESTAMP** | Camera2 frame timestamp from `CLOCK_BOOTTIME`, verified as `Image.getTimestamp()` in `DualCameraController.processFrame()` |
+| **PTT** | Pulse Transit Time — delay (ms) between pulse wave arrival at face vs. finger |
+| **rPPG** | Remote photoplethysmography — contactless pulse detection via camera |
+| **PPG** | Photoplethysmography — pulse detection via light transmission (contact) |
+| **SQI** | Signal Quality Index (0–100): SNR (0–70) + regularity (0–30) |
+| **Confidence** | Combined metric (0.0–1.0): `min(SQI) × corrScore × sharpness × agreement` |
+| **FPS Gate** | Hard threshold at 25Hz — below this, interpolation dominates and PTT is unreliable |
+| **AE Lock** | Camera2 `CONTROL_AE_LOCK=true` — freezes exposure to prevent staircase artifacts |
+| **`filtfilt`** | Forward-backward (zero-phase) filtering — eliminates phase shift in bandpass |
+| **Foot** | Diastolic minimum (onset) of the pressure waveform — primary PTT reference point |
+| **Monotonic cursor** | Pairing strategy where the cursor only advances forward → prevents temporal violations |
+| **`pttCapable`** | Runtime flag — `true` if camera FPS supports PTT quality (≥25Hz) |

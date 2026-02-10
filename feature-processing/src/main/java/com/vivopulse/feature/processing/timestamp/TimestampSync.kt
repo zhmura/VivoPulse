@@ -156,8 +156,8 @@ object TimestampSync {
         val drops1 = calculateDropRate(stream1Timestamps, interval1Ms)
         val drops2 = calculateDropRate(stream2Timestamps, interval2Ms)
         
-        // Calculate Robust Offset using median of first N pairs
-        val (robustOffsetMs, offsetPairs) = calculateRobustOffset(stream1Timestamps, stream2Timestamps)
+        // Calculate Robust Offset using median of first N pairs (P2-B: also returns rate ratio)
+        val (robustOffsetMs, offsetPairs, rateRatio) = calculateRobustOffset(stream1Timestamps, stream2Timestamps)
         val offsetMs = robustOffsetMs ?: 0.0
         val offsetValid = robustOffsetMs != null
         
@@ -182,6 +182,7 @@ object TimestampSync {
             offsetValid = offsetValid,
             offsetPairs = offsetPairs,
             overlapDurationMs = overlapDurationMs,
+            rateRatio = rateRatio,
             message = if (offsetValid) {
                 "Sync: Offset ${"%.0f".format(offsetMs)}ms (n=$offsetPairs), Rates ${"%.1f".format(rate1)}/${"%.1f".format(rate2)} fps"
             } else {
@@ -220,11 +221,12 @@ object TimestampSync {
      * 2. Monotonic constraint: cursor j only advances forward, preventing re-pairing.
      * 3. Adaptive tolerance: max(50ms, 1.5 * max(medianDt1, medianDt2)) — scales with cadence.
      * 4. Median aggregation: robust to remaining outliers.
+     * 5. P2-B: Linear rate ratio estimation for drift compensation.
      *
-     * @return Pair of (offset in ms or null, number of valid pairs used)
+     * @return Triple of (offset in ms or null, number of valid pairs, rate ratio or 1.0)
      */
-    private fun calculateRobustOffset(stream1: List<Long>, stream2: List<Long>, n: Int = 30): Pair<Double?, Int> {
-        if (stream1.isEmpty() || stream2.isEmpty()) return null to 0
+    private fun calculateRobustOffset(stream1: List<Long>, stream2: List<Long>, n: Int = 30): Triple<Double?, Int, Double> {
+        if (stream1.isEmpty() || stream2.isEmpty()) return Triple(null, 0, 1.0)
 
         // 1. Skip warmup frames (first 0.5s — cadence/latency stabilization)
         val warmupNs = 500_000_000L
@@ -238,13 +240,13 @@ object TimestampSync {
         val effectiveS2 = if (s2.size >= 5) s2 else stream2
 
         // 3. Adaptive tolerance: max(50ms, 1.5 * max(medianDt1, medianDt2))
-        //    At 30fps (33ms dt) → 50ms. At 15fps (66ms dt) → 99ms.
         val medianDt1Ns = medianIntervalNs(effectiveS1)
         val medianDt2Ns = medianIntervalNs(effectiveS2)
         val maxMedianDtNs = maxOf(medianDt1Ns, medianDt2Ns)
         val adaptiveToleranceNs = maxOf(50_000_000L, (1.5 * maxMedianDtNs).toLong())
 
         val diffs = mutableListOf<Double>()
+        val pairs = mutableListOf<Pair<Long, Long>>()  // P2-B: collect pairs for regression
         val maxIter = minOf(n, effectiveS1.size)
 
         // 2. Monotonic cursor: j only advances forward
@@ -263,13 +265,14 @@ object TimestampSync {
             val diff = effectiveS2[j] - t1
             if (abs(diff) <= adaptiveToleranceNs) {
                 diffs.add(diff / 1_000_000.0) // ns → ms
+                pairs.add(t1 to effectiveS2[j])
             }
 
             // Advance j past this match to enforce one-to-one pairing
             j++
         }
 
-        if (diffs.isEmpty()) return null to 0
+        if (diffs.isEmpty()) return Triple(null, 0, 1.0)
 
         diffs.sort()
         val mid = diffs.size / 2
@@ -278,7 +281,51 @@ object TimestampSync {
         } else {
             diffs[mid]
         }
-        return median to diffs.size
+        
+        // P2-B: Linear regression for rate ratio (drift correction)
+        // t2 = a * t1 + b → a captures relative clock rate
+        val rateRatio = if (pairs.size >= 5) {
+            computeRateRatio(pairs)
+        } else {
+            1.0
+        }
+        
+        return Triple(median, diffs.size, rateRatio)
+    }
+    
+    /**
+     * P2-B: Simple linear regression to estimate rate ratio between two clock streams.
+     * Given pairs of (t1, t2), fits t2 = a*t1 + b.
+     * Returns a (rate ratio, should be ~1.0; >1.0 means stream2 clock is faster).
+     */
+    private fun computeRateRatio(pairs: List<Pair<Long, Long>>): Double {
+        if (pairs.size < 3) return 1.0
+        
+        // Normalize timestamps to avoid precision loss
+        val t1Base = pairs.first().first
+        val t2Base = pairs.first().second
+        
+        val xs = pairs.map { (it.first - t1Base).toDouble() }
+        val ys = pairs.map { (it.second - t2Base).toDouble() }
+        
+        val n = xs.size.toDouble()
+        val sumX = xs.sum()
+        val sumY = ys.sum()
+        val sumXY = xs.zip(ys) { x, y -> x * y }.sum()
+        val sumX2 = xs.map { it * it }.sum()
+        
+        val denom = n * sumX2 - sumX * sumX
+        if (denom < 1e-10) return 1.0
+        
+        val a = (n * sumXY - sumX * sumY) / denom
+        
+        // Rate ratio should be very close to 1.0 (same clock)
+        // Log if drift is significant (>100ppm)
+        if (abs(a - 1.0) > 0.0001) {
+            logD("Drift detected: rate ratio = ${"%f".format(a)} (${"%.0f".format((a - 1.0) * 1_000_000)} ppm)")
+        }
+        
+        return a
     }
 
     /** Compute median inter-frame interval in nanoseconds. */
@@ -467,6 +514,7 @@ data class DriftResult(
     val offsetValid: Boolean = true,
     val offsetPairs: Int = 0,
     val overlapDurationMs: Double = 0.0,
+    val rateRatio: Double = 1.0,       // P2-B: inter-stream clock rate ratio (1.0 = no drift)
     val message: String
 )
 

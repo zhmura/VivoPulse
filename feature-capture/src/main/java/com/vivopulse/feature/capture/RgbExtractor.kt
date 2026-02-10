@@ -124,4 +124,104 @@ object RgbExtractor {
             null
         }
     }
+
+    // ---- P0-B: Lightweight extraction fast paths ----
+
+    /**
+     * Fast luma-only extraction — Y channel only, no color conversion.
+     * ~3-5x faster than full RGB for finger PPG where red channel dominates via torch.
+     * Uses 2x spatial subsampling for additional speedup.
+     */
+    fun extractAverageLuma(image: ImageProxy, roi: Rect): Double? {
+        val width = image.width
+        val height = image.height
+
+        val constrained = Rect(
+            max(0, roi.left),
+            max(0, roi.top),
+            min(width, roi.right),
+            min(height, roi.bottom)
+        )
+        if (constrained.isEmpty) return null
+
+        val yPlane = image.planes[0]
+        val yBuffer = yPlane.buffer
+        val yRowStride = yPlane.rowStride
+
+        var sum = 0L
+        var count = 0
+
+        // 2x spatial subsampling — sufficient for average signal extraction
+        for (y in constrained.top until constrained.bottom step 2) {
+            for (x in constrained.left until constrained.right step 2) {
+                val idx = y * yRowStride + x
+                if (idx < yBuffer.limit()) {
+                    sum += yBuffer.get(idx).toInt() and 0xFF
+                    count++
+                }
+            }
+        }
+
+        return if (count > 0) sum.toDouble() / count else null
+    }
+
+    /**
+     * Green-proxy extraction from YUV — avoids full RGB matrix.
+     * G ≈ Y - 0.344*U - 0.714*V (dominant rPPG channel for face).
+     * ~40% faster than full RGB (skips R and B computation).
+     * Uses 2x spatial subsampling.
+     */
+    fun extractAverageGreenProxy(image: ImageProxy, roi: Rect): Double? {
+        val width = image.width
+        val height = image.height
+
+        val constrained = Rect(
+            max(0, roi.left),
+            max(0, roi.top),
+            min(width, roi.right),
+            min(height, roi.bottom)
+        )
+        if (constrained.isEmpty) return null
+
+        val planes = image.planes
+        if (planes.size < 3) return null
+
+        val yPlane = planes[0]
+        val uPlane = planes[1]
+        val vPlane = planes[2]
+
+        val yBuffer = yPlane.buffer
+        val uBuffer = uPlane.buffer
+        val vBuffer = vPlane.buffer
+
+        val yRowStride = yPlane.rowStride
+        val uvRowStride = uPlane.rowStride
+        val uvPixelStride = uPlane.pixelStride
+
+        var sumG = 0.0
+        var count = 0
+
+        // Step by 2 for spatial subsampling (matches chroma subsampling)
+        for (y in constrained.top until constrained.bottom step 2) {
+            for (x in constrained.left until constrained.right step 2) {
+                val yIndex = y * yRowStride + x
+                val uvX = x / 2
+                val uvY = y / 2
+                val uvIndex = uvY * uvRowStride + (uvX * uvPixelStride)
+
+                if (yIndex < yBuffer.limit() && uvIndex < uBuffer.limit() && uvIndex < vBuffer.limit()) {
+                    val yVal = yBuffer.get(yIndex).toInt() and 0xFF
+                    val uVal = (uBuffer.get(uvIndex).toInt() and 0xFF) - 128
+                    val vVal = (vBuffer.get(uvIndex).toInt() and 0xFF) - 128
+
+                    // Green channel only: G = Y - 0.344*U - 0.714*V
+                    val g = (yVal - 0.344136 * uVal - 0.714136 * vVal).coerceIn(0.0, 255.0)
+                    sumG += g
+                    count++
+                }
+            }
+        }
+
+        return if (count > 0) sumG / count else null
+    }
 }
