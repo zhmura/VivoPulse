@@ -6,6 +6,7 @@ import com.vivopulse.feature.processing.timestamp.TimestampSync
 import com.vivopulse.feature.processing.timestamp.TimestampedValue
 import com.vivopulse.signal.DspFunctions
 import android.util.Log
+import com.vivopulse.signal.PulseLog
 import com.vivopulse.feature.processing.wavelet.WaveletDenoiser
 import com.vivopulse.feature.processing.motion.ImuMotionAnalyzer
 import com.vivopulse.feature.processing.motion.StepNotchFilter
@@ -34,7 +35,7 @@ class SignalPipeline(
     private val walkingModeEnabled: Boolean = false,
     private val motionRejectionThresholdG: Double = 0.1
 ) {
-    private val tag = "SignalPipeline"
+    private val tag = PulseLog.PIPELINE
     private val imuAnalyzer = ImuMotionAnalyzer()
     
     /**
@@ -322,15 +323,51 @@ class SignalPipeline(
         
         if (motionGate != null) failedGates += motionGate
         if (!driftResult.offsetValid) failedGates += "INVALID_OFFSET"
-        if (minRate < 25.0) failedGates += "LOW_FPS"
+        
+        // FPS gate: <20 = hard off, 20-25 = experimental PTT (xcorr/phase only)
+        if (minRate < 20.0) {
+            failedGates += "LOW_FPS"
+        } else if (minRate < 25.0) {
+            // Allow PTT but flag as experimental — footDetection already disabled via resampling
+            Log.i(tag, "FPS_EXPERIMENTAL: minRate=${"%.1f".format(minRate)}fps — PTT in xcorr/phase-only mode")
+        }
+        
         if (driftResult.stream1JitterMs > 5.0 || driftResult.stream2JitterMs > 5.0) failedGates += "HIGH_JITTER"
         if (driftResult.stream1DropRate > 0.1 || driftResult.stream2DropRate > 0.1) failedGates += "HIGH_DROPS"
-        // P1-B: Clock-domain hard gate — if rate ratio deviates > 100ppm, clocks aren't shared
-        val clockDrift = kotlin.math.abs(driftResult.rateRatio - 1.0)
-        if (clockDrift > 0.0001) {
-            failedGates += "CLOCK_DRIFT"
-            Log.w(tag, "CLOCK_DRIFT gate: rateRatio=${"%.8f".format(driftResult.rateRatio)} " +
-                  "(${"%+.1f".format(clockDrift * 1_000_000)}ppm) — non-shared clock domain suspected")
+        
+        // Clock-domain gate — tiered thresholds:
+        //   ≤500ppm:   OK (normal shared-clock jitter)
+        //   500-2000ppm: suspicious — log warning, allow PTT
+        //   >2000ppm:  hard gate — timestamps from different clock domains
+        val clockDriftPpm = kotlin.math.abs(driftResult.rateRatio - 1.0) * 1_000_000
+        when {
+            clockDriftPpm > 2000 -> {
+                failedGates += "CLOCK_DRIFT"
+                Log.w(tag, "CLOCK_DRIFT gate: rateRatio=${"%.6f".format(driftResult.rateRatio)} " +
+                      "(${"%.0f".format(clockDriftPpm)}ppm) — non-shared clock domain, PTT disabled")
+            }
+            clockDriftPpm > 500 -> {
+                Log.w(tag, "CLOCK_DRIFT warn: rateRatio=${"%.6f".format(driftResult.rateRatio)} " +
+                      "(${"%.0f".format(clockDriftPpm)}ppm) — suspicious, PTT allowed with caution")
+            }
+            clockDriftPpm > 100 -> {
+                Log.i(tag, "CLOCK_DRIFT info: rateRatio=${"%.6f".format(driftResult.rateRatio)} " +
+                      "(${"%.0f".format(clockDriftPpm)}ppm) — within tolerance")
+            }
+        }
+        
+        // Offset stability gate: adaptive threshold for mixed-FPS jitter
+        // Base: 5ms (tight sync). Adaptive: 25% of max frame interval (handling 30 vs 25fps beat frequency)
+        // e.g., at 25fps (40ms), threshold = max(5, 10) = 10ms
+        val interval1Ms = if (driftResult.stream1Rate > 0) 1000.0 / driftResult.stream1Rate else 1000.0
+        val interval2Ms = if (driftResult.stream2Rate > 0) 1000.0 / driftResult.stream2Rate else 1000.0
+        val maxIntervalMs = maxOf(interval1Ms, interval2Ms)
+        val stabilityThresholdMs = maxOf(5.0, 0.25 * maxIntervalMs)
+        
+        if (driftResult.offsetStdMs > stabilityThresholdMs) {
+            failedGates += "OFFSET_UNSTABLE"
+            Log.w(tag, "OFFSET_UNSTABLE gate: offsetStd=${"%.1f".format(driftResult.offsetStdMs)}ms > " +
+                  "${"%.1f".format(stabilityThresholdMs)}ms threshold (adaptive)")
         }
         
         if (failedGates.isNotEmpty()) {
@@ -341,14 +378,25 @@ class SignalPipeline(
             Log.w(tag, "PTT gated: primary=$primary, all=${failedGates.joinToString("|")}")
         }
 
-        // Per-session debug summary — one structured line for device-run analysis
+        // Per-session debug summary — enriched for next-run diagnosis
         val gateReason = if (failedGates.isEmpty()) "NONE" else failedGates.joinToString("|")
-        Log.i(tag, "SESSION_SUMMARY | " +
-            "fps=${"%.1f".format(driftResult.stream1Rate)}/${"%.1f".format(driftResult.stream2Rate)} | " +
-            "jitter=${"%.1f".format(driftResult.stream1JitterMs)}/${"%.1f".format(driftResult.stream2JitterMs)}ms | " +
-            "drops=${"%.0f".format(driftResult.stream1DropRate*100)}%/${"%.0f".format(driftResult.stream2DropRate*100)}% | " +
-            "offset=${"%.1f".format(driftResult.offsetMs)}ms (n=${driftResult.offsetPairs}) | " +
-            "nBeats=${effectivePtt?.nBeats ?: 0} | " + // Log foot-to-foot beats
+        val sharedClockLikely = clockDriftPpm <= 500
+        Log.i(PulseLog.SUMMARY, "SESSION_SUMMARY | " +
+            "fpsFace=${"%.1f".format(driftResult.stream1Rate)} | " +
+            "fpsFinger=${"%.1f".format(driftResult.stream2Rate)} | " +
+            "dropsFace=${"%.0f".format(driftResult.stream1DropRate*100)}% | " +
+            "dropsFinger=${"%.0f".format(driftResult.stream2DropRate*100)}% | " +
+            "jitterFaceMs=${"%.1f".format(driftResult.stream1JitterMs)} | " +
+            "jitterFingerMs=${"%.1f".format(driftResult.stream2JitterMs)} | " +
+            "sharedClockLikely=$sharedClockLikely | " +
+            "rateRatio=${"%.6f".format(driftResult.rateRatio)} (${"%.0f".format(clockDriftPpm)}ppm) | " +
+            "offsetMeanMs=${"%.1f".format(driftResult.offsetMs)} | " +
+            "offsetStdMs=${"%.1f".format(driftResult.offsetStdMs)} | " +
+            "bandSqiFace=${effectivePtt?.sqiFace ?: -1} | " +
+            "bandSqiFinger=${effectivePtt?.sqiFinger ?: -1} | " +
+            "confidence=${"%.2f".format(effectivePtt?.confidence ?: 0.0)} | " +
+            "lagMedianMs=${effectivePtt?.pttMs?.let { "%.1f".format(it) } ?: "null"} | " +
+            "nBeats=${effectivePtt?.nBeats ?: 0} | " +
             "pttGated=$gateReason | " +
             "pttMs=${effectivePtt?.pttMs?.let { "%.1f".format(it) } ?: "null"}")
         
@@ -416,11 +464,26 @@ class SignalPipeline(
         val zeroMean = DspFunctions.removeMean(rawSignal)
         val detrended = DspFunctions.detrendIIR(zeroMean, 0.5, targetSampleRateHz)
         
+        // Gap E: Step-span exclusion — repair baseline change-points before bandpass
+        // Pressure slips, residual AE steps cause step-like artifacts that ring
+        // severely after bandpass filtering
+        val stepResult = com.vivopulse.feature.processing.signal.ChangePointDetector.detectAndRepair(
+            signal = detrended,
+            sampleRate = targetSampleRateHz,
+            cutoffHz = 0.3,
+            threshold = 2.0,
+            spanSeconds = 0.5
+        )
+        val stepCleaned = stepResult.cleaned
+        if (stepResult.changePointIndices.isNotEmpty()) {
+            Log.d(tag, "STEP_EXCL | ${stepResult.changePointIndices.size} change-points repaired")
+        }
+
         // Pad 1.5s (covers >1 period of 0.7Hz cutoff), clamped to signal length
-        val safePad = minOf(150, detrended.size - 1)
+        val safePad = minOf(150, stepCleaned.size - 1)
         
         var mainFiltered = DspFunctions.filtfilt(
-            signal = detrended,
+            signal = stepCleaned,
             padLength = safePad
         ) { sig ->
             DspFunctions.butterworthBandpass(
@@ -434,7 +497,7 @@ class SignalPipeline(
         
         var denoisedFiltered: DoubleArray? = null
         if (sqi in 40..80) {
-            val waveletCleaned = WaveletDenoiser.denoise(detrended, WaveletDenoiser.Config(levels = 4))
+            val waveletCleaned = WaveletDenoiser.denoise(stepCleaned, WaveletDenoiser.Config(levels = 4))
             denoisedFiltered = DspFunctions.filtfilt(
                 signal = waveletCleaned,
                 padLength = safePad

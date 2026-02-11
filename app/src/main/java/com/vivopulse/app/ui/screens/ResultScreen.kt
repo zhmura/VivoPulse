@@ -30,9 +30,11 @@ import com.vivopulse.app.ui.components.PulseGraph
 fun ResultScreen(
     navController: NavController,
     onNavigateBack: () -> Unit,
-    viewModel: ProcessingViewModel = hiltViewModel(
-        navController.getBackStackEntry(PROCESSING_GRAPH_ROUTE)
-    )
+    viewModel: ProcessingViewModel = try {
+        hiltViewModel(navController.getBackStackEntry(PROCESSING_GRAPH_ROUTE))
+    } catch (_: IllegalArgumentException) {
+        hiltViewModel()  // Fallback: may create new VM, but won't crash
+    }
 ) {
     val context = LocalContext.current
     val pttResult by viewModel.pttResult.collectAsState()

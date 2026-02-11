@@ -122,10 +122,12 @@ object PttSqi {
      */
     fun computePhotometricSqi(rawSignal: DoubleArray): PhotometricSqiResult {
         if (rawSignal.size < 10) {
-            return PhotometricSqiResult(score = 0, stepCount = 0, clipPercent = 0.0)
+            return PhotometricSqiResult(score = 100, stepCount = 0, clipPercent = 0.0)
         }
         
-        // 1. Detect exposure steps: |Δsignal[i]| > 3×MAD(Δsignal)
+        // 1. Detect exposure steps: |Δsignal[i]| > 6×MAD(Δsignal)
+        // Use 6× (not 3×) because PPG heartbeats create legitimate diff spikes.
+        // Only true AE exposure jumps will exceed 6×MAD.
         val diffs = DoubleArray(rawSignal.size - 1) { i -> rawSignal[i + 1] - rawSignal[i] }
         val absDiffs = diffs.map { kotlin.math.abs(it) }
         val sortedAbsDiffs = absDiffs.sorted()
@@ -139,8 +141,11 @@ object PttSqi {
             else sorted[sorted.size / 2]
         }
         
-        val stepThreshold = medianDiff + 3.0 * madDiff
-        val stepCount = absDiffs.count { it > stepThreshold && stepThreshold > 1e-10 }
+        // Threshold: 6×MAD above median, with a minimum floor to avoid triggering on flat signals
+        val stepThreshold = maxOf(medianDiff + 6.0 * madDiff, medianDiff * 3.0)
+        val stepCount = if (stepThreshold > 1e-10) {
+            absDiffs.count { it > stepThreshold }
+        } else 0
         
         // 2. Detect clipping: samples within 1% of min/max range
         val minVal = rawSignal.minOrNull() ?: 0.0
@@ -153,8 +158,15 @@ object PttSqi {
         val clipCount = rawSignal.count { it <= minVal + clipMargin || it >= maxVal - clipMargin }
         val clipPercent = (clipCount.toDouble() / rawSignal.size) * 100.0
         
-        // Score: start at 100, penalize steps and clipping
-        val score = (100.0 - 20.0 * stepCount - 10.0 * clipPercent / 100.0 * 10.0)
+        // Score: normalize step count as % of signal, cap penalties
+        // stepPenalty: 0% steps=0, 1% steps=10, 5% steps=40 (capped)
+        val stepPercent = (stepCount.toDouble() / rawSignal.size) * 100.0
+        val stepPenalty = (stepPercent * 8.0).coerceAtMost(40.0)
+        
+        // clipPenalty: 0% clips=0, 5% clips=10, 15%+ clips=30 (capped)
+        val clipPenalty = (clipPercent * 2.0).coerceAtMost(30.0)
+        
+        val score = (100.0 - stepPenalty - clipPenalty)
             .coerceIn(0.0, 100.0).toInt()
         
         return PhotometricSqiResult(score = score, stepCount = stepCount, clipPercent = clipPercent)

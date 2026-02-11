@@ -156,16 +156,19 @@ object TimestampSync {
         val drops1 = calculateDropRate(stream1Timestamps, interval1Ms)
         val drops2 = calculateDropRate(stream2Timestamps, interval2Ms)
         
-        // Calculate Robust Offset using median of first N pairs (P2-B: also returns rate ratio)
-        val (robustOffsetMs, offsetPairs, rateRatio) = calculateRobustOffset(stream1Timestamps, stream2Timestamps)
-        val offsetMs = robustOffsetMs ?: 0.0
-        val offsetValid = robustOffsetMs != null
+        // Calculate Robust Offset using median of first N pairs (P2-B: also returns rate ratio + stddev)
+        val offsetResult = calculateRobustOffset(stream1Timestamps, stream2Timestamps)
+        val offsetMs = offsetResult.medianMs ?: 0.0
+        val offsetValid = offsetResult.medianMs != null
+        val offsetPairs = offsetResult.pairCount
+        val rateRatio = offsetResult.rateRatio
+        val offsetStdMs = offsetResult.stdMs
         
         // Start Overlap Duration
         val overlapDurationMs = (maxEnd - minStart) / 1_000_000.0
         
         logD("Sync Analysis: Rates ${"%.1f".format(rate1)}/${"%.1f".format(rate2)} fps, " +
-             "Offset ${"%.1f".format(offsetMs)} ms (valid=$offsetValid, n=$offsetPairs), " +
+             "Offset ${"%.1f".format(offsetMs)}±${"%.1f".format(offsetStdMs)} ms (valid=$offsetValid, n=$offsetPairs), " +
              "Jitter ${"%.1f".format(jitter1)}/${"%.1f".format(jitter2)} ms, " +
              "Drops ${"%.1f".format(drops1 * 100)}%/${"%.1f".format(drops2 * 100)}%")
         
@@ -181,6 +184,7 @@ object TimestampSync {
             offsetMs = offsetMs,
             offsetValid = offsetValid,
             offsetPairs = offsetPairs,
+            offsetStdMs = offsetStdMs,
             overlapDurationMs = overlapDurationMs,
             rateRatio = rateRatio,
             message = if (offsetValid) {
@@ -225,8 +229,8 @@ object TimestampSync {
      *
      * @return Triple of (offset in ms or null, number of valid pairs, rate ratio or 1.0)
      */
-    private fun calculateRobustOffset(stream1: List<Long>, stream2: List<Long>, n: Int = 30): Triple<Double?, Int, Double> {
-        if (stream1.isEmpty() || stream2.isEmpty()) return Triple(null, 0, 1.0)
+    private fun calculateRobustOffset(stream1: List<Long>, stream2: List<Long>, n: Int = 30): OffsetResult {
+        if (stream1.isEmpty() || stream2.isEmpty()) return OffsetResult(null, 0, 1.0, 0.0)
 
         // 1. Skip warmup frames (first 0.5s — cadence/latency stabilization)
         val warmupNs = 500_000_000L
@@ -246,7 +250,6 @@ object TimestampSync {
         val adaptiveToleranceNs = maxOf(50_000_000L, (1.5 * maxMedianDtNs).toLong())
 
         val diffs = mutableListOf<Double>()
-        val pairs = mutableListOf<Pair<Long, Long>>()  // P2-B: collect pairs for regression
         val maxIter = minOf(n, effectiveS1.size)
 
         // 2. Monotonic cursor: j only advances forward
@@ -265,14 +268,13 @@ object TimestampSync {
             val diff = effectiveS2[j] - t1
             if (abs(diff) <= adaptiveToleranceNs) {
                 diffs.add(diff / 1_000_000.0) // ns → ms
-                pairs.add(t1 to effectiveS2[j])
             }
 
             // Advance j past this match to enforce one-to-one pairing
             j++
         }
 
-        if (diffs.isEmpty()) return Triple(null, 0, 1.0)
+        if (diffs.isEmpty()) return OffsetResult(null, 0, 1.0, 0.0)
 
         diffs.sort()
         val mid = diffs.size / 2
@@ -282,50 +284,49 @@ object TimestampSync {
             diffs[mid]
         }
         
-        // P2-B: Linear regression for rate ratio (drift correction)
-        // t2 = a * t1 + b → a captures relative clock rate
-        val rateRatio = if (pairs.size >= 5) {
-            computeRateRatio(pairs)
-        } else {
-            1.0
-        }
+        // Offset stability: stddev of diffs (lower = more stable timestamps)
+        val mean = diffs.average()
+        val variance = diffs.map { (it - mean) * (it - mean) }.average()
+        val stdMs = kotlin.math.sqrt(variance)
         
-        return Triple(median, diffs.size, rateRatio)
+        // P2-B: Elapsed-span clock drift (FPS-independent)
+        val rateRatio = computeRateRatio(effectiveS1, effectiveS2)
+        
+        return OffsetResult(median, diffs.size, rateRatio, stdMs)
     }
     
     /**
-     * P2-B: Simple linear regression to estimate rate ratio between two clock streams.
-     * Given pairs of (t1, t2), fits t2 = a*t1 + b.
-     * Returns a (rate ratio, should be ~1.0; >1.0 means stream2 clock is faster).
+     * P2-B: Measure clock drift by comparing elapsed time spans.
+     *
+     * Previous approach (linear regression on paired timestamps) was incorrect:
+     * it measured FPS ratio, not clock drift, because nearest-neighbor pairing
+     * of streams with different FPS creates a biased slope (30fps/25fps ≈ 1.2).
+     *
+     * Correct approach: if both cameras use the same clock, the total elapsed
+     * time span of each stream should be nearly identical regardless of FPS.
+     * rateRatio = span_s2 / span_s1 → should be ~1.0 for shared clocks.
+     *
+     * @param stream1 Timestamps from stream 1 (face), already warmup-stripped
+     * @param stream2 Timestamps from stream 2 (finger), already warmup-stripped
+     * @return rate ratio (≈1.0 for shared clock; >>1.0 for different clock domains)
      */
-    private fun computeRateRatio(pairs: List<Pair<Long, Long>>): Double {
-        if (pairs.size < 3) return 1.0
+    private fun computeRateRatio(stream1: List<Long>, stream2: List<Long>): Double {
+        if (stream1.size < 5 || stream2.size < 5) return 1.0
         
-        // Normalize timestamps to avoid precision loss
-        val t1Base = pairs.first().first
-        val t2Base = pairs.first().second
+        val span1 = (stream1.last() - stream1.first()).toDouble()
+        val span2 = (stream2.last() - stream2.first()).toDouble()
         
-        val xs = pairs.map { (it.first - t1Base).toDouble() }
-        val ys = pairs.map { (it.second - t2Base).toDouble() }
+        if (span1 < 1e6 || span2 < 1e6) return 1.0 // Less than 1ms of data
         
-        val n = xs.size.toDouble()
-        val sumX = xs.sum()
-        val sumY = ys.sum()
-        val sumXY = xs.zip(ys) { x, y -> x * y }.sum()
-        val sumX2 = xs.map { it * it }.sum()
+        val ratio = span2 / span1
         
-        val denom = n * sumX2 - sumX * sumX
-        if (denom < 1e-10) return 1.0
-        
-        val a = (n * sumXY - sumX * sumY) / denom
-        
-        // Rate ratio should be very close to 1.0 (same clock)
-        // Log if drift is significant (>100ppm)
-        if (abs(a - 1.0) > 0.0001) {
-            logD("Drift detected: rate ratio = ${"%f".format(a)} (${"%.0f".format((a - 1.0) * 1_000_000)} ppm)")
+        if (abs(ratio - 1.0) > 0.001) { // > 1000ppm
+            logD("Clock drift: spanRatio = ${"%.6f".format(ratio)} " +
+                 "(${"%.0f".format((ratio - 1.0) * 1_000_000)} ppm) " +
+                 "span1=${"%.1f".format(span1 / 1e9)}s span2=${"%.1f".format(span2 / 1e9)}s")
         }
         
-        return a
+        return ratio
     }
 
     /** Compute median inter-frame interval in nanoseconds. */
@@ -513,9 +514,20 @@ data class DriftResult(
     val offsetMs: Double = 0.0,
     val offsetValid: Boolean = true,
     val offsetPairs: Int = 0,
+    val offsetStdMs: Double = 0.0,     // Offset stability (stddev of paired diffs)
     val overlapDurationMs: Double = 0.0,
     val rateRatio: Double = 1.0,       // P2-B: inter-stream clock rate ratio (1.0 = no drift)
     val message: String
+)
+
+/**
+ * Internal result from calculateRobustOffset.
+ */
+data class OffsetResult(
+    val medianMs: Double?,
+    val pairCount: Int,
+    val rateRatio: Double,
+    val stdMs: Double
 )
 
 /**

@@ -111,18 +111,18 @@ object PttEngine {
         )
         
         // R3-C: Photometric SQI (exposure steps + clipping detection)
+        // NOTE: Log-only diagnostic until camera metadata-based step detection is available.
+        // Signal-based step detection confuses PPG heartbeats with exposure steps,
+        // so we don't blend it into confidence — use band-SQI directly.
         val photoSqiFace = PttSqi.computePhotometricSqi(faceRaw)
         val photoSqiFinger = PttSqi.computePhotometricSqi(fingerRaw)
         android.util.Log.i(tag, "PHOTO_SQI | face: score=${photoSqiFace.score} steps=${photoSqiFace.stepCount} clip=${"%.1f".format(photoSqiFace.clipPercent)}% | " +
               "finger: score=${photoSqiFinger.score} steps=${photoSqiFinger.stepCount} clip=${"%.1f".format(photoSqiFinger.clipPercent)}%")
         
-        // Blend photometric SQI into channel SQI (weighted average: 80% band SQI + 20% photometric)
-        val blendedSqiFace = ((sqiFace.sqi * 0.8 + photoSqiFace.score * 0.2).toInt()).coerceIn(0, 100)
-        val blendedSqiFinger = ((sqiFinger.sqi * 0.8 + photoSqiFinger.score * 0.2).toInt()).coerceIn(0, 100)
-        
+        // Use band-SQI directly for confidence (not blended with photometric)
         val finalConfidence = PttSqi.computeCombinedConfidence(
-            sqiFace = blendedSqiFace,
-            sqiFinger = blendedSqiFinger,
+            sqiFace = sqiFace.sqi,
+            sqiFinger = sqiFinger.sqi,
             corrScore = syncMetrics.correlation,
             peakSharpness = 0.5, // Simplified sharpness
             delayStabilityScore = consensusResult.delayStabilityScore,
@@ -131,7 +131,7 @@ object PttEngine {
         
         android.util.Log.d(tag, "Confidence: ${"%.2f".format(finalConfidence)} (Corr=${"%.2f".format(syncMetrics.correlation)}, " +
               "Stability=${"%.2f".format(consensusResult.delayStabilityScore)}, " +
-              "SQI=face:$blendedSqiFace/finger:$blendedSqiFinger)")
+              "SQI=face:${sqiFace.sqi}/finger:${sqiFinger.sqi})")
         
         // 6. Determine if PTT should be reported
         val shouldReport = PttSqi.shouldReportPtt(finalConfidence)
@@ -154,8 +154,8 @@ object PttEngine {
             confidence = finalConfidence,
             hrFaceBpm = hrFace.hrBpm,
             hrFingerBpm = hrFinger.hrBpm,
-            sqiFace = blendedSqiFace,
-            sqiFinger = blendedSqiFinger,
+            sqiFace = sqiFace.sqi,
+            sqiFinger = sqiFinger.sqi,
             peakSharpness = 0.5,
             facePeakCount = facePeaks.getPeakCount(),
             fingerPeakCount = fingerPeaks.getPeakCount(),

@@ -109,6 +109,20 @@ Camera2Interop.Extender(builder)
     )
 ```
 
+### Post-Processing Disable
+
+**Source**: [Camera2Configurator.kt](file:///home/ext.siarhei.zhmura/Work/pulse/feature-capture/src/main/java/com/vivopulse/feature/capture/camera/Camera2Configurator.kt)
+
+Vendor post-processing corrupts PPG signal amplitude and timing. All `ImageAnalysis` builders disable:
+
+| Setting | Why Disabled |
+|---|---|
+| `CONTROL_VIDEO_STABILIZATION_MODE_OFF` | EIS introduces temporal smoothing / frame interpolation |
+| `NOISE_REDUCTION_MODE_OFF` | Vendor NR averages out subtle luma pulsations |
+| `EDGE_MODE_OFF` | Sharpening amplifies noise and adds ringing artifacts |
+
+Applied to all 5 `ImageAnalysis.Builder` instances (concurrent front/back, analysis-only front/back, sequential).
+
 > [!IMPORTANT]
 > **Device Variance**: Pixel 8 in concurrent mode can sustain 30fps at 720p with good lighting. In low light, AE extends shutter time → effective FPS drops. The `[25, 30]` floor prevents dropping below PTT quality threshold while allowing some AE flexibility.
 
@@ -142,9 +156,9 @@ Frame(
 )
 ```
 
-### Auto-Exposure & White Balance Lock (Stability-Based)
+### 3A Lock (AE + AWB + AF)
 
-rPPG captures minute luma changes (~0.5–2.0 units on a 0–255 scale). Without AE lock, the camera's auto-exposure adjustments create "staircase" artifacts that are orders of magnitude larger than the pulse signal.
+rPPG captures minute luma changes (~0.5–2.0 units on a 0–255 scale). Without 3A lock, the camera's auto-exposure/focus adjustments create artifacts that are orders of magnitude larger than the pulse signal.
 
 **Lock Strategy** (per camera, independently):
 
@@ -156,7 +170,23 @@ Lock when BOTH conditions met:
   2. Variance < 5.0 (no oscillation)
 
 Hard timeout: 90 frames (~3s) — locks regardless as fallback
+
+On lock, apply via CaptureRequestOptions:
+  AE_LOCK      = true
+  AWB_LOCK     = true
+
+  // Gap C: Conditional AF lock
+  if (supportsManualFocus):
+    AF_MODE      = OFF
+    FOCUS_DIST   = 0.0  (face)    → infinity
+    FOCUS_DIST   = 10.0 (finger)  → near/macro
+  else:
+    AF_MODE      = AUTO           → best-effort one-shot AF
+    AF_TRIGGER   = START
 ```
+
+> [!NOTE]
+> **Gap C — Focus Capability Detection**: `DeviceProbe.checkManualFocusSupport()` queries `LENS_INFO_MINIMUM_FOCUS_DISTANCE` for the back camera. If the device reports 0 or null (fixed-focus), the controller falls back to `AF_MODE_AUTO` with a trigger. This prevents crashes on devices that ignore manual focus distance.
 
 ```kotlin
 // Stability-based AE lock (replaces fixed 30-frame threshold)
@@ -174,8 +204,81 @@ private fun shouldLockExposure(samples: ArrayDeque<Float>): AeLockResult {
 // Hard timeout: 90 frames → TIMEOUT (locks but marks exposureSettled=false)
 ```
 
+### P0-A Hardening: AE Lock Gate
+Frames are **dropped** from the processing pipeline until AE is both **LOCKED** (via stability or timeout) and **SETTLED** (via stability).
+- If AE converges: `exposureSettled=true` → signals flow to PTT.
+- If AE times out (3s): `exposureSettled=false` → signals are **permanently blocked**.
+
 > [!NOTE]
-> **Audit risk [#3] — MITIGATED**: Frame-count trigger replaced with luma stability detection. Lock now triggers only when the signal has actually converged, with a 3-second hard timeout as safety net. **Timeout-forced locks are tracked** via `exposureSettled=false` and logged as `AE_TIMEOUT_DIAG`.
+> **Audit risk [#3] — MITIGATED**: Frame-count trigger replaced with luma stability detection. Lock now triggers only when the signal has actually converged. **Hard Prerequisite**: PTT analysis does not start until lock is confirmed. If timeout occurs, the session is effectively blocked to prevent garbage-in-garbage-out.
+
+### AE Diagnostics
+`AE_DIAG` log line tracks per-frame metadata (exposure time, sensitivity, clipping):
+```
+AE_DIAG | FINGER | state=CONVERGED | exp=33000000ns | iso=150 | meanY=50.2
+```
+
+### Finger-Cover Detection
+
+The finger camera requires the user's fingertip to fully occlude the lens. Detection uses ROI variance and luma threshold:
+```
+isCovered = (fingerLuma > 30) AND (roiVariance < 800)
+```
+- `luma > 30`: torch illuminates through the fingertip (too low = uncovered/dark).
+- `variance < 800`: covered finger produces a spatially uniform image.
+- If not covered → status banner: **"Cover lens fully with your fingertip"**.
+
+### Clipping Feedback
+
+Signal clipping (pixels < 5 or > 250) degrades PPG waveform fidelity. When `clippingPct > 10%`, directional feedback helps the user correct:
+
+| Dominant Direction | Feedback |
+|---|---|
+| Saturation (>5% pixels ≥ 250) | **"Too bright — reduce pressure slightly"** |
+| Underexposure dominant | **"Too dark — press fingertip firmly"** |
+
+### 3-State Status Banner
+
+User-facing feedback tracks the capture state progression:
+
+| State | Banner Message |
+|---|---|
+| Camera started, waiting for finger | "Searching — Place finger on lens" |
+| AE calibrating | "Stabilizing..." |
+| AE locked via timeout (not settled) | "Unstable light — try adjusting position" |
+| AE locked + settled | Banner cleared → measurement in progress |
+
+### Post-Lock AE Drift Monitoring (Gap A)
+
+Some devices silently unlock or drift under torch/thermal changes. After 3A lock, `DualCameraController` continuously monitors `EV = ln(exposureTime × ISO)` via a 30-frame rolling window (~1s):
+
+```
+drift = (max(EV_window) - min(EV_window)) / |mean(EV_window)|
+if drift > 2%:
+  → mark camera as drifted → block PTT → "Unstable light"
+```
+
+### Metadata-Based Photometric Gate (Gap B)
+
+Exposure "steps" (AE unlocking, finger pressure changes) are detected via frame-to-frame EV comparison — this replaces signal-based SQI for exposure step detection:
+
+```
+stepPct = |EV_current - EV_previous| / |EV_previous|
+if stepPct > 3% OR clippingPct > 15%:
+  → PTT hard-off → "Brightness changed — restarting..."
+```
+
+This is critical because signal-based step detection confuses pulse periodicity with exposure step artifacts.
+
+### GoodSync Progress (Gap F)
+
+A `goodSyncSeconds: StateFlow<Double>` tracks accumulated stable capture time. Stable frames require:
+- AE locked + settled + no drift
+- No exposure step detected
+- Clipping ≤ 15%
+- IMU RMS < 0.1 G
+
+Any instability resets the counter to 0. A companion `goodSyncBlocker: StateFlow<String?>` identifies the current blocking reason ("Finger exposure", "Lighting", "Motion", etc.) for UX display.
 
 ### Timestamp Clock Domain
 
@@ -227,16 +330,18 @@ for each camera frame:
 This stage computes sync quality metrics and estimates inter-stream clock rate ratio for drift compensation.
 
 > [!NOTE]
-> **Audit risk [#6] — MITIGATED**: Linear regression now fits `t2 ≈ a×t1 + b` through paired timestamps to estimate rate ratio. The `rateRatio` field is stored in `DriftResult` for downstream use. Drift >100ppm is logged.
+> **Audit risk [#6] — MITIGATED**: Elapsed-span comparison (`span₂/span₁`) now measures true clock drift (FPS-independent). Previous per-frame regression measured FPS ratio, not drift. The `rateRatio` and `offsetStdMs` fields are stored in `DriftResult` for downstream gating. Offset stability (stddev of paired diffs) prevents unstable timestamps from passing.
 
 ### Metrics Computed
 
 | Metric | Formula | Gate Threshold |
 |---|---|---|
-| **Effective FPS** | `(N-1) / duration_s` | <25 Hz → `LOW_FPS` |
+| **Effective FPS** | `(N-1) / duration_s` | <20 Hz → `LOW_FPS` hard-off; 20-25 Hz → experimental |
 | **Jitter** | `MAD(inter_frame_dt)` from median | >5 ms → `HIGH_JITTER` |
 | **Drop Rate** | `count(dt > 1.5 × median_dt) / total` | >10% → `HIGH_DROPS` |
 | **Offset** | Median of paired (t2 - t1) | `offsetValid=false` → `INVALID_OFFSET` |
+| **Offset Stability** | `stddev(paired diffs)` | >5 ms → `OFFSET_UNSTABLE` |
+| **Clock Drift** | `span₂/span₁` (elapsed time ratio) | >2000ppm → `CLOCK_DRIFT` |
 
 ### Robust Offset Estimation
 
@@ -260,9 +365,15 @@ The offset between camera streams is estimated by pairing individual frame times
 
 4. MEDIAN: Take median of all paired differences → robust to outliers
 
-5. RATE RATIO: Linear regression through pairs → t2 = a×t1 + b
-   - a ≈ 1.0 for shared clock; >100ppm logged as significant drift
-   - Stored in DriftResult.rateRatio for downstream compensation
+5. OFFSET STABILITY: stddev of all paired differences
+   - Low stddev (<5ms) = stable timestamps
+   - High stddev (>5ms) = OFFSET_UNSTABLE gate
+
+6. RATE RATIO: Elapsed-span comparison (FPS-independent)
+   - rateRatio = span_s2 / span_s1
+   - If cameras share the same clock, both record equal wall time → ratio ≈ 1.0
+   - Previous approach (regression on paired timestamps) incorrectly measured FPS ratio
+   - Stored in DriftResult.rateRatio for downstream clock-domain gating
 ```
 
 ---
@@ -318,9 +429,25 @@ zeroMean  = signal - mean(signal)             // Remove DC offset
 detrended = detrendIIR(zeroMean, cutoff=0.5Hz) // IIR high-pass removes respiratory drift
 ```
 
-### 5b. Zero-Phase Bandpass Filtering (`filtfilt`)
+### 5b. Step-Span Exclusion (Gap E)
+
+Pressure slips and residual AE steps cause baseline change-points that ring severely after bandpass filtering. `ChangePointDetector` detects and repairs these before bandpass:
+
 ```
-filtered = filtfilt(detrended, pad=min(150, n-1)) {
+lowPassed  = movingAverage(detrended, window ≈ sampleRate/0.3)
+diffs      = firstDifferences(lowPassed)
+zscores    = (diffs - mean(diffs)) / std(diffs)
+changePoints = indices where |zscore| > 2.0 (merged within 0.5s)
+
+for each changePoint:
+    interpolate ±0.5s span with linear ramp
+```
+
+**Source**: [ChangePointDetector.kt](file:///home/ext.siarhei.zhmura/Work/pulse/feature-processing/src/main/java/com/vivopulse/feature/processing/signal/ChangePointDetector.kt)
+
+### 5c. Zero-Phase Bandpass Filtering (`filtfilt`)
+```
+filtered = filtfilt(stepCleaned, pad=min(150, n-1)) {
     butterworthBandpass(signal, fLow=0.7Hz, fHigh=4.0Hz, order=4)
 }
 ```
@@ -334,7 +461,7 @@ filtered = filtfilt(detrended, pad=min(150, n-1)) {
 
 **`filtfilt`** = forward-backward filtering → **zero phase distortion**. This is critical: any filter phase shift would directly corrupt PTT timing.
 
-### 5c. Wavelet Denoising (conditional)
+### 5d. Wavelet Denoising (conditional)
 ```
 if SQI ∈ [40, 80]:  // Moderate quality only
     cleaned  = WaveletDenoiser.denoise(detrended, levels=4)
@@ -342,7 +469,7 @@ if SQI ∈ [40, 80]:  // Moderate quality only
 ```
 Not applied to high-quality (unnecessary) or low-quality (too noisy) signals.
 
-### 5d. Z-Score Normalization
+### 5e. Z-Score Normalization
 ```
 normalized = (signal - mean) / std
 ```
@@ -430,14 +557,32 @@ PTT is **strictly blocked** (`effectivePtt = null`) if any condition fails. All 
 | Condition | Threshold | Gate Name |
 |---|---|---|
 | Offset invalid | `!offsetValid` | `INVALID_OFFSET` |
-| FPS too low | `min(fps1, fps2) < 25` | `LOW_FPS` |
+| FPS too low | `min(fps1, fps2) < 20` | `LOW_FPS` |
+| FPS experimental | `min(fps1, fps2) ∈ [20, 25)` | *(logged, not gated — xcorr/phase only)* |
 | Jitter too high | `MAD(dt) > 5ms` (either) | `HIGH_JITTER` |
 | Drops too many | `dropRate > 0.10` (either) | `HIGH_DROPS` |
 | All motion | windowed RMS > threshold | `ALL_MOTION` |
-| Clock drift | `|rateRatio - 1.0| > 100ppm` | `CLOCK_DRIFT` |
+| Clock drift | `\|rateRatio - 1.0\| > 2000ppm` | `CLOCK_DRIFT` |
+| Offset unstable | `offsetStdMs > max(5ms, 0.25*maxDt)` | `OFFSET_UNSTABLE` |
+
+**FPS Gate Tiers:**
+
+| FPS Range | PTT Mode | Foot Detection | Notes |
+|---|---|---|---|
+| < 20 fps | **Off** (`LOW_FPS`) | ❌ | Beat timing too quantized |
+| 20–25 fps | Experimental (xcorr/phase only) | ❌ | Longer windows, stricter stability required |
+| ≥ 25 fps | Full (scientific mode) | ✅ | All methods available |
+
+**Clock Drift Tiers:**
+
+| Drift (ppm) | Action |
+|---|---|
+| ≤ 500 | OK — normal shared-clock jitter |
+| 500 – 2000 | Warning logged, PTT allowed with caution |
+| > 2000 | `CLOCK_DRIFT` — PTT hard-off (different clock domains) |
 
 > [!NOTE]
-> **Audit risk [#10a] — MITIGATED**: Gate is now a **bitmask** — all failing gates are collected and logged together (e.g., `"PTT gated: primary=LOW_FPS, all=LOW_FPS|HIGH_JITTER"`). New gates: `ALL_MOTION` (windowed motion scoring) and `CLOCK_DRIFT` (non-shared clock detection at >100ppm).
+> **Audit risk [#10a] — MITIGATED**: Gate is now a **bitmask** — all failing gates are collected and logged together (e.g., `"PTT gated: primary=LOW_FPS, all=LOW_FPS|HIGH_JITTER"`). Gates include: `ALL_MOTION`, `CLOCK_DRIFT` (tiered, >2000ppm), `OFFSET_UNSTABLE` (stddev>5ms). Clock drift now uses elapsed-span ratio (FPS-independent) instead of per-frame regression.
 
 ### Layer B: Signal Quality Gate
 
@@ -452,6 +597,15 @@ Regularity (0–30): 100 × (1 - CV(RR)) × 0.3
 ```
 SNR uses **raw (unfiltered)** signal intentionally — prevents false confidence when filtering masks poor quality.
 
+**Photometric SQI** (log-only diagnostic, not blended into confidence):
+```
+Computed per channel: step detection (6×MAD threshold) + clipping %
+Logged as: PHOTO_SQI | face: score=XX steps=YY clip=ZZ% | finger: ...
+Not used in confidence formula — signal-based step detection confuses
+PPG heartbeats with exposure steps. Will be replaced with camera
+metadata-based detection (exposureTime × ISO) in future.
+```
+
 **Combined Confidence (0.0–1.0)**:
 ```
 confidence = (min(SQI_face, SQI_finger) / 100)
@@ -459,6 +613,8 @@ confidence = (min(SQI_face, SQI_finger) / 100)
            × min(1.0, peakSharpness / 0.2)
            × agreementScore
 ```
+> [!IMPORTANT]
+> PHOTO_SQI is **deliberately excluded** from the confidence multiplication chain. When signal-based, it can misclassify normal PPG systolic slopes as exposure steps, zeroing out confidence. Band-SQI (SNR + regularity) is used directly.
 
 ---
 
@@ -466,9 +622,16 @@ confidence = (min(SQI_face, SQI_finger) / 100)
 
 ### SESSION_SUMMARY Log (one per process() call)
 ```
-SESSION_SUMMARY | fps=29.8/28.5 | jitter=1.2/1.5ms | drops=2%/3%
-               | offset=0.8ms (n=350) | nBeats=58
-               | pttGated=NONE | pttMs=125.3
+SESSION_SUMMARY | fpsFace=29.8 | fpsFinger=28.5 |
+  dropsFace=2% | dropsFinger=3% |
+  jitterFaceMs=1.2 | jitterFingerMs=1.5 |
+  sharedClockLikely=true |
+  rateRatio=1.000012 (12ppm) |
+  offsetMeanMs=0.8 | offsetStdMs=1.2 |
+  bandSqiFace=72 | bandSqiFinger=85 |
+  confidence=0.78 |
+  lagMedianMs=125.3 | nBeats=58 |
+  pttGated=NONE | pttMs=125.3
 ```
 
 ### ProcessedSeries Output
@@ -549,6 +712,39 @@ SESSION_SUMMARY | fps=29.8/28.5 | jitter=1.2/1.5ms | drops=2%/3%
 | **Root Cause** | `ProcessedSeries.rawFaceSignal` and `rawFingerSignal` were not populated in test fixtures |
 | **Fix** | Populated `rawFaceSignal` and `rawFingerSignal` in test `ProcessedSeries` construction |
 | **File** | [PttLiteratureConsistencyTests.kt](file:///home/ext.siarhei.zhmura/Work/pulse/feature-processing/src/test/java/com/vivopulse/feature/processing/tests/PttLiteratureConsistencyTests.kt) |
+---
+
+### Issue 7: PHOTO_SQI False Positives Zero Confidence
+
+| Attribute | Detail |
+|---|---|
+| **Symptom** | `PHOTO_SQI \| face: score=0 steps=153 \| finger: score=0 steps=121` — confidence=0.00, PTT rejected |
+| **Root Cause** | `computePhotometricSqi` used `medianDiff + 3×MAD` threshold on raw intensity diffs → normal PPG systolic slopes classified as "exposure steps" |
+| **Fix** | (a) Raised threshold to 6×MAD with floor; (b) Decoupled PHOTO_SQI from confidence chain — now log-only diagnostic until camera metadata-based detection available |
+| **Files** | [PttSqi.kt](file:///home/ext.siarhei.zhmura/Work/pulse/feature-processing/src/main/java/com/vivopulse/feature/processing/ptt/PttSqi.kt), [PttEngine.kt](file:///home/ext.siarhei.zhmura/Work/pulse/feature-processing/src/main/java/com/vivopulse/feature/processing/ptt/PttEngine.kt) |
+
+---
+
+### Issue 8: `computeRateRatio` Measured FPS Ratio, Not Clock Drift
+
+| Attribute | Detail |
+|---|---|
+| **Symptom** | `CLOCK_DRIFT gate: rateRatio=1.094619 (+94618ppm)` — PTT gated despite shared clock domain |
+| **Root Cause** | Per-frame nearest-neighbor regression paired dense face timestamps (30fps) to sparse finger timestamps (25fps) → slope captured FPS ratio (30/25≈1.2), not clock drift |
+| **Evidence** | `CLOCK_DIAG` logs confirm same clock domain (both streams start at ~282965.9×10⁹ ns); elapsed spans differ only due to different frame counts |
+| **Fix** | Replaced with elapsed-span comparison: `rateRatio = span_s2 / span_s1` (FPS-independent). Added `offsetStdMs` for stability checking. |
+| **File** | [TimestampSync.kt](file:///home/ext.siarhei.zhmura/Work/pulse/feature-processing/src/main/java/com/vivopulse/feature/processing/timestamp/TimestampSync.kt) |
+
+---
+
+### Issue 9: Back-Navigation Crash from Processing Result
+
+| Attribute | Detail |
+|---|---|
+| **Symptom** | `IllegalArgumentException: No destination with route processing_graph` on back button from `ResultScreen` |
+| **Root Cause** | `CaptureScreen` navigated to `Route.Processing.path` instead of `PROCESSING_GRAPH_ROUTE` → nested graph not on backstack |
+| **Fix** | (a) Changed navigation target to `PROCESSING_GRAPH_ROUTE`; (b) Added try-catch fallback in `ResultScreen` |
+| **Files** | [VivoPulseNavHost.kt](file:///home/ext.siarhei.zhmura/Work/pulse/app/src/main/java/com/vivopulse/app/navigation/VivoPulseNavHost.kt), [ResultScreen.kt](file:///home/ext.siarhei.zhmura/Work/pulse/app/src/main/java/com/vivopulse/app/ui/screens/ResultScreen.kt) |
 
 ---
 
@@ -561,9 +757,10 @@ SESSION_SUMMARY | fps=29.8/28.5 | jitter=1.2/1.5ms | drops=2%/3%
 | **PPG** | Photoplethysmography — pulse detection via light transmission (contact) |
 | **SQI** | Signal Quality Index (0–100): SNR (0–70) + regularity (0–30) |
 | **Confidence** | Combined metric (0.0–1.0): `min(SQI) × corrScore × sharpness × agreement` |
-| **FPS Gate** | Hard threshold at 25Hz — below this, interpolation dominates and PTT is unreliable |
+| **FPS Gate** | Tiered: <20Hz hard-off, 20-25Hz experimental (xcorr only), ≥25Hz full PTT |
 | **AE Lock** | Camera2 `CONTROL_AE_LOCK=true` — freezes exposure to prevent staircase artifacts |
 | **`filtfilt`** | Forward-backward (zero-phase) filtering — eliminates phase shift in bandpass |
 | **Foot** | Diastolic minimum (onset) of the pressure waveform — primary PTT reference point |
 | **Monotonic cursor** | Pairing strategy where the cursor only advances forward → prevents temporal violations |
 | **`pttCapable`** | Runtime flag — `true` if camera FPS supports PTT quality (≥25Hz) |
+| **PHOTO_SQI** | Photometric quality metric — log-only diagnostic, not in confidence chain |

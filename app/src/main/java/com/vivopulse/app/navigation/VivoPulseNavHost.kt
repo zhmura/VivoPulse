@@ -28,7 +28,7 @@ fun VivoPulseNavHost(
         composable(Route.Capture.path) {
             CaptureScreen(
                 onNavigateToProcessing = {
-                    navController.navigate(Route.Processing.path)
+                    navController.navigate(PROCESSING_GRAPH_ROUTE)
                 }
             )
         }

@@ -8,6 +8,7 @@ import android.hardware.camera2.CameraMetadata
 import android.os.Build
 import android.util.Log
 import android.util.Size
+import com.vivopulse.signal.PulseLog
 import com.vivopulse.signal.AppLogger
 
 /**
@@ -34,6 +35,7 @@ data class DeviceCapabilities(
     val supportsAntiFlicker: Boolean,
     val supportsAeLock: Boolean,
     val supportsAwbLock: Boolean,
+    val supportsManualFocus: Boolean,  // Gap C: back camera supports manual focus distance
     val concurrentPair: Pair<String, String>?,
     val deviceInfo: String
 )
@@ -51,7 +53,7 @@ data class DeviceCapabilities(
  * - Drive the `CameraBindingHelper` fallback logic with precise capability flags.
  */
 class DeviceProbe(private val context: Context) {
-    private val tag = "DeviceProbe"
+    private val tag = PulseLog.HW
     private val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
     
     /**
@@ -75,13 +77,16 @@ class DeviceProbe(private val context: Context) {
         // Check 3A capabilities
         val (antiFlicker, aeLock, awbLock) = check3ACapabilities(frontId, backId)
         
+        // Gap C: Check manual focus support on back camera
+        val manualFocus = checkManualFocusSupport(backId)
+        
         // Recommend mode and pair
         val (mode, pair) = recommendMode(hasConcurrent, concurrentIds, frontId, backId)
         
         val deviceInfo = "${Build.MANUFACTURER} ${Build.MODEL} (API ${Build.VERSION.SDK_INT})"
         
         Log.i(tag, "Device probe complete: $deviceInfo")
-        Log.i(tag, "Concurrent support: $hasConcurrent, Recommended mode: $mode")
+        Log.i(tag, "Concurrent support: $hasConcurrent, Recommended mode: $mode, ManualFocus: $manualFocus")
         if (pair != null) {
             Log.i(tag, "Concurrent pair found: ${pair.first} + ${pair.second}")
         }
@@ -97,6 +102,7 @@ class DeviceProbe(private val context: Context) {
             supportsAntiFlicker = antiFlicker,
             supportsAeLock = aeLock,
             supportsAwbLock = awbLock,
+            supportsManualFocus = manualFocus,
             concurrentPair = pair,
             deviceInfo = deviceInfo
         )
@@ -210,6 +216,24 @@ class DeviceProbe(private val context: Context) {
         }
         
         return Triple(antiFlicker, aeLock, awbLock)
+    }
+
+    /**
+     * Gap C: Check if back camera supports manual focus distance control.
+     * Returns true if LENS_INFO_MINIMUM_FOCUS_DISTANCE > 0 (fixed-focus returns 0 or null).
+     */
+    private fun checkManualFocusSupport(backId: String?): Boolean {
+        if (backId == null) return false
+        return try {
+            val chars = cameraManager.getCameraCharacteristics(backId)
+            val minFocusDist = chars.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE)
+            val supported = minFocusDist != null && minFocusDist > 0.0f
+            Log.i(tag, "Manual focus check (back=$backId): minFocusDist=$minFocusDist, supported=$supported")
+            supported
+        } catch (e: Exception) {
+            Log.e(tag, "Error checking manual focus support", e)
+            false
+        }
     }
     
     /**
