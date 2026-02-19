@@ -703,6 +703,7 @@ class DualCameraController(
 
             var faceLuma: Double? = null
             var fingerLuma: Double? = null
+            var fingerVChannel: Double? = null // For signal (Red-difference)
             var faceRgb: RgbData? = null
             var fingerRgb: RgbData? = null
             var faceMotionRms: Double? = null
@@ -765,6 +766,9 @@ class DualCameraController(
 
                     // P0-B: Use luma-only for finger PPG (red dominates with torch)
                     fingerLuma = RgbExtractor.extractAverageLuma(imageProxy, roi)
+                    // V-Channel optimization (from drift): cleaner red signal
+                    fingerVChannel = RgbExtractor.extractAverageVChannel(imageProxy, roi)
+                    
                     // Full RGB only for recording/debug (not every frame)
                     if (isRecording || backFpsTracker.totalFrames % 30 == 0) {
                         fingerRgb = RgbExtractor.extractAverageRgb(imageProxy, roi)
@@ -779,7 +783,7 @@ class DualCameraController(
                     clippingPct = computeClippingPct(clipBuffer, roi, rowStride)
                     
                     // Directional clipping feedback
-                    if (clippingPct!! > 0.1 && fingerFrameCounter % 30 == 0) {
+                    if (clippingPct > 0.1 && fingerFrameCounter % 30 == 0) {
                          // Determine dominant clipping direction
                          val highClipBuffer = yPlane.buffer.duplicate().apply { position(0) }
                          val highPct = computeSaturationPct(highClipBuffer, roi, rowStride) // pixels >= 250
@@ -798,9 +802,10 @@ class DualCameraController(
                         _statusBanner.value = "Cover lens fully with your fingertip"
                     }
 
-                    fingerLuma?.let { 
+                    // Use V-Channel for signal if available, else Luma
+                    (fingerVChannel ?: fingerLuma)?.let { 
                         _fingerWave.tryEmit(it)
-                        Log.v(tag, "Finger luma: $it")
+                        Log.v(tag, "Finger signal (V): $it")
                     }
                 } catch (e: Exception) {
                     Log.e(tag, "Error processing finger channel", e)
@@ -893,21 +898,21 @@ class DualCameraController(
             
             // Check for AE Lock (stability-based, P0-A)
             if (source == Source.FACE && !frontExposureLocked) {
-                val result = shouldLockExposure(faceLuma, frontFpsTracker, frontLumaSamples)
-                if (result != AeLockResult.NOT_READY) {
+                val lockResult = shouldLockExposure(faceLuma, frontFpsTracker, frontLumaSamples)
+                if (lockResult != AeLockResult.NOT_READY) {
                     lockExposure(Source.FACE)
                     frontExposureLocked = true
-                    frontExposureSettled = (result == AeLockResult.SETTLED)
+                    frontExposureSettled = (lockResult == AeLockResult.SETTLED)
                     if (!frontExposureSettled) {
                         Log.w(PulseLog.FRAME, "AE_TIMEOUT_DIAG | Face exposure locked via TIMEOUT — SNR may be degraded")
                     }
                 }
             } else if (source == Source.FINGER && !backExposureLocked) {
-                val result = shouldLockExposure(fingerLuma, backFpsTracker, backLumaSamples)
-                if (result != AeLockResult.NOT_READY) {
+                val lockResult = shouldLockExposure(fingerLuma, backFpsTracker, backLumaSamples)
+                if (lockResult != AeLockResult.NOT_READY) {
                     lockExposure(Source.FINGER)
                     backExposureLocked = true
-                    backExposureSettled = (result == AeLockResult.SETTLED)
+                    backExposureSettled = (lockResult == AeLockResult.SETTLED)
                     if (!backExposureSettled) {
                         Log.w(PulseLog.FRAME, "AE_TIMEOUT_DIAG | Finger exposure locked via TIMEOUT — SNR may be degraded")
                     }
@@ -969,7 +974,7 @@ class DualCameraController(
                     !frontAeDrifted && !backAeDrifted &&
                     !fingerExposureStepDetected &&
                     (clippingPct ?: 0.0) <= CLIPPING_HARD_GATE_PCT &&
-                    (imuRmsG ?: 0.0) < 0.1
+                    imuRmsG < 0.1
 
                 if (isStable) {
                     stableFrameCount++
@@ -983,7 +988,7 @@ class DualCameraController(
                         backAeDrifted || frontAeDrifted -> "Lighting"
                         fingerExposureStepDetected -> "Brightness change"
                         (clippingPct ?: 0.0) > CLIPPING_HARD_GATE_PCT -> "Clipping"
-                        (imuRmsG ?: 0.0) >= 0.1 -> "Motion"
+                        imuRmsG >= 0.1 -> "Motion"
                         else -> "Stabilizing"
                     }
                 }
@@ -1037,7 +1042,7 @@ class DualCameraController(
                 SignalSample(
                     timestampNs = image.timestamp,
                     faceMeanLuma = faceLuma,
-                    fingerMeanLuma = fingerLuma,
+                    fingerMeanLuma = fingerVChannel ?: fingerLuma, // Use V-Channel for signal
                     faceRgb = faceRgb?.let { RgbSample(it.r, it.g, it.b) },
                     fingerRgb = fingerRgb?.let { RgbSample(it.r, it.g, it.b) },
                     faceMotionRmsPx = faceMotionRms,
@@ -1088,6 +1093,11 @@ class DualCameraController(
         }
         frontFpsTracker.reset()
         backFpsTracker.reset()
+        
+        // Fix 2: Reset GoodSync counter per recording session (was accumulating across camera lifecycle)
+        stableFrameCount = 0
+        _goodSyncSeconds.value = 0.0
+        _goodSyncBlocker.value = "Stabilizing"
         
         recordingStartTime = System.currentTimeMillis()
         isRecording = true

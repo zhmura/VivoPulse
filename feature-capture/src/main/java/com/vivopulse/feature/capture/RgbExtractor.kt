@@ -224,4 +224,51 @@ object RgbExtractor {
 
         return if (count > 0) sumG / count else null
     }
+
+    /**
+     * V-channel (Cr) extraction — approximates Red chrominance.
+     * 
+     * Highly effective for Finger PPG under white flash (Red-dominated).
+     * Faster than GreenProxy (no linear combination) and much faster than RGB.
+     * Returns 0-255 range (128 is neutral). High values = Red.
+     */
+    fun extractAverageVChannel(image: ImageProxy, roi: Rect): Double? {
+        val width = image.width
+        val height = image.height
+
+        val constrained = Rect(
+            max(0, roi.left),
+            max(0, roi.top),
+            min(width, roi.right),
+            min(height, roi.bottom)
+        )
+        if (constrained.isEmpty) return null
+
+        val vPlane = image.planes[2]
+        val vBuffer = vPlane.buffer
+        val uvRowStride = vPlane.rowStride
+        val uvPixelStride = vPlane.pixelStride
+
+        var sumV = 0L
+        var count = 0
+
+        // Step by 2 for spatial subsampling (matches chroma subsampling 4:2:0)
+        for (y in constrained.top until constrained.bottom step 2) {
+            for (x in constrained.left until constrained.right step 2) {
+                
+                val uvX = x / 2
+                val uvY = y / 2
+                val uvIndex = uvY * uvRowStride + (uvX * uvPixelStride)
+
+                if (uvIndex < vBuffer.limit()) {
+                    // Extract raw V (Cr) byte as 0-255 unsigned
+                    val vVal = vBuffer.get(uvIndex).toInt() and 0xFF
+                    sumV += vVal
+                    count++
+                }
+            }
+        }
+
+        return if (count > 0) sumV.toDouble() / count else null
+    }
 }

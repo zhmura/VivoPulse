@@ -50,10 +50,10 @@ class SignalPipelineIntegrationTest {
         assertTrue("Result should be valid", result.isValid)
         assertEquals("Sample rate should be 100 Hz", 100.0, result.sampleRateHz, 0.1)
         
-        // Check that we have approximately 10 seconds of data at 100 Hz = ~1000 samples
-        val expectedSamples = 1000
-        assertTrue("Should have ~1000 samples, got ${result.timeMillis.size}", 
-            result.timeMillis.size in (expectedSamples - 100)..(expectedSamples + 100))
+        // After 2s warm-up trim: ~8 seconds of data at 100 Hz = ~800 samples
+        val expectedSamples = 800
+        assertTrue("Should have ~800 samples (after 2s trim), got ${result.timeMillis.size}", 
+            result.timeMillis.size in (expectedSamples - 150)..(expectedSamples + 150))
         
         // Check signal is valid (non-zero, normalized)
         assertTrue("Face signal should not be empty", result.faceSignal.isNotEmpty())

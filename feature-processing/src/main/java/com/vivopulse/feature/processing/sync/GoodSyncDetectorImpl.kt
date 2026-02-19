@@ -2,6 +2,15 @@ package com.vivopulse.feature.processing.sync
 
 import kotlin.math.min
 
+/**
+ * @deprecated This class uses hardcoded placeholder ROI stats (faceMotionRmsPx=0.1, snrDbFace=10.0, etc.)
+ * which makes the detector effectively ignore real-world noise, motion, and saturation.
+ * Use [GoodSyncDetector.detectSessionSegments] instead, which computes real SQI from the signal.
+ */
+@Deprecated(
+    message = "Uses hardcoded ROI stats. Use GoodSyncDetector.detectSessionSegments() instead.",
+    level = DeprecationLevel.WARNING
+)
 class GoodSyncDetectorImpl : GoodSyncDetector() {
 
     /**

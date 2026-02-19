@@ -13,6 +13,7 @@ import com.vivopulse.feature.processing.motion.StepNotchFilter
 import com.vivopulse.signal.HarmonicFeatureExtractor
 import com.vivopulse.signal.PosExtractor
 import com.vivopulse.signal.ProcessedSignal
+import com.vivopulse.feature.processing.signal.SnrEstimator
 
 /**
  * Signal processing pipeline for dual camera PPG signals.
@@ -37,6 +38,16 @@ class SignalPipeline(
 ) {
     private val tag = PulseLog.PIPELINE
     private val imuAnalyzer = ImuMotionAnalyzer()
+    private val snrEstimator = SnrEstimator()
+    
+    companion object {
+        // P1: Spectral SNR thresholds (dB).
+        // Ojas rule: Peak > 2× Noise ≈ 6dB power. Conservative thresholds:
+        //   Face:   3 dB (weaker signal, ambient light)
+        //   Finger: 6 dB (stronger signal, torch illumination)
+        const val FACE_SNR_GATE_DB = 3.0
+        const val FINGER_SNR_GATE_DB = 6.0
+    }
     
     /**
      * Result of motion rejection with optional PTT gate.
@@ -46,6 +57,47 @@ class SignalPipeline(
         val pttGate: String? = null  // null = OK, "ALL_MOTION" = all frames exceeded threshold
     )
     
+    /**
+     * Trim warm-up transient: discard the first [warmUpNs] nanoseconds of each stream.
+     * Each stream is trimmed from its own start time independently (they may start at different times).
+     * This prevents AE settling ramps and ISP stabilization artifacts from entering the pipeline.
+     */
+    private fun trimWarmUp(rawBuffer: RawSeriesBuffer, warmUpNs: Long): RawSeriesBuffer {
+        if (warmUpNs <= 0) return rawBuffer
+
+        // Safety: skip trim if recording is too short (< 5s) to avoid removing meaningful data
+        val faceDurationNs = if (rawBuffer.faceData.size >= 2)
+            rawBuffer.faceData.last().timestampNs - rawBuffer.faceData.first().timestampNs else 0L
+        val fingerDurationNs = if (rawBuffer.fingerData.size >= 2)
+            rawBuffer.fingerData.last().timestampNs - rawBuffer.fingerData.first().timestampNs else 0L
+        val minDurationNs = minOf(faceDurationNs, fingerDurationNs)
+        
+        if (minDurationNs < 5_000_000_000L) { // < 5 seconds
+            Log.d(tag, "WARMUP_TRIM | skipped (recording too short: ${"%.1f".format(minDurationNs / 1e9)}s)")
+            return rawBuffer
+        }
+
+        fun <T> trimByTimestamp(data: List<T>?, extractTs: (T) -> Long, cutoffNs: Long): List<T>? {
+            if (data.isNullOrEmpty()) return data
+            return data.filter { extractTs(it) >= cutoffNs }
+        }
+
+        // Calculate cutoff timestamps per stream (independent start times)
+        val faceCutoff = rawBuffer.faceData.firstOrNull()?.timestampNs?.plus(warmUpNs) ?: 0L
+        val fingerCutoff = rawBuffer.fingerData.firstOrNull()?.timestampNs?.plus(warmUpNs) ?: 0L
+
+        return RawSeriesBuffer(
+            faceData = rawBuffer.faceData.filter { it.timestampNs >= faceCutoff },
+            fingerData = rawBuffer.fingerData.filter { it.timestampNs >= fingerCutoff },
+            faceRgb = trimByTimestamp(rawBuffer.faceRgb, { it.first }, faceCutoff),
+            fingerRgb = trimByTimestamp(rawBuffer.fingerRgb, { it.first }, fingerCutoff),
+            faceMotion = trimByTimestamp(rawBuffer.faceMotion, { it.timestampNs }, faceCutoff),
+            fingerSaturation = trimByTimestamp(rawBuffer.fingerSaturation, { it.timestampNs }, fingerCutoff),
+            imuRms = rawBuffer.imuRms, // IMU is global, keep all
+            faceRoi = trimByTimestamp(rawBuffer.faceRoi, { it.first }, faceCutoff)
+        )
+    }
+
     /**
      * Filter out high-motion frames based on IMU RMS threshold.
      * 
@@ -126,8 +178,16 @@ class SignalPipeline(
     ): ProcessedSeries {
         Log.d(tag, "Starting pipeline process. Raw buffer size: ${rawBuffer.faceData.size} (face), ${rawBuffer.fingerData.size} (finger)")
         
+        // Fix 1: Trim warm-up transient — discard first ~2 seconds to remove AE settling ramp
+        val warmUpNs = 2_000_000_000L // 2 seconds in nanoseconds
+        val trimmedBuffer = trimWarmUp(rawBuffer, warmUpNs)
+        Log.i(tag, "WARMUP_TRIM | face: ${rawBuffer.faceData.size}->${trimmedBuffer.faceData.size} | " +
+              "finger: ${rawBuffer.fingerData.size}->${trimmedBuffer.fingerData.size} | " +
+              "trimmedFace=${rawBuffer.faceData.size - trimmedBuffer.faceData.size} | " +
+              "trimmedFinger=${rawBuffer.fingerData.size - trimmedBuffer.fingerData.size}")
+        
         // Motion rejection: filter out high-motion frames (P1-A)
-        val motionResult = applyMotionRejection(rawBuffer)
+        val motionResult = applyMotionRejection(trimmedBuffer)
         val filteredBuffer = motionResult.buffer
         val motionGate = motionResult.pttGate
         Log.d(tag, "After motion rejection: ${filteredBuffer.faceData.size} (face), ${filteredBuffer.fingerData.size} (finger)" +
@@ -277,6 +337,15 @@ class SignalPipeline(
         val rawFingerRgbList = rawBuffer.fingerRgb?.let { interpolateRgb(it, resampled.unifiedTimestamps) }
         val fingerResult = processChannel(rawFingerSignal, avgFingerSqi, motionFeatures, rawFingerRgbList)
         
+        // P1: Spectral SNR — compute after bandpass for gating
+        val faceSnrDb = if (faceResult.mainSignal.size >= 64)
+            snrEstimator.computeSnrDb(faceResult.mainSignal, effectiveSampleRateHz)
+        else 0.0
+        val fingerSnrDb = if (fingerResult.mainSignal.size >= 64)
+            snrEstimator.computeSnrDb(fingerResult.mainSignal, effectiveSampleRateHz)
+        else 0.0
+        Log.i(tag, "SPECTRAL_SNR | faceSnrDb=${"%.1f".format(faceSnrDb)} | fingerSnrDb=${"%.1f".format(fingerSnrDb)}")
+        
         val pttOutput = PttEngine.computePtt(
             faceSig = faceResult.mainSignal,
             fingerSig = fingerResult.mainSignal,
@@ -324,6 +393,16 @@ class SignalPipeline(
         if (motionGate != null) failedGates += motionGate
         if (!driftResult.offsetValid) failedGates += "INVALID_OFFSET"
         
+        // P1: Spectral SNR gate — both channels must exceed minimum threshold
+        if (faceSnrDb < FACE_SNR_GATE_DB) {
+            failedGates += "LOW_FACE_SNR"
+            Log.w(tag, "LOW_FACE_SNR gate: ${"%.1f".format(faceSnrDb)}dB < ${FACE_SNR_GATE_DB}dB")
+        }
+        if (fingerSnrDb < FINGER_SNR_GATE_DB) {
+            failedGates += "LOW_FINGER_SNR"
+            Log.w(tag, "LOW_FINGER_SNR gate: ${"%.1f".format(fingerSnrDb)}dB < ${FINGER_SNR_GATE_DB}dB")
+        }
+        
         // FPS gate: <20 = hard off, 20-25 = experimental PTT (xcorr/phase only)
         if (minRate < 20.0) {
             failedGates += "LOW_FPS"
@@ -362,7 +441,7 @@ class SignalPipeline(
         val interval1Ms = if (driftResult.stream1Rate > 0) 1000.0 / driftResult.stream1Rate else 1000.0
         val interval2Ms = if (driftResult.stream2Rate > 0) 1000.0 / driftResult.stream2Rate else 1000.0
         val maxIntervalMs = maxOf(interval1Ms, interval2Ms)
-        val stabilityThresholdMs = maxOf(5.0, 0.25 * maxIntervalMs)
+        val stabilityThresholdMs = maxOf(5.0, 0.50 * maxIntervalMs)
         
         if (driftResult.offsetStdMs > stabilityThresholdMs) {
             failedGates += "OFFSET_UNSTABLE"
@@ -370,6 +449,12 @@ class SignalPipeline(
                   "${"%.1f".format(stabilityThresholdMs)}ms threshold (adaptive)")
         }
         
+        // Fix 3: Extract bandSQI from raw pttOutput BEFORE gate nullification
+        val rawSqiFace = pttOutput.sqiFace
+        val rawSqiFinger = pttOutput.sqiFinger
+        val rawConfidence = pttOutput.confidence
+        val rawNBeats = pttOutput.nBeats
+
         if (failedGates.isNotEmpty()) {
             effectivePtt = null
             effectivePttDenoised = null
@@ -386,17 +471,19 @@ class SignalPipeline(
             "fpsFinger=${"%.1f".format(driftResult.stream2Rate)} | " +
             "dropsFace=${"%.0f".format(driftResult.stream1DropRate*100)}% | " +
             "dropsFinger=${"%.0f".format(driftResult.stream2DropRate*100)}% | " +
-            "jitterFaceMs=${"%.1f".format(driftResult.stream1JitterMs)} | " +
-            "jitterFingerMs=${"%.1f".format(driftResult.stream2JitterMs)} | " +
+            "jitterFaceMs=${"%.2f".format(driftResult.stream1JitterMs)} | " +
+            "jitterFingerMs=${"%.2f".format(driftResult.stream2JitterMs)} | " +
             "sharedClockLikely=$sharedClockLikely | " +
             "rateRatio=${"%.6f".format(driftResult.rateRatio)} (${"%.0f".format(clockDriftPpm)}ppm) | " +
             "offsetMeanMs=${"%.1f".format(driftResult.offsetMs)} | " +
             "offsetStdMs=${"%.1f".format(driftResult.offsetStdMs)} | " +
-            "bandSqiFace=${effectivePtt?.sqiFace ?: -1} | " +
-            "bandSqiFinger=${effectivePtt?.sqiFinger ?: -1} | " +
-            "confidence=${"%.2f".format(effectivePtt?.confidence ?: 0.0)} | " +
+            "bandSqiFace=$rawSqiFace | " +
+            "bandSqiFinger=$rawSqiFinger | " +
+            "faceSnrDb=${"%.1f".format(faceSnrDb)} | " +
+            "fingerSnrDb=${"%.1f".format(fingerSnrDb)} | " +
+            "confidence=${"%.2f".format(rawConfidence)} | " +
             "lagMedianMs=${effectivePtt?.pttMs?.let { "%.1f".format(it) } ?: "null"} | " +
-            "nBeats=${effectivePtt?.nBeats ?: 0} | " +
+            "nBeats=$rawNBeats | " +
             "pttGated=$gateReason | " +
             "pttMs=${effectivePtt?.pttMs?.let { "%.1f".format(it) } ?: "null"}")
         
@@ -426,7 +513,9 @@ class SignalPipeline(
             rawFaceRgb = rawFaceRgbList,
             rawFingerRgb = rawFingerRgbList,
             faceSignalPos = faceResult.posSignal,
-            fingerSignalPos = fingerResult.posSignal
+            fingerSignalPos = fingerResult.posSignal,
+            faceSnrDb = faceSnrDb,
+            fingerSnrDb = fingerSnrDb
         )
     }
 
@@ -589,7 +678,9 @@ data class ProcessedSeries(
     val fingerSignalPos: DoubleArray? = null,
     val rawFaceRgb: List<Triple<Double, Double, Double>>? = null,
     val rawFingerRgb: List<Triple<Double, Double, Double>>? = null,
-    val faceRoi: List<android.graphics.Rect?>? = null
+    val faceRoi: List<android.graphics.Rect?>? = null,
+    val faceSnrDb: Double? = null,
+    val fingerSnrDb: Double? = null
 ) {
     fun getSampleCount(): Int = timeMillis.size
     

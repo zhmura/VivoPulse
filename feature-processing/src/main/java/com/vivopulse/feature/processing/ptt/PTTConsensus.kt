@@ -95,8 +95,22 @@ class PTTConsensus {
             )
         }
         
-        val pttFootMedian = median(beatLags)
-        val pttFootIqr = iqr(beatLags)
+        // IQR-based outlier removal: filter beat lags outside 1.5×IQR
+        // before computing median (prevents stray beat-pairs from biasing PTT)
+        val filtered = if (beatLags.size >= 4) {
+            val sorted = beatLags.sorted()
+            val q1 = sorted[sorted.size / 4]
+            val q3 = sorted[sorted.size * 3 / 4]
+            val iqrVal = q3 - q1
+            val lower = q1 - 1.5 * iqrVal
+            val upper = q3 + 1.5 * iqrVal
+            beatLags.filter { it in lower..upper }.ifEmpty { beatLags }
+        } else {
+            beatLags
+        }
+        
+        val pttFootMedian = median(filtered)
+        val pttFootIqr = iqr(filtered)
         
         val agreement = abs(pttXCorr - pttFootMedian)
         
@@ -107,7 +121,7 @@ class PTTConsensus {
             pttMsMedian = bestPtt,
             pttMsIqr = pttFootIqr,
             methodAgreeMs = agreement,
-            nBeats = beatLags.size
+            nBeats = filtered.size
         )
     }
     

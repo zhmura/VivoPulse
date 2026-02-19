@@ -69,7 +69,7 @@ class SnrEstimator {
         return 10.0 * log10(signalPower / noisePower)
     }
     
-    private fun computeMagnitudeSpectrum(data: DoubleArray): DoubleArray {
+    fun computeMagnitudeSpectrum(data: DoubleArray): DoubleArray {
         val n = data.size
         val spectrum = DoubleArray(n / 2 + 1)
         
