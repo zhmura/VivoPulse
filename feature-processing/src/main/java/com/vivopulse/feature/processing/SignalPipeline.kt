@@ -389,88 +389,91 @@ class SignalPipeline(
         var effectivePttDenoised: PttOutput? = pttDenoised
         var msg = "Processed ${timeMillis.size} samples"
 
-        // Timing Quality Gating (P2-C: collect ALL failing gates as bitmask)
+        // ═══════════════════════════════════════════════════════════════
+        // P0.1: Soft Gating — sigmoid membership → logit-space combination
+        // Instead of binary pass/fail, each gate contributes a continuous
+        // quality score μ ∈ (0,1). Combined in logit space so no single
+        // gate collapses the result to zero.
+        // ═══════════════════════════════════════════════════════════════
         val minRate = minOf(driftResult.stream1Rate, driftResult.stream2Rate)
-        val failedGates = mutableListOf<String>()
-        
-        if (motionGate != null) failedGates += motionGate
-        if (!driftResult.offsetValid) failedGates += "INVALID_OFFSET"
-        
-        // P1: Spectral SNR gate — both channels must exceed minimum threshold
-        if (faceSnrDb < FACE_SNR_GATE_DB) {
-            failedGates += "LOW_FACE_SNR"
-            Log.w(tag, "LOW_FACE_SNR gate: ${"%.1f".format(faceSnrDb)}dB < ${FACE_SNR_GATE_DB}dB")
-        }
-        if (fingerSnrDb < FINGER_SNR_GATE_DB) {
-            failedGates += "LOW_FINGER_SNR"
-            Log.w(tag, "LOW_FINGER_SNR gate: ${"%.1f".format(fingerSnrDb)}dB < ${FINGER_SNR_GATE_DB}dB")
-        }
-        
-        // FPS gate: <20 = hard off, 20-25 = experimental PTT (xcorr/phase only)
-        if (minRate < 20.0) {
-            failedGates += "LOW_FPS"
-        } else if (minRate < 25.0) {
-            // Allow PTT but flag as experimental — footDetection already disabled via resampling
-            Log.i(tag, "FPS_EXPERIMENTAL: minRate=${"%.1f".format(minRate)}fps — PTT in xcorr/phase-only mode")
-        }
-        
-        if (driftResult.stream1JitterMs > 5.0 || driftResult.stream2JitterMs > 5.0) failedGates += "HIGH_JITTER"
-        if (driftResult.stream1DropRate > 0.1 || driftResult.stream2DropRate > 0.1) failedGates += "HIGH_DROPS"
-        
-        // Clock-domain gate — tiered thresholds:
-        //   ≤500ppm:   OK (normal shared-clock jitter)
-        //   500-2000ppm: suspicious — log warning, allow PTT
-        //   >2000ppm:  hard gate — timestamps from different clock domains
         val clockDriftPpm = kotlin.math.abs(driftResult.rateRatio - 1.0) * 1_000_000
-        when {
-            clockDriftPpm > 2000 -> {
-                failedGates += "CLOCK_DRIFT"
-                Log.w(tag, "CLOCK_DRIFT gate: rateRatio=${"%.6f".format(driftResult.rateRatio)} " +
-                      "(${"%.0f".format(clockDriftPpm)}ppm) — non-shared clock domain, PTT disabled")
-            }
-            clockDriftPpm > 500 -> {
-                Log.w(tag, "CLOCK_DRIFT warn: rateRatio=${"%.6f".format(driftResult.rateRatio)} " +
-                      "(${"%.0f".format(clockDriftPpm)}ppm) — suspicious, PTT allowed with caution")
-            }
-            clockDriftPpm > 100 -> {
-                Log.i(tag, "CLOCK_DRIFT info: rateRatio=${"%.6f".format(driftResult.rateRatio)} " +
-                      "(${"%.0f".format(clockDriftPpm)}ppm) — within tolerance")
-            }
-        }
-        
-        // Offset stability gate: adaptive threshold for mixed-FPS jitter
-        // Base: 5ms (tight sync). Adaptive: 25% of max frame interval (handling 30 vs 25fps beat frequency)
-        // e.g., at 25fps (40ms), threshold = max(5, 10) = 10ms
+        val maxJitterMs = maxOf(driftResult.stream1JitterMs, driftResult.stream2JitterMs)
+        val maxDropRate = maxOf(driftResult.stream1DropRate, driftResult.stream2DropRate)
         val interval1Ms = if (driftResult.stream1Rate > 0) 1000.0 / driftResult.stream1Rate else 1000.0
         val interval2Ms = if (driftResult.stream2Rate > 0) 1000.0 / driftResult.stream2Rate else 1000.0
         val maxIntervalMs = maxOf(interval1Ms, interval2Ms)
         val stabilityThresholdMs = maxOf(5.0, 0.50 * maxIntervalMs)
+
+        // Sigmoid helper: σ((x - center) / scale)
+        fun sigmoid(x: Double): Double = 1.0 / (1.0 + kotlin.math.exp(-x))
+        fun logit(p: Double): Double = kotlin.math.ln(p / (1.0 - p))
+        val eps = 0.02
+
+        // ── Gate memberships: higher μ = better quality ──
+        val muFps = sigmoid((minRate - 20.0) / 3.0).coerceIn(eps, 1.0 - eps)
+        val muFaceSnr = sigmoid((faceSnrDb - FACE_SNR_GATE_DB) / 2.0).coerceIn(eps, 1.0 - eps)
+        val muFingerSnr = sigmoid((fingerSnrDb - FINGER_SNR_GATE_DB) / 2.0).coerceIn(eps, 1.0 - eps)
+        val muJitter = sigmoid((5.0 - maxJitterMs) / 2.0).coerceIn(eps, 1.0 - eps)
+        val muDrops = sigmoid((0.10 - maxDropRate) / 0.03).coerceIn(eps, 1.0 - eps)
+        val muClockDrift = sigmoid((2000.0 - clockDriftPpm) / 500.0).coerceIn(eps, 1.0 - eps)
+        val muOffset = sigmoid((stabilityThresholdMs - driftResult.offsetStdMs) / 2.0).coerceIn(eps, 1.0 - eps)
+        val muMotion = if (motionGate != null) 0.15 else (1.0 - eps)
+        val muOffsetValid = if (driftResult.offsetValid) (1.0 - eps) else 0.20
+
+        // ── Weighted logit-space combination ──
+        data class GateEntry(val name: String, val weight: Double, val mu: Double)
+        val gates = listOf(
+            GateEntry("FPS", 2.0, muFps),
+            GateEntry("FACE_SNR", 1.5, muFaceSnr),
+            GateEntry("FINGER_SNR", 1.5, muFingerSnr),
+            GateEntry("JITTER", 1.0, muJitter),
+            GateEntry("DROPS", 1.0, muDrops),
+            GateEntry("CLOCK_DRIFT", 1.5, muClockDrift),
+            GateEntry("OFFSET_STABLE", 1.0, muOffset),
+            GateEntry("MOTION", 1.0, muMotion),
+            GateEntry("OFFSET_VALID", 1.0, muOffsetValid)
+        )
         
-        if (driftResult.offsetStdMs > stabilityThresholdMs) {
-            failedGates += "OFFSET_UNSTABLE"
-            Log.w(tag, "OFFSET_UNSTABLE gate: offsetStd=${"%.1f".format(driftResult.offsetStdMs)}ms > " +
-                  "${"%.1f".format(stabilityThresholdMs)}ms threshold (adaptive)")
+        var logitSum = 0.0
+        var weightSum = 0.0
+        val weakGates = mutableListOf<String>()
+        for (g in gates) {
+            logitSum += g.weight * logit(g.mu)
+            weightSum += g.weight
+            if (g.mu < 0.30) weakGates += g.name // flag weak gates for logging
         }
-        
+        val pipelineQuality = sigmoid(logitSum / weightSum)
+
+        // ── CRITICAL hard gates: only truly catastrophic conditions ──
+        val criticalFailure = minRate < 15.0 || clockDriftPpm > 5000
+
+        Log.i(tag, "SOFT_GATES | quality=${"%.3f".format(pipelineQuality)} | " +
+              "fps=${"%.2f".format(muFps)} snrF=${"%.2f".format(muFaceSnr)} snrFi=${"%.2f".format(muFingerSnr)} " +
+              "jitter=${"%.2f".format(muJitter)} drops=${"%.2f".format(muDrops)} clock=${"%.2f".format(muClockDrift)} " +
+              "offset=${"%.2f".format(muOffset)} motion=${"%.2f".format(muMotion)} " +
+              "weak=[${weakGates.joinToString(",")}] critical=$criticalFailure")
+
         // Fix 3: Extract bandSQI from raw pttOutput BEFORE gate nullification
         val rawSqiFace = pttOutput.sqiFace
         val rawSqiFinger = pttOutput.sqiFinger
         val rawConfidence = pttOutput.confidence
         val rawNBeats = pttOutput.nBeats
 
-        if (failedGates.isNotEmpty()) {
+        if (criticalFailure) {
             effectivePtt = null
             effectivePttDenoised = null
-            val primary = failedGates.first()
-            msg += " ($primary: PTT Gated)"
-            // Critical: Log gating reason to file
-            AppLogger.warn(tag, "PTT gated: primary=$primary, all=${failedGates.joinToString("|")}")
-            Log.w(tag, "PTT gated: primary=$primary, all=${failedGates.joinToString("|")}")
+            msg += " (CRITICAL: ${if (minRate < 15.0) "FPS<15" else "CLOCK>5000ppm"} — PTT Rejected)"
+            AppLogger.warn(tag, "PTT CRITICAL rejection: fps=${"%.1f".format(minRate)}, drift=${"%.0f".format(clockDriftPpm)}ppm")
+            Log.w(tag, "PTT CRITICAL rejection: fps=${"%.1f".format(minRate)}, drift=${"%.0f".format(clockDriftPpm)}ppm")
+        } else if (weakGates.isNotEmpty()) {
+            msg += " (soft-gated: ${weakGates.joinToString("|")})"
+            Log.i(tag, "PTT soft-gated (quality=${"%.3f".format(pipelineQuality)}): ${weakGates.joinToString("|")}")
         }
 
         // Per-session debug summary — enriched for next-run diagnosis
-        val gateReason = if (failedGates.isEmpty()) "NONE" else failedGates.joinToString("|")
+        val gateReason = if (criticalFailure) "CRITICAL" else if (weakGates.isEmpty()) "NONE" else weakGates.joinToString("|")
         val sharedClockLikely = clockDriftPpm <= 500
+        val qualityTier = effectivePtt?.qualityTier?.name ?: "NULL"
         val summaryMsg = "SESSION_SUMMARY | " +
             "fpsFace=${"%.1f".format(driftResult.stream1Rate)} | " +
             "fpsFinger=${"%.1f".format(driftResult.stream2Rate)} | " +
@@ -486,10 +489,12 @@ class SignalPipeline(
             "bandSqiFinger=$rawSqiFinger | " +
             "faceSnrDb=${"%.1f".format(faceSnrDb)} | " +
             "fingerSnrDb=${"%.1f".format(fingerSnrDb)} | " +
-            "confidence=${"%.2f".format(rawConfidence)} | " +
+            "confidence=${"%.3f".format(rawConfidence)} | " +
+            "pipelineQuality=${"%.3f".format(pipelineQuality)} | " +
+            "qualityTier=$qualityTier | " +
             "lagMedianMs=${effectivePtt?.pttMs?.let { "%.1f".format(it) } ?: "null"} | " +
             "nBeats=$rawNBeats | " +
-            "pttGated=$gateReason | " +
+            "weakGates=$gateReason | " +
             "pttMs=${effectivePtt?.pttMs?.let { "%.1f".format(it) } ?: "null"}"
         
         // Use AppLogger to ensure this critical summary is written to file

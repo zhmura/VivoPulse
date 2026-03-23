@@ -472,6 +472,167 @@ object CrossCorr {
             message = "MultiWindow: n=${windowLags.size}, median=${"%.1f".format(median)}ms, MAD=${"%.1f".format(mad)}ms, stability=${"%.2f".format(stabilityScore)}"
         )
     }
+    // ═══════════════════════════════════════════════════════════════════
+    // P2.7: Adaptive GCC with Coherence-Weighted PHAT
+    // ═══════════════════════════════════════════════════════════════════
+
+    /**
+     * Adaptive GCC with per-bin coherence weighting.
+     *
+     * Instead of a fixed β, uses per-frequency coherence γ²(f) from Welch
+     * estimation to blend between PHAT (sharp, full whitening) and
+     * cross-correlation (SNR-preserving):
+     *
+     *   W(f) = |G(f)|^(-γ²(f))
+     *
+     * - High coherence bins → full PHAT whitening → sharp peak
+     * - Low coherence bins → less whitening → preserves SNR
+     *
+     * This is the "optimal" weighting in the sense of maximizing
+     * peak-to-sidelobe ratio under stationary noise.
+     *
+     * @param x First signal (face PPG)
+     * @param y Second signal (finger PPG)
+     * @param fsHz Sample rate in Hz
+     * @param minLagMs Min physiological lag (default 30ms)
+     * @param maxLagMs Max physiological lag (default 400ms)
+     * @param windowSec Analysis window (default 20s)
+     * @param welchSegment Welch segment length for coherence estimation
+     * @param fallbackBeta Fixed β to use if coherence estimation fails
+     * @return CrossCorrResult with lag and the coherence-adaptive sharpness
+     */
+    fun adaptiveGccLag(
+        x: DoubleArray,
+        y: DoubleArray,
+        fsHz: Double,
+        minLagMs: Double = 30.0,
+        maxLagMs: Double = 400.0,
+        windowSec: Double = 20.0,
+        welchSegment: Int = 256,
+        fallbackBeta: Double = 0.8
+    ): CrossCorrResult {
+        // Use last windowSec of signal
+        val windowSamples = (windowSec * fsHz).toInt()
+        val startIdx = maxOf(0, x.size - windowSamples)
+
+        val xWindow = x.sliceArray(startIdx until x.size)
+        val yWindow = y.sliceArray(startIdx until y.size)
+        val n = minOf(xWindow.size, yWindow.size)
+
+        if (n < 64) {
+            return CrossCorrResult(
+                lagMs = 0.0, corrScore = 0.0, peakSharpness = 0.0,
+                isValid = false, message = "Insufficient samples for adaptive GCC (need ≥64)"
+            )
+        }
+
+        // 1. Estimate per-bin coherence via Welch
+        val coherenceMap: DoubleArray? = if (n >= welchSegment * 2) {
+            val welch = com.vivopulse.signal.WelchEstimator.crossSpectral(
+                xWindow.take(n).toDoubleArray(),
+                yWindow.take(n).toDoubleArray(),
+                fsHz, welchSegment
+            )
+            if (welch.nSegments >= 2) welch.coherence else null
+        } else null
+
+        val welchBinWidth = if (coherenceMap != null) {
+            fsHz / com.vivopulse.signal.FastFourierTransform.nextPowerOf2(welchSegment)
+        } else 0.0
+
+        // 2. Compute cross-spectrum in frequency domain
+        val nfft = com.vivopulse.signal.FastFourierTransform.nextPowerOf2(n * 2)
+
+        val xPad = DoubleArray(nfft)
+        val yPad = DoubleArray(nfft)
+        System.arraycopy(xWindow, 0, xPad, 0, minOf(n, xWindow.size))
+        System.arraycopy(yWindow, 0, yPad, 0, minOf(n, yWindow.size))
+
+        // DC removal
+        val xMean = xPad.take(n).average()
+        val yMean = yPad.take(n).average()
+        for (i in 0 until n) { xPad[i] -= xMean; yPad[i] -= yMean }
+
+        // Forward FFT
+        val (xReal, xImag) = com.vivopulse.signal.FastFourierTransform.fft(xPad)
+        val (yReal, yImag) = com.vivopulse.signal.FastFourierTransform.fft(yPad)
+
+        // 3. Adaptive whitening
+        val gccBinWidth = fsHz / nfft
+        val gReal = DoubleArray(nfft)
+        val gImag = DoubleArray(nfft)
+
+        for (i in 0 until nfft) {
+            val cpReal = xReal[i] * yReal[i] + xImag[i] * yImag[i]
+            val cpImag = xReal[i] * yImag[i] - xImag[i] * yReal[i]
+            val magnitude = sqrt(cpReal * cpReal + cpImag * cpImag)
+
+            if (magnitude > 1e-12) {
+                // Determine per-bin β from coherence
+                val beta = if (coherenceMap != null && welchBinWidth > 0) {
+                    val freqHz = i * gccBinWidth
+                    val welchIdx = (freqHz / welchBinWidth).toInt()
+                        .coerceIn(0, coherenceMap.size - 1)
+                    coherenceMap[welchIdx].coerceIn(0.0, 1.0)
+                } else {
+                    fallbackBeta
+                }
+
+                val weight = magnitude.pow(beta)
+                gReal[i] = cpReal / weight
+                gImag[i] = cpImag / weight
+            }
+        }
+
+        // 4. IFFT → correlation
+        val (rReal, _) = com.vivopulse.signal.FastFourierTransform.ifft(gReal, gImag)
+
+        // 5. Find peak in physiological range
+        val minLagSamples = (minLagMs * fsHz / 1000.0).toInt()
+        val maxLagSamples = (maxLagMs * fsHz / 1000.0).toInt()
+
+        var bestLag = 0
+        var bestVal = -Double.MAX_VALUE
+
+        for (lag in minLagSamples..minOf(maxLagSamples, nfft / 2 - 1)) {
+            if (rReal[lag] > bestVal) { bestVal = rReal[lag]; bestLag = lag }
+        }
+        for (lag in minLagSamples..minOf(maxLagSamples, nfft / 2 - 1)) {
+            val idx = nfft - lag
+            if (idx in 0 until nfft && rReal[idx] > bestVal) { bestVal = rReal[idx]; bestLag = -lag }
+        }
+
+        // Sub-sample refinement
+        val peakIdx = if (bestLag >= 0) bestLag else nfft + bestLag
+        val refinedLag = if (peakIdx > 0 && peakIdx < nfft - 1) {
+            val y1 = rReal[peakIdx - 1]; val y2 = rReal[peakIdx]; val y3 = rReal[peakIdx + 1]
+            val a = (y1 + y3) / 2.0 - y2; val b = (y3 - y1) / 2.0
+            val delta = if (abs(a) > 1e-10) -b / (2.0 * a) else 0.0
+            bestLag.toDouble() + delta
+        } else bestLag.toDouble()
+
+        val lagMs = refinedLag * 1000.0 / fsHz
+
+        val sharpness = if (peakIdx > 2 && peakIdx < nfft - 3) {
+            val neighborMean = (rReal[peakIdx - 2] + rReal[peakIdx - 1] +
+                                rReal[peakIdx + 1] + rReal[peakIdx + 2]) / 4.0
+            if (neighborMean > 1e-12) bestVal / neighborMean else 0.0
+        } else 0.0
+
+        val maxR = rReal.maxOrNull() ?: 1.0
+        val corrScore = if (maxR > 1e-12) (bestVal / maxR).coerceIn(0.0, 1.0) else 0.0
+
+        val isAdaptive = coherenceMap != null
+        return CrossCorrResult(
+            lagMs = lagMs,
+            corrScore = corrScore,
+            peakSharpness = sharpness.coerceIn(0.0, 1.0),
+            isValid = true,
+            lagSamples = refinedLag,
+            lagConfidence = if (abs(lagMs) > 200.0) 1.0 - ((abs(lagMs) - 200.0) / 300.0).coerceIn(0.0, 0.5) else 1.0,
+            message = "AdaptiveGCC: PTT=${"%.2f".format(lagMs)}ms, adaptive=$isAdaptive, Sharp=${"%.3f".format(sharpness)}"
+        )
+    }
 }
 
 /**

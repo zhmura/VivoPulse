@@ -1,0 +1,412 @@
+Algorithmic upgrades for dual-camera PTT estimation on mobile
+Failure analysis of the current pipeline
+The observed “PTT = 0 (null/rejected)” behavior is consistent with two interacting problems: (i) high brittleness in the quality/acceptance logic and (ii) delay estimators that are fragile under common rPPG failure modes (illumination changes, motion, frame-rate variability). Both problems are amplified by the dual-camera setting (front camera rPPG + rear camera contact PPG), where each stream has different noise statistics and (often) imperfect timestamp comparability.
+
+The signal environment you describe is objectively hostile for rPPG: real-world rPPG accuracy degrades under illumination variance, motion artifacts, and video pipeline effects (including compression and frame-rate variability), which are widely documented as key limitations to reliable deployment. 
+ In addition, contact PPG quality can change markedly with contact force and temperature, affecting waveform shape (and therefore fiducial timing), so “finger is high SNR” is not guaranteed across the entire 15–30 s recording. 
+
+Weakest algorithmic links and why they fail
+Brittle acceptance logic (multiplicative confidence + binary gating). Your combined confidence multiplies five factors. Any one factor near zero collapses the product, which makes the pipeline behave like a “series system” where the weakest link dominates. In noisy rPPG, it is normal for one metric (e.g., cross-correlation sharpness, stability, or agreement) to transiently degrade even when the physiological component is still recoverable, so the current design encourages false negatives. Meanwhile, pipeline-level gates hard-reject measurements before PTT is computed, so you lose the possibility of “degraded but usable” outputs with uncertainty bounds (critical in real-world rPPG). The literature on rPPG and PPG signal quality emphasizes that artifacts are frequent and quality assessment is central; rejecting everything on a single failure wastes partial information. 
+
+Cross-correlation lag estimation under mixed/common-mode artifacts. In dual-sensor settings, delay estimators based on cross- or cross-spectral methods can exhibit a bias toward zero delay when correlated/mixed noise is present in both channels (e.g., motion-induced intensity changes affecting both face and finger signals at nearly the same time). This effect can produce spurious near-zero lags even when a true physiological delay exists. 
+ This is a plausible mechanism for occasional “PTT≈0” proposals that then get rejected downstream (or clipped).
+
+Foot detection fragility. A global threshold defined as a fraction of the maximum derivative is extremely sensitive to single outliers; it is also sampling-rate sensitive and does not adapt to heart rate (your fixed “search back 50 samples” is not physiologically normalized). Classic PPG processing references emphasize multiple fiducial strategies and the importance of derivatives and morphology-aware detection. 
+
+Peak detection non-robustness. A mean + k·std threshold is sensitive to outliers and baseline shifts. Beat detection benchmarks show that multiple established detectors can maintain high F1 in clean conditions but degrade in artifacted segments; importantly, top-performing detectors differ in failure modes, motivating multi-detector or quality-aware approaches rather than a single brittle threshold. 
+
+Clock/timestamp assumptions. Android camera timestamps may not always be comparable across camera devices depending on timestamp source; the platform explicitly distinguishes cases where camera timestamps can be compared to a shared timebase versus cases where they “cannot be compared” across camera instances. 
+ In addition, rPPG quality is impacted by frame-rate variability and jitter in real conditions. 
+
+The remainder of this report proposes concrete algorithmic replacements/augmentations that directly address these failure modes under your constraints (no GPU, ~500 ms total compute, no labeled ground truth).
+
+Time-delay estimation upgrades for low SNR and low FPS
+This section targets Q1. The central idea is to replace “single-window NCC + parabola” with estimators that:
+(a) explicitly exploit quasi-periodicity (heart rate and harmonics),
+(b) provide sub-sample delay resolution without ad hoc interpolation, and
+(c) yield an uncertainty estimate (so confidence becomes principled).
+
+Proposal: coherence-weighted cross-spectral phase-slope delay estimator
+A time delay τ induces an approximately linear phase shift in the cross-spectrum: for frequency f (or angular frequency ω = 2πf), the cross-spectral phase satisfies [ \phi_{xy}(f)\approx -2\pi f \tau + \phi_0, ] where (\phi_0) captures fixed phase offsets and physiological morphology differences.
+
+A recent cross-spectral method (developed for robust time-delay estimation under phase distortion) estimates τ from linear regions of the unwrapped cross-spectral phase and derives an uncertainty relationship tied to coherence. 
+ While that paper is from acoustic leak detection, the underlying signal model (delay ↔ phase slope) and the coherence-linked variance are directly useful for PPG/rPPG delay estimation.
+
+Implementation-friendly formulation (weighted least squares). Compute Welch estimates of:
+
+auto-spectra (S_{xx}(f), S_{yy}(f)),
+cross-spectrum (S_{xy}(f)),
+coherence (\gamma^2(f)=\frac{|S_{xy}(f)|^2}{S_{xx}(f)S_{yy}(f)}).
+Then estimate τ by weighted regression of unwrapped phase (\tilde{\phi}_{xy}(f)) versus frequency.
+
+A practical closed-form (after intercept correction) is of the form 
+ [ \hat{\tau}=\frac{\sum_{i=1}^{m} w_i ,\omega_i,\tilde{\phi}{xy}(\omega_i)} {\sum{i=1}^{m} w_i ,\omega_i^{2}}, ] with weights (w_i) chosen to emphasize high-quality bins. Coherence is an excellent default weight because low coherence implies high phase variance. 
+ A simple and robust choice is: [ w_i=\gamma^2(\omega_i)\cdot \mathbf{1}[\gamma^2(\omega_i)\ge \gamma_{\min}], ] where (\gamma_{\min}) can be low (e.g., 0.1–0.2) to avoid over-rejection; poor bins are simply down-weighted rather than hard-gated.
+
+Exploit quasi-periodicity (HR-harmonic bin selection). Let (f_{HR}) be the dominant HR frequency estimated from the finger signal (more stable on average). Select bins around harmonics (k f_{HR}) for (k=1..K) within 0.7–4.0 Hz (or up to ~8 Hz if you retain higher harmonics as some PPG beat detectors do). 
+ This uses the physiological structure to suppress irrelevant noise.
+
+Uncertainty estimate (turn confidence into statistics). The cross-spectral phase method provides an approximate expression for phase variance in terms of coherence and the number of Welch averages n, and then derives a τ variance that increases as coherence drops. 
+ In practice, you don’t need the exact derivation to get utility: compute a regression standard error (SE) and use it as your primary “delay confidence.”
+
+Pseudocode (Kotlin-ready).
+
+text
+Copy
+function estimateDelay_CSP(x, y, fs):
+    # 1) Compute Welch spectra
+    (Sxx, Syy, Sxy) = welchCrossSpectra(x, y, fs, winLen=256 or 512, overlap=50%)
+    gamma2 = |Sxy|^2 / (Sxx * Syy + eps)
+
+    # 2) Estimate HR from finger (y) or from average spectrum
+    fHR = argmax_f_in_band(PSD_y, 0.7..4.0 Hz)
+
+    # 3) Build harmonic frequency set
+    bins = []
+    for k in 1..K:
+        f0 = k * fHR
+        if f0 in [0.7, 8.0]:
+            bins += all FFT bins within ±Δ around f0
+    # Δ could be ~0.15 Hz or adapt to window length
+
+    # 4) Unwrap phase of Sxy at selected bins
+    phi = unwrap(angle(Sxy[bins]))
+
+    # 5) Weighted LS estimate of tau (and optionally intercept)
+    w = clamp(gamma2[bins], 0, 1)
+    w = w * (gamma2[bins] >= gammaMin)
+    omega = 2π * f[bins]
+
+    tauHat = sum(w * omega * phi) / sum(w * omega^2 + eps)
+
+    # 6) Compute uncertainty proxy (regression residual -> SE)
+    # Predict phase: phiPred = -omega * tauHat
+    resid = wrapToPi(phi + omega * tauHat)
+    seTau = sqrt( weightedVar(resid) / (sum(w * omega^2) + eps) )
+
+    return (tauHat, seTau, mean(w), mean(gamma2[bins]))
+Expected improvement.
+
+More robust to amplitude distortion (exposure steps, gain changes) because it uses phase relationships rather than time-domain amplitude similarity. 
+Sub-sample resolution without ad hoc parabolic interpolation, since τ is estimated from phase slope directly. 
+Produces an uncertainty estimate tied to coherence and residual phase nonlinearity, enabling principled confidence scoring. 
+Caveats. Phase unwrapping can fail if the phase is extremely noisy; down-weighting by coherence and restricting to HR harmonics mitigates but does not eliminate this. 
+ Also, physiology is not a pure delay + scaling system; waveform morphology differs by site, so “phase linearity” may hold best in limited bands (again supporting harmonic selection).
+
+Proposal: replace quadratic peak interpolation with FFT zero-padding (band-limited interpolation)
+Your current NCC/GCC refinement uses one-step parabolic interpolation around a discrete peak. A more principled (and still cheap) alternative is oversampled correlation via frequency-domain zero-padding, which approximates continuous-time correlation under a band-limited assumption:
+
+Compute a weighted cross-spectrum (G(f)=W(f)X^*(f)Y(f)).
+Zero-pad (G(f)) to length (L\cdot N) in frequency.
+Compute (r_{xy}(\tau)=\mathrm{IFFT}(G)) at finer lag grid.
+This provides a sinc-like interpolation of correlation, typically reducing bias compared with a local quadratic fit when the peak is not well approximated by a parabola (common at low SNR or when the peak is broadened). Subsample delay estimation improvements (beyond simple parabolic fitting) are an active topic; recent subsample TDE work explicitly seeks alternatives to improve accuracy under practical conditions. 
+
+Pseudocode.
+
+text
+Copy
+function estimateDelay_OversampledGCC(x, y, fs, L=8):
+    X = FFT(x)
+    Y = FFT(y)
+
+    # Weighting: start with PHAT-like but stabilized
+    Sxy = conj(X) * Y
+    W = 1 / (|Sxy|^beta + eps)          # beta adapts (see next proposal)
+    G = W * Sxy
+
+    # Zero-pad G to length L*N (centered)
+    Gpad = zeroPadCentered(G, L)
+
+    r = IFFT(Gpad)                      # correlation at Lx temporal grid
+    tauGrid = lagsInSeconds(fs, L, len(r))
+
+    tauHat = argmax_{tau in [-0.4, 0.4]} r(tau)
+
+    # Peak quality: peak-to-sidelobe, or ratio
+    q = peakToSidelobeRatio(r, tauHat, excludeWidth=40 ms)
+
+    return (tauHat, q)
+Expected improvement.
+
+Better sub-sample precision than parabola in cases where the correlation peak is broad or asymmetric. 
+Much faster than time-domain O(N·M) correlation, allowing more robust multi-window analysis within budget.
+Caveats. This remains correlation-based, so it can still be fooled by common-mode artifacts that align at near-zero lag. The next proposal mitigates that via adaptive weighting and coherence gating, and the cross-spectral phase estimator mitigates it even more directly. 
+
+Proposal: adaptive GCC weighting (PHAT ↔ SCOT blend) driven by coherence/SNR
+Hardcoding β = 0.8 in GCC-PHAT is suboptimal because PHAT-like whitening can over-amplify noise when SNR is low and suppress useful amplitude structure when SNR is moderate. Recent work on generalized/weighted GCC functions (including SCOT–PHAT hybrids) specifically targets improved performance at low SNR by modifying spectral weights. 
+ A phase-spectrum family (“GPS” methods) similarly emphasizes frequency-domain weighting and can be implemented using only a subset of frequency bins (useful on mobile). 
+
+A practical mobile recipe:
+
+Use coherence (\gamma^2(f)) to suppress bins that are not jointly physiological. 
+Use a stabilized PHAT exponent β(f) that decreases when coherence is low: [ \beta(f)=\beta_{\max}\cdot \sigma!\left(\frac{\gamma^2(f)-\gamma_0}{s}\right) ] where σ is logistic; for example (\beta_{\max}=1), (\gamma_0=0.3), (s=0.1).
+Then: [ W(f)=\frac{(\gamma^2(f))^{p}}{(|S_{xy}(f)|^{\beta(f)}+\epsilon)} ] with small p (e.g., 1). This keeps PHAT behavior when coherence is good while preventing “pure phase whitening” when coherence is poor.
+
+Expected improvement. Sharper, more stable peaks at low SNR without hard-coded magic numbers, aligning with the motivation of recent low-SNR GCC weighting research. 
+
+Caveats. If coherence is uniformly low (very poor face rPPG), no weighting can recover delay; in that case, output should degrade gracefully with high uncertainty rather than returning null (see confidence redesign).
+
+Proposal: stabilize against spurious zero-delay via artifact-aware preprocessing
+Because mixed/common-mode artifacts can bias delay estimates toward zero (a documented failure mode for conventional cross-/bispectral delay estimators), you should explicitly reduce shared artifacts prior to delay estimation. 
+ Two practical, unsupervised options that fit mobile constraints:
+
+Motion-reference adaptive noise cancellation for face rPPG. Motion artifacts are a primary error source in PPG/rPPG, and reviews emphasize both detection and filtering strategies (including reference-sensor approaches). 
+ If you already compute face motion metrics (ROI tracking, optical flow magnitude), treat that as a reference and apply a low-order NLMS adaptive filter to remove correlated motion components before bandpass.
+
+Artifact-aware segment rejection instead of session rejection. Motion artifact reviews note that some approaches mark corrupt segments; your pipeline currently hard-rejects the entire session. 
+ Replacing session-level rejection with segment-level down-weighting is usually higher yield in consumer conditions.
+
+Robust pulse onset and beat detection
+This section targets Q2 and partially supports Q1/Q3 (better beat timing → better delay estimation).
+
+Proposal: Intersecting Tangent Method for foot detection with HR-adaptive windows
+A PPG pulse’s onset (foot) is a standard fiducial point, and derivative-based points (maximum slope) are also canonical. 
+ A comparative study of multiple foot-finding methods reported the best correlation with ECG-derived intervals for the intersecting tangents method (in stationary conditions), suggesting it can be a strong baseline for precise timing extraction. 
+
+Method definition (per beat). Let x(t) be filtered PPG.
+
+Identify a beat’s local minimum at (t_{min}) in a search window before the upslope.
+Identify the maximum slope point (t_{ms}=\arg\max \dot{x}(t)) on the upslope. 
+Construct tangents:
+baseline tangent (y_b(t)=x(t_{min})) (or a linear baseline fit over a short pre-upstroke segment),
+upslope tangent (y_u(t)=x(t_{ms})+\dot{x}(t_{ms})(t-t_{ms})).
+The foot time is the intersection: solve (y_b(t)=y_u(t)): [ t_{foot}=t_{ms}+\frac{x(t_{min})-x(t_{ms})}{\dot{x}(t_{ms})}. ]
+Critical improvements over your current implementation.
+
+Replace raw central differences with a Savitzky–Golay derivative (polynomial smoothing + derivative), which is substantially more stable at low effective sample rates and preserves slope timing better than naive differencing in noisy signals.
+Make the “search back” window HR-adaptive: if RR is ~0.6 s vs 1.2 s, a fixed 50 samples at 100 Hz means very different physiology. Use a fraction of RR, e.g., search back 0.25·RR to 0.45·RR.
+Pseudocode.
+
+text
+Copy
+function detectFeet_ITM(x, fs, peakTimes):
+    # x: bandpassed & detrended PPG
+    # peakTimes: systolic peaks or beat anchors
+    dx = savgolDerivative(x, fs, windowMs=120..180, polyOrder=3)
+
+    feet = []
+    for each beat k:
+        # define beat window using adjacent peaks or RR estimate
+        t0 = peakTimes[k] - 0.45*RRk
+        t1 = peakTimes[k] - 0.05*RRk
+
+        t_min = argmin_{t in [t0, t1]} x(t)
+
+        # upslope window from t_min to near peak
+        tu0 = t_min
+        tu1 = peakTimes[k] - 0.10*RRk
+        t_ms = argmax_{t in [tu0, tu1]} dx(t)
+
+        if dx(t_ms) <= slopeMin: continue    # slopeMin via MAD threshold per beat
+
+        t_foot = t_ms + (x(t_min) - x(t_ms)) / dx(t_ms)
+        feet.append(t_foot)
+
+    return feet
+The use of onset + max-slope is consistent with standard fiducials used in PPG processing. 
+
+Expected improvement.
+
+Significantly less sensitivity to a single global derivative outlier than “5% of max slope.”
+More consistent foot timing for PTT/PWV-style metrics, consistent with the reported strong agreement of ITM in comparative foot-finding analysis (noting that robustness to noise still depends on preprocessing). 
+Caveats. The comparative foot-finding work also notes that different methods respond differently to noise; ITM is not a silver bullet in highly corrupted segments. 
+ This motivates beat-level or segment-level confidence rather than hard failure.
+
+Proposal: beat detection upgrade using established high-accuracy detectors
+Your peak detector (mean + 0.3·std) is not robust. A large benchmarking study evaluated 15 open-source PPG beat detectors across eight datasets and reported that two detectors (“MSPTD” and “qppg”) performed best with complementary characteristics. 
+ More recent work introduces MSPTDfast variants explicitly designed to retain high accuracy with lower computational cost (important for your mobile budget). 
+
+Practical mobile path. Implement one of:
+
+MSPTDfast-style multiscale peak & trough detection (downsample to ≥20 Hz and restrict scales to HR ≥30 bpm; then detect maxima/minima across scales). 
+Or, if you want a simpler step first: implement prominence-based peak detection with a robust (MAD-based) adaptive threshold, then add physiological plausibility checks. This is less literature-grounded than MSPTDfast but still a major improvement over mean+std.
+Why this matters for PTT. Better peaks enable:
+
+better HR estimation (for harmonic delay estimation),
+better beat segmentation / per-beat foot detection,
+and better beat-level quality scoring rather than session-wide gates. 
+Caveats. MSPTDfast uses scalogram-like processing; while the paper reports improved efficiency, you must implement carefully to stay within memory/time budgets on-device. 
+
+Optional: fractional differintegration fiducials for improved timing stability
+A 2024 peer-reviewed study proposes fiducial points based on local extrema after fractional differintegration of the systolic rise to improve pulse arrival detection, reporting reduced variability and improved agreement in specific evaluation settings. 
+
+This is attractive because it is still signal-processing-based (no training labels required), but it is higher effort to implement correctly and tune. Use it as a Tier-3 enhancement if ITM + robust derivatives are insufficient.
+
+Multi-method fusion that is principled and mobile-friendly
+This section targets Q3.
+
+Your current fusion logic is essentially a hard switch based on an arbitrary agreement band. The literature trend in both biomedical estimation and general sensor fusion is to treat multiple estimators as noisy “measurements” and fuse them with uncertainty-aware weighting, rather than threshold switching.
+
+Proposal: uncertainty-weighted fusion with a scalar Kalman filter over windows/beats
+Model PTT as a slowly varying latent state (x_k) (beat index k or window index k): [ x_k = x_{k-1} + w_k,\quad w_k\sim\mathcal{N}(0,Q) ] Each method m provides a measurement: [ y_{k}^{(m)} = x_k + v_k^{(m)},\quad v_k^{(m)}\sim\mathcal{N}(0,R_k^{(m)}). ]
+
+You can compute (R_k^{(m)}) from method-specific uncertainty proxies:
+
+Cross-spectral phase estimator: regression-derived SE or coherence-linked variance behavior (variance grows as coherence drops). 
+Multi-window GCC: empirical variance/MAD across subwindows (but use a robust mapping, not linear MAD/20ms).
+Foot-to-foot: variance of beatwise lags after robust outlier removal.
+Kalman update (scalar). If you sequentially incorporate M methods each step, the update is O(M) per window/beat—trivial for mobile.
+
+Pseudocode.
+
+text
+Copy
+# state: (x, P)  ; x = current PTT estimate, P = variance
+function kalmanFuse(x, P, measurements):
+    # measurements: list of (y_m, R_m) after per-method QC
+    # Predict
+    xPred = x
+    PPred = P + Q
+
+    # Update sequentially
+    for (y, R) in measurements:
+        if R is INF: continue
+        # Innovation
+        nu = y - xPred
+        S  = PPred + R
+        # Optional outlier gate:
+        if (nu*nu / S) > chi2Gate: continue
+
+        K = PPred / S
+        xPred = xPred + K * nu
+        PPred = (1 - K) * PPred
+
+    return (xPred, PPred)
+Handling disagreement. Instead of “if disagree > 50 ms, switch,” you:
+
+inflate R for methods that look unreliable (low coherence, low SNR, high residual, few beats),
+and apply an outlier gate on innovations (Mahalanobis distance), so a single bad estimator does not flip the output.
+Expected improvement.
+
+Fewer null outputs because you can fuse partial information and still report PTT with high variance.
+Better temporal consistency than a single 20 s window NCC, without imposing arbitrary thresholds.
+Caveats. Choosing Q (process noise) requires a heuristic; however, you can link it to observed variability (e.g., start with Q ≈ (5–10 ms)² per beat) and tune empirically.
+
+Proposal: beat-synchronous template delay as an additional estimator to fuse
+Exploit quasi-periodicity more directly by mapping each beat to a phase variable and averaging:
+
+For beat i with onset (t_i) and next onset (t_{i+1}), define phase (\theta=(t-t_i)/(t_{i+1}-t_i)\in[0,1]). Resample each beat to a fixed grid over θ and average across beats to create templates (T_x(\theta), T_y(\theta)). Estimate phase shift (\Delta\theta) between templates (via correlation or phase slope). Convert to time using median RR: (\hat{\tau}=\Delta\theta\cdot RR_{median}).
+
+This reduces noise by ensemble averaging and turns irregular beat lengths into a normalized domain, aligning with canonical PPG fiducial processing ideas (pulse-wise analysis and derivative landmarks). 
+
+Confidence estimation without ground truth and replacing brittle gates
+This section targets Q4–Q5. The key design shift is:
+
+Stop treating confidence as an ad hoc product of unrelated scores; start treating it as an estimate of uncertainty in τ. Then, instead of binary accept/reject, output:
+
+PTT estimate
+uncertainty (e.g., ±1.96·SE)
+quality tier (high/medium/low)
+Proposal: convert confidence to “PTT ± CI” using estimator-derived uncertainty
+The cross-spectral phase approach provides a direct route: phase variance increases as coherence decreases, and τ variance follows (conceptually) from how well phase fits a line. 
+ That naturally supports:
+
+confidence ≈ ( \Pr(|\tau-\hat{\tau}|\le \delta)) under a Gaussian approximation, or
+a deterministic mapping: (conf = \exp(-SE_\tau^2 / \sigma_0^2)).
+This is far more interpretable than multiplying arbitrary factors, and makes “near-miss” cases usable.
+
+Proposal: use cross-channel coherence as a primary quality metric
+Coherence quantifies frequency-specific linear association. In the cross-spectral phase derivation, poor coherence directly causes uncertainty in the delay estimate, making coherence a principled gate/weight. 
+
+Practical metric: [ Q_{\text{coh}}=\frac{1}{|B|}\sum_{f\in B}\gamma^2(f), ] where B is the set of HR-harmonic bins.
+
+Then:
+
+Use (Q_{\text{coh}}) to weight CSP and GCC estimates,
+Use it as a soft gate: low (Q_{\text{coh}}) → high uncertainty, not necessarily null.
+Proposal: replace session-level binary gating with fuzzy/continuous gating
+Instead of bitmask “fail → null,” map each gate to a membership (\mu_i\in[0,1]) and compute an overall quality “budget.”
+
+Examples:
+
+FPS: (\mu_{\text{fps}}=\sigma((fps-20)/2)) (smooth increase around 20 fps).
+Jitter: (\mu_{\text{jit}}=\sigma((5ms-jitter)/1ms)).
+SNR: (\mu_{\text{snr}}=\sigma((SNR-SNR_0)/s)).
+Then combine with a weighted sum in logit space: [ score = \sum_i w_i ,\mathrm{logit}(\mu_i),\qquad conf=\sigma(score), ] so no single metric collapses the confidence catastrophically.
+
+This aligns with the broader PPG signal-quality literature emphasizing continuous assessment and selective use of cleaner segments rather than discarding everything. 
+
+Proposal: add morphology/statistical SQIs that are cheap and informative
+Because contact force and physiology affect PPG morphology, relying solely on “raw − filtered” noise for SNR is fragile. 
+ A recent study explicitly lays out several SQIs and their formulas—skewness, kurtosis, relative power, zero-crossing rate, entropy, perfusion index—that can complement your SNR and peak-regularity measures. 
+
+A mobile-friendly channel quality vector could be:
+
+RSQI: relative in-band power (Welch PSD) 
+ESQI: entropy (signal disorder) 
+ZSQI: zero-crossing rate as a noise proxy 
+Optional: skewness/kurtosis (distribution shape) 
+Rather than “min(face,finger),” use a soft-min (to penalize the worse channel without instantly killing the estimate): [ Q_{\text{pair}}=-\frac{1}{\lambda}\log(e^{-\lambda Q_f}+e^{-\lambda Q_g}). ]
+
+Proposal: bootstrap-style confidence intervals over time windows
+If you prefer to keep correlation-based methods, estimate uncertainty by resampling time segments (block bootstrap) and recomputing the lag distribution; then CI width becomes your confidence. Bootstrap CIs for correlation/time series require care (dependence and non-identical sampling), but there is recent methodological work specifically addressing bootstrap intervals when time series are not on identical time points—highly relevant to asynchronous cameras. 
+
+A mobile approximation:
+
+Partition the 20 s window into overlapping subwindows (e.g., 5 s with 50% overlap).
+Sample subwindows with replacement to form bootstrap replicates.
+Compute τ per replicate (CSP or weighted GCC).
+CI = percentiles (2.5%, 97.5%).
+This is computationally feasible because each replicate uses short FFTs.
+
+Dual-camera clock synchronization and sampling limits
+This section targets Q6.
+
+What Android timestamps do and do not guarantee
+Android’s camera metadata explicitly distinguishes timestamp sources. In the “UNKNOWN” case, timestamps are monotonic but “cannot be compared” across camera devices, while the “REALTIME” source indicates the same timebase as SystemClock.elapsedRealtimeNanos() and therefore comparability to that base. 
+
+For logical multi-camera systems (multiple physical cameras within a logical camera), Android supports a sensor sync-type characteristic; in “CALIBRATED,” physical sensors may run in leader/follower mode to synchronize shutter time. 
+ However, front + rear cameras are typically not a logical multi-camera group, so hardware timestamp synchronization is usually not available, and software synchronization is required.
+
+Proposal: affine timebase model + drift compensation, then resample
+Model the mapping between camera timestamps as: [ t_f = a, t_r + b, ] where:
+
+(t_f) = face frame time,
+(t_r) = rear/finger frame time,
+(a) captures drift (rate mismatch),
+(b) captures offset.
+Estimate (a,b) by robust regression on timestamp pairs over the capture (e.g., match nearest timestamps by arrival order). This is analogous to timestamping models used in smartphone camera synchronization research; a 2021 study on multi-smartphone synchronization reports a mathematical model of periodic timestamping and provides empirical drift characterization across devices. 
+
+Once mapped to a unified time axis, resample both signals using band-limited interpolation (sinc/zero-padding) or at least monotone cubic interpolation. Avoid interpolation methods known to distort waveform phase if you rely on foot/onset (IIR filtering and interpolation can shift fiducials if not designed carefully). 
+
+Practical note. If the camera timestamp source is REALTIME, you can anchor both to elapsedRealtimeNanos and directly estimate (a,b) more reliably. 
+
+Does Nyquist-Shannon impose a fundamental limit at 30 fps?
+At 30 fps, the sample interval is ~33 ms, and naive discrete peak picking cannot do better than that grid. But delay is a continuous parameter; sub-frame delay estimation is possible when the signal has sufficient effective bandwidth and SNR, and classical performance analysis uses bounds such as Cramér–Rao limits for band-limited signals and MLE behavior. 
+
+In your case, rPPG bandwidth is narrow (dominated by HR and a few harmonics) and SNR can be low, so you should not expect sub-millisecond truth. However:
+
+Coherence-weighted cross-spectral estimation can reasonably target single-digit milliseconds in favorable conditions because it uses phase information accumulated across many samples and windows, not just a single frame interval. 
+More importantly, the real deliverable for BP proxying is often stable relative PTT, not absolute microsecond accuracy, and that stability is improved by uncertainty-aware fusion and segment-level weighting.
+Ranked upgrade backlog by impact-to-effort ratio
+The rankings below consider: reduction of null outputs, robustness to rPPG realities, and feasibility in Kotlin/Android under ~500 ms total compute.
+
+Highest impact for low effort
+Replace multiplicative confidence with uncertainty-aware output (PTT ± CI) and soft gating.
+Effort is mostly refactoring scoring; impact is immediate because it directly addresses your dominant failure mode (“any factor near zero kills confidence”) and converts partial-quality data into usable outputs. Use coherence/SE-based uncertainty from the cross-spectral estimator, or bootstrap-window variability if you stay correlation-based. 
+
+Switch NCC time-domain correlation to FFT-based weighted GCC with oversampling.
+This reduces compute, improves sub-sample estimation beyond parabolic fitting, and enables more robust multi-window strategies within budget. 
+
+Fix beat detection/peak detection with a vetted detector (MSPTD/qppg family) or at minimum robust prominence + MAD thresholds.
+Beat detection benchmarks show that top performers exist and that detectors disagree most in low-quality segments, motivating beat-level quality handling. 
+
+High impact for moderate effort
+Implement coherence-weighted cross-spectral phase-slope delay (HR-harmonic CSP).
+This is the single biggest algorithmic upgrade to your delay estimation because it (i) uses physiological priors (harmonics), (ii) is robust to amplitude steps, and (iii) yields an uncertainty estimate grounded in coherence/residuals. 
+
+Replace foot detection with ITM + Savitzky–Golay derivatives + HR-adaptive windows.
+This converts a fragile global threshold method into a morphology-based fiducial estimator aligned with standard PPG fiducials (onset/minimum, maximum slope) and supported by comparative foot-finding evidence. 
+
+Replace “agreement threshold switch” with uncertainty-weighted fusion (scalar Kalman).
+Effort is moderate; impact is large because fusion becomes robust to estimator disagreement and provides smooth tracking. 
+
+Medium impact or higher effort
+Artifact-aware preprocessing to prevent spurious zero-delay (motion-reference ANC, segment weighting).
+This targets the known bias of conventional delay estimators toward zero under mixed/common-mode noise and addresses the reality that motion artifacts dominate PPG/rPPG. 
+
+Clock model upgrade (affine drift/offset + timestamp-source checks).
+Important for correctness across devices and OS implementations; effort moderate. It reduces false gating due to apparent “drift/jitter” and improves resampling fidelity. 
+
+Fractional differintegration fiducials.
+Promising but higher implementation/tuning burden; best as a later-stage enhancement. 

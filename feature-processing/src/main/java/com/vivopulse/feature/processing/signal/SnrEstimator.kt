@@ -1,18 +1,20 @@
 package com.vivopulse.feature.processing.signal
 
+import com.vivopulse.signal.FastFourierTransform
 import kotlin.math.log10
-import kotlin.math.pow
 import kotlin.math.sqrt
 
 /**
  * Estimates Signal-to-Noise Ratio (SNR) for PPG signals.
  *
  * Uses spectral power ratio: Band (0.7-4.0 Hz) / Off-Band.
+ * 
+ * P0.3: Migrated from O(N²) DFT to FFT (Cooley-Tukey) for performance.
  */
 class SnrEstimator {
 
     /**
-     * Compute SNR in dB.
+     * Compute SNR in dB using FFT-based power spectrum.
      *
      * @param signal PPG signal (time domain)
      * @param fsHz Sampling frequency
@@ -23,39 +25,35 @@ class SnrEstimator {
         
         // 1. Remove DC / Detrend
         val mean = signal.average()
-        val zeroMean = signal.map { it - mean }.toDoubleArray()
+        val zeroMean = DoubleArray(signal.size) { signal[it] - mean }
         
-        // 2. Windowing (Hanning)
+        // 2. Zero-pad to next power of 2
+        val nfft = FastFourierTransform.nextPowerOf2(zeroMean.size)
+        
+        // 3. Windowing (Hanning) + zero-pad
+        val windowed = DoubleArray(nfft)
         val n = zeroMean.size
-        val windowed = DoubleArray(n)
         for (i in 0 until n) {
             val w = 0.5 * (1.0 - kotlin.math.cos(2.0 * Math.PI * i / (n - 1)))
             windowed[i] = zeroMean[i] * w
         }
+        // Remaining windowed[n..nfft-1] are zero-padded
         
-        // 3. FFT (Magnitude Spectrum)
-        // Simple DFT for now if N is small, or assume we have an FFT util.
-        // Since we don't have a complex math lib handy, let's do a simple DFT for relevant bins
-        // or just use a rough variance ratio if we had bandpassed signals.
-        // But the requirement asks for "band power / off-band power".
+        // 4. FFT
+        val (real, imag) = FastFourierTransform.fft(windowed)
         
-        // Let's implement a basic DFT for the spectrum.
-        val spectrum = computeMagnitudeSpectrum(windowed)
-        
-        // 4. Sum Power in Signal Band (0.7 - 4.0 Hz) vs Noise Band
+        // 5. Sum power in signal band (0.7–4.0 Hz) vs noise band
+        val binWidth = fsHz / nfft
         var signalPower = 0.0
         var noisePower = 0.0
         
-        val binWidth = fsHz / n
-        
-        for (i in spectrum.indices) {
+        // Only iterate over positive frequencies [0, Nyquist]
+        val nyquistBin = nfft / 2
+        for (i in 1..nyquistBin) {
             val freq = i * binWidth
-            // Skip DC (already removed but just in case)
-            if (freq < 0.1) continue
-            // Nyquist
             if (freq > fsHz / 2) break
             
-            val power = spectrum[i] * spectrum[i]
+            val power = real[i] * real[i] + imag[i] * imag[i]
             
             if (freq in 0.7..4.0) {
                 signalPower += power
@@ -69,23 +67,22 @@ class SnrEstimator {
         return 10.0 * log10(signalPower / noisePower)
     }
     
+    /**
+     * Compute magnitude spectrum using FFT.
+     * 
+     * @param data Input signal (any length, will be zero-padded to power of 2)
+     * @return Magnitude spectrum (positive frequencies only, length nfft/2 + 1)
+     */
     fun computeMagnitudeSpectrum(data: DoubleArray): DoubleArray {
-        val n = data.size
-        val spectrum = DoubleArray(n / 2 + 1)
+        val nfft = FastFourierTransform.nextPowerOf2(data.size)
+        val padded = DoubleArray(nfft)
+        System.arraycopy(data, 0, padded, 0, data.size)
         
-        // Slow DFT O(N^2) - okay for small windows (e.g. 100-300 samples)
-        // For larger windows, we should use FFT.
-        // Assuming window is ~6-10s @ 30Hz = 180-300 samples. Acceptable.
+        val (real, imag) = FastFourierTransform.fft(padded)
         
+        val spectrum = DoubleArray(nfft / 2 + 1)
         for (k in spectrum.indices) {
-            var real = 0.0
-            var imag = 0.0
-            for (t in 0 until n) {
-                val angle = 2.0 * Math.PI * t * k / n
-                real += data[t] * kotlin.math.cos(angle)
-                imag -= data[t] * kotlin.math.sin(angle)
-            }
-            spectrum[k] = sqrt(real * real + imag * imag)
+            spectrum[k] = sqrt(real[k] * real[k] + imag[k] * imag[k])
         }
         return spectrum
     }

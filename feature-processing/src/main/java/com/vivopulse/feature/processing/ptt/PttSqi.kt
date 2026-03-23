@@ -5,14 +5,31 @@ import kotlin.math.*
 /**
  * PTT Signal Quality Index (PTT-SQI) for confidence assessment.
  * 
- * Combines:
- * - Per-channel SQI (SNR, peak regularity, motion penalty)
- * - Cross-correlation score
- * - Peak sharpness
+ * P0.1 Research upgrade: Replaced multiplicative confidence chain
+ * with logit-space weighted sum. No single factor can collapse the
+ * confidence to zero — each contributes additively in logit space.
  * 
- * Confidence threshold: ≥0.60 to report PTT
+ * Outputs:
+ * - Continuous confidence score (0–1)
+ * - Quality tier (HIGH / MEDIUM / LOW / REJECTED)
+ * - Uncertainty estimate (when available)
  */
 object PttSqi {
+    
+    // ── Confidence thresholds ──
+    const val THRESHOLD_HIGH = 0.75
+    const val THRESHOLD_MEDIUM = 0.50
+    const val THRESHOLD_LOW = 0.30
+    
+    /**
+     * Quality tier for PTT measurement.
+     */
+    enum class QualityTier {
+        HIGH,       // conf ≥ 0.75 — report with high confidence
+        MEDIUM,     // conf ≥ 0.50 — report with caveat
+        LOW,        // conf ≥ 0.30 — report as experimental
+        REJECTED    // conf < 0.30 — do not report
+    }
     
     /**
      * Compute per-channel SQI.
@@ -20,14 +37,7 @@ object PttSqi {
      * Components:
      * - SNR (0-70 points): band power (0.7-4.0 Hz) / noise power
      * - Peak regularity (0-30 points): 1 - CV(RR)
-     * - Motion penalty (0 points for finger, applied for face)
-     * 
-     * @param filteredSignal Filtered signal (0.7-4.0 Hz bandpass)
-     * @param rawSignal Raw signal (before filtering)
-     * @param fsHz Sample rate
-     * @param peakResult Peak detection result
-     * @param motionPenalty Motion penalty 0-100 (100 = no motion, default)
-     * @return Channel SQI 0-100
+     * - Motion penalty: applied with weight 0.15 (was 0.0)
      */
     fun computeChannelSqi(
         filteredSignal: DoubleArray,
@@ -44,10 +54,12 @@ object PttSqi {
         val peakQuality = PeakDetect.assessPeakQuality(peakResult)
         val regularityScore = peakQuality * 0.3 // Scale to 0-30
         
-        // 3. Motion component (0 points base, penalty reduces score)
-        val motionScore = motionPenalty * 0.0 // Currently 0 weight, can adjust
+        // 3. Motion component (P0.1 fix: now active with weight 0.15)
+        // motionPenalty: 100 = no motion, 0 = extreme motion
+        // converts to 0-15 points: 100 → 15, 0 → 0
+        val motionScore = (motionPenalty / 100.0) * 15.0
         
-        // Combined score
+        // Combined score: max possible = 70 + 30 + 15 = 115, clamped to 100
         val sqi = snrScore + regularityScore + motionScore
         
         return ChannelSqiResult(
@@ -62,14 +74,6 @@ object PttSqi {
     
     /**
      * Compute band-limited SNR.
-     * 
-     * SNR = 10*log10(signal_power / noise_power)
-     * Signal = filtered (0.7-4.0 Hz passband)
-     * Noise = raw - filtered
-     * 
-     * @param filtered Filtered signal
-     * @param raw Raw signal
-     * @return SNR in dB
      */
     private fun computeBandSnr(filtered: DoubleArray, raw: DoubleArray): Double {
         val n = minOf(filtered.size, raw.size)
@@ -96,13 +100,6 @@ object PttSqi {
     
     /**
      * Convert SNR (dB) to score (0-70 points).
-     * 
-     * Mapping:
-     * - SNR 15+ dB → 70 points
-     * - SNR 10 dB → 50 points
-     * - SNR 5 dB → 30 points
-     * - SNR 0 dB → 10 points
-     * - SNR <0 dB → 0 points
      */
     private fun computeSnrScore(snrDb: Double): Double {
         return when {
@@ -114,40 +111,31 @@ object PttSqi {
     
     /**
      * Compute photometric SQI (R3-C).
-     * 
-     * Detects exposure steps and signal clipping that corrupt PPG quality.
-     * 
-     * @param rawSignal Raw (unfiltered) signal
-     * @return PhotometricSqiResult with score, step count, clip percentage
+     * Detects exposure steps and signal clipping.
      */
     fun computePhotometricSqi(rawSignal: DoubleArray): PhotometricSqiResult {
         if (rawSignal.size < 10) {
             return PhotometricSqiResult(score = 100, stepCount = 0, clipPercent = 0.0)
         }
         
-        // 1. Detect exposure steps: |Δsignal[i]| > 6×MAD(Δsignal)
-        // Use 6× (not 3×) because PPG heartbeats create legitimate diff spikes.
-        // Only true AE exposure jumps will exceed 6×MAD.
         val diffs = DoubleArray(rawSignal.size - 1) { i -> rawSignal[i + 1] - rawSignal[i] }
-        val absDiffs = diffs.map { kotlin.math.abs(it) }
+        val absDiffs = diffs.map { abs(it) }
         val sortedAbsDiffs = absDiffs.sorted()
         val medianDiff = if (sortedAbsDiffs.size % 2 == 0) {
             (sortedAbsDiffs[sortedAbsDiffs.size / 2 - 1] + sortedAbsDiffs[sortedAbsDiffs.size / 2]) / 2.0
         } else {
             sortedAbsDiffs[sortedAbsDiffs.size / 2]
         }
-        val madDiff = sortedAbsDiffs.map { kotlin.math.abs(it - medianDiff) }.sorted().let { sorted ->
+        val madDiff = sortedAbsDiffs.map { abs(it - medianDiff) }.sorted().let { sorted ->
             if (sorted.size % 2 == 0) (sorted[sorted.size / 2 - 1] + sorted[sorted.size / 2]) / 2.0
             else sorted[sorted.size / 2]
         }
         
-        // Threshold: 6×MAD above median, with a minimum floor to avoid triggering on flat signals
         val stepThreshold = maxOf(medianDiff + 6.0 * madDiff, medianDiff * 3.0)
         val stepCount = if (stepThreshold > 1e-10) {
             absDiffs.count { it > stepThreshold }
         } else 0
         
-        // 2. Detect clipping: samples within 1% of min/max range
         val minVal = rawSignal.minOrNull() ?: 0.0
         val maxVal = rawSignal.maxOrNull() ?: 1.0
         val range = maxVal - minVal
@@ -158,39 +146,31 @@ object PttSqi {
         val clipCount = rawSignal.count { it <= minVal + clipMargin || it >= maxVal - clipMargin }
         val clipPercent = (clipCount.toDouble() / rawSignal.size) * 100.0
         
-        // Score: normalize step count as % of signal, cap penalties
-        // stepPenalty: 0% steps=0, 1% steps=10, 5% steps=40 (capped)
         val stepPercent = (stepCount.toDouble() / rawSignal.size) * 100.0
         val stepPenalty = (stepPercent * 8.0).coerceAtMost(40.0)
-        
-        // clipPenalty: 0% clips=0, 5% clips=10, 15%+ clips=30 (capped)
         val clipPenalty = (clipPercent * 2.0).coerceAtMost(30.0)
         
-        val score = (100.0 - stepPenalty - clipPenalty)
-            .coerceIn(0.0, 100.0).toInt()
+        val score = (100.0 - stepPenalty - clipPenalty).coerceIn(0.0, 100.0).toInt()
         
         return PhotometricSqiResult(score = score, stepCount = stepCount, clipPercent = clipPercent)
     }
 
+    // ═══════════════════════════════════════════════════════════════
+    // P0.1: Logit-space soft confidence (replaces multiplicative)
+    // ═══════════════════════════════════════════════════════════════
+
     /**
-     * Compute combined PTT confidence (updated for R3-B + R3-C).
+     * Compute combined PTT confidence using logit-space weighted sum.
      * 
-     * Formula:
-     * confidence = (min(SQI_face, SQI_finger) / 100)
-     *            × corrScore
-     *            × sharpnessNorm
-     *            × delayStability      ← R3-B: multi-window lag consistency
-     *            × agreementNorm        ← method agreement (xcorr vs foot-to-foot)
+     * Instead of multiplying factors (where any ~0 kills everything),
+     * each factor is mapped to a sigmoid membership μᵢ ∈ (0,1),
+     * then combined in logit space:
+     *     score = Σ wᵢ · logit(μᵢ)
+     *     confidence = σ(score)
      * 
-     * Threshold: confidence ≥ 0.60 to report PTT
-     * 
-     * @param sqiFace Face channel SQI (0-100)
-     * @param sqiFinger Finger channel SQI (0-100)
-     * @param corrScore Cross-correlation score (0-1)
-     * @param peakSharpness Peak sharpness from cross-correlation
-     * @param delayStabilityScore R3-B: multi-window delay stability (0-1, default 1.0)
-     * @param methodAgreeMs Agreement between xcorr and foot-to-foot (ms)
-     * @return Combined confidence (0-1)
+     * This is equivalent to a logistic regression model where each
+     * quality metric is a feature. No single bad metric can collapse
+     * confidence to zero.
      */
     fun computeCombinedConfidence(
         sqiFace: Int,
@@ -200,37 +180,93 @@ object PttSqi {
         delayStabilityScore: Double = 1.0,
         methodAgreeMs: Double = 0.0
     ): Double {
-        // Weakest link for SQI
-        val minSqi = minOf(sqiFace, sqiFinger)
+        // ── Map each factor to membership μ ∈ (ε, 1-ε) ──
+        // Clamped to (0.01, 0.99) to prevent logit(0) = -Inf
+        val eps = 0.01
         
-        // Normalize sharpness (0.2 = full confidence)
-        val sharpnessNorm = minOf(1.0, peakSharpness / 0.2)
+        // 1. SQI: use soft-min instead of hard min
+        //    soft-min(a,b) = -1/λ · log(e^(-λa) + e^(-λb))
+        val lambda = 5.0 // temperature: higher = closer to hard min
+        val sqiFaceNorm = (sqiFace / 100.0).coerceIn(eps, 1.0 - eps)
+        val sqiFingerNorm = (sqiFinger / 100.0).coerceIn(eps, 1.0 - eps)
+        val muSqi = softMin(sqiFaceNorm, sqiFingerNorm, lambda).coerceIn(eps, 1.0 - eps)
         
-        // R3-B: delay stability factor
-        val stabilityFactor = delayStabilityScore.coerceIn(0.0, 1.0)
+        // 2. Correlation: already ∈ [0, 1]
+        val muCorr = corrScore.coerceIn(eps, 1.0 - eps)
         
-        // Method agreement factor: 0ms = perfect (1.0), 50ms = 0.375, 80ms+ = 0.0
-        // MAX_VALUE = unknown (foot-to-foot failed) → penalize to 0.7
-        val agreementFactor = when {
-            methodAgreeMs == Double.MAX_VALUE -> 0.7 // Unknown agreement
-            methodAgreeMs <= 0.0 -> 1.0              // Perfect or default agreement
-            else -> (1.0 - (methodAgreeMs / 80.0)).coerceIn(0.0, 1.0)
+        // 3. Peak sharpness: sigmoid mapping (now uses real value, not hardcoded)
+        val muSharpness = sigmoid((peakSharpness - 0.05) / 0.05).coerceIn(eps, 1.0 - eps)
+        
+        // 4. Delay stability: already ∈ [0, 1]
+        val muStability = delayStabilityScore.coerceIn(eps, 1.0 - eps)
+        
+        // 5. Method agreement: sigmoid gate on disagreement
+        val muAgreement = when {
+            methodAgreeMs == Double.MAX_VALUE -> 0.50 // Unknown = uncertain, not disqualifying
+            methodAgreeMs <= 0.0 -> 0.95              // Perfect agreement
+            else -> sigmoid((30.0 - methodAgreeMs) / 15.0).coerceIn(eps, 1.0 - eps)
         }
         
-        // Combined confidence
-        val confidence = (minSqi / 100.0) * corrScore * sharpnessNorm * stabilityFactor * agreementFactor
+        // ── Logit-space weighted sum ──
+        // Weights reflect relative importance:
+        val weights = doubleArrayOf(
+            2.0,   // SQI (most important — signal quality)
+            1.5,   // Correlation (cross-channel agreement)
+            0.5,   // Peak sharpness (supporting evidence)
+            1.0,   // Delay stability (multi-window consistency)
+            1.0    // Method agreement (xcorr vs foot-to-foot)
+        )
+        val memberships = doubleArrayOf(muSqi, muCorr, muSharpness, muStability, muAgreement)
+        
+        var logitSum = 0.0
+        var weightSum = 0.0
+        for (i in weights.indices) {
+            logitSum += weights[i] * logit(memberships[i])
+            weightSum += weights[i]
+        }
+        
+        // Normalize by total weight so confidence range stays interpretable
+        val normalizedLogit = logitSum / weightSum
+        
+        val confidence = sigmoid(normalizedLogit)
         
         return confidence.coerceIn(0.0, 1.0)
     }
     
     /**
+     * Determine quality tier from confidence.
+     */
+    fun getQualityTier(confidence: Double): QualityTier {
+        return when {
+            confidence >= THRESHOLD_HIGH -> QualityTier.HIGH
+            confidence >= THRESHOLD_MEDIUM -> QualityTier.MEDIUM
+            confidence >= THRESHOLD_LOW -> QualityTier.LOW
+            else -> QualityTier.REJECTED
+        }
+    }
+    
+    /**
      * Check if PTT should be reported based on confidence.
      * 
-     * @param confidence Combined confidence (0-1)
-     * @return true if confidence ≥ 0.60
+     * P0.1: Now reports for MEDIUM and above (was only HIGH/≥0.60).
+     * LOW tier can optionally be shown with "experimental" caveat.
      */
     fun shouldReportPtt(confidence: Double): Boolean {
-        return confidence >= 0.60
+        return getQualityTier(confidence) != QualityTier.REJECTED
+    }
+    
+    // ── Math helpers ──
+    
+    private fun sigmoid(x: Double): Double = 1.0 / (1.0 + exp(-x))
+    
+    private fun logit(p: Double): Double = ln(p / (1.0 - p))
+    
+    /**
+     * Differentiable soft-min: penalizes the worse channel without hard cutoff.
+     * softMin(a, b) ≈ min(a, b) as λ → ∞
+     */
+    private fun softMin(a: Double, b: Double, lambda: Double): Double {
+        return -1.0 / lambda * ln(exp(-lambda * a) + exp(-lambda * b))
     }
 }
 
