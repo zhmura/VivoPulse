@@ -7,6 +7,7 @@ import com.vivopulse.feature.processing.timestamp.TimestampedValue
 import com.vivopulse.signal.DspFunctions
 import android.util.Log
 import com.vivopulse.signal.PulseLog
+import com.vivopulse.signal.AppLogger
 import com.vivopulse.feature.processing.wavelet.WaveletDenoiser
 import com.vivopulse.feature.processing.motion.ImuMotionAnalyzer
 import com.vivopulse.feature.processing.motion.StepNotchFilter
@@ -355,6 +356,8 @@ class SignalPipeline(
             faceMotionPenalty = 100.0,
             footDetectionEnabled = footDetectionAllowed
         )
+        // Critical: Log result to file to survive logcat rotation/crash
+        AppLogger.log(tag, "Pipeline Result: PTT=${pttOutput.pttMs} ms, Conf=${"%.2f".format(pttOutput.confidence)}, Valid=${pttOutput.isValid}")
         Log.i(tag, "Pipeline Result: PTT=${pttOutput.pttMs} ms, Conf=${"%.2f".format(pttOutput.confidence)}, Valid=${pttOutput.isValid}")
         
         var pttDenoised: PttOutput? = null
@@ -460,13 +463,15 @@ class SignalPipeline(
             effectivePttDenoised = null
             val primary = failedGates.first()
             msg += " ($primary: PTT Gated)"
+            // Critical: Log gating reason to file
+            AppLogger.warn(tag, "PTT gated: primary=$primary, all=${failedGates.joinToString("|")}")
             Log.w(tag, "PTT gated: primary=$primary, all=${failedGates.joinToString("|")}")
         }
 
         // Per-session debug summary — enriched for next-run diagnosis
         val gateReason = if (failedGates.isEmpty()) "NONE" else failedGates.joinToString("|")
         val sharedClockLikely = clockDriftPpm <= 500
-        Log.i(PulseLog.SUMMARY, "SESSION_SUMMARY | " +
+        val summaryMsg = "SESSION_SUMMARY | " +
             "fpsFace=${"%.1f".format(driftResult.stream1Rate)} | " +
             "fpsFinger=${"%.1f".format(driftResult.stream2Rate)} | " +
             "dropsFace=${"%.0f".format(driftResult.stream1DropRate*100)}% | " +
@@ -485,7 +490,11 @@ class SignalPipeline(
             "lagMedianMs=${effectivePtt?.pttMs?.let { "%.1f".format(it) } ?: "null"} | " +
             "nBeats=$rawNBeats | " +
             "pttGated=$gateReason | " +
-            "pttMs=${effectivePtt?.pttMs?.let { "%.1f".format(it) } ?: "null"}")
+            "pttMs=${effectivePtt?.pttMs?.let { "%.1f".format(it) } ?: "null"}"
+        
+        // Use AppLogger to ensure this critical summary is written to file
+        AppLogger.log(PulseLog.SUMMARY, summaryMsg)
+        Log.i(PulseLog.SUMMARY, summaryMsg)
         
         return ProcessedSeries(
             timeMillis = timeMillis,

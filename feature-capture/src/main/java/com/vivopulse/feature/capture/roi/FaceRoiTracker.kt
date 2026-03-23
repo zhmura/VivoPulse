@@ -56,7 +56,8 @@ class FaceRoiTracker(
         // Configure ML Kit Face Detector
         val options = FaceDetectorOptions.Builder()
             .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_FAST)
-            .setLandmarkMode(FaceDetectorOptions.LANDMARK_MODE_ALL)
+            // Fix: Disable landmarks to prevent "ThickFaceDetector: Unknown landmark type" native spam/crash
+            .setLandmarkMode(FaceDetectorOptions.LANDMARK_MODE_NONE)
             .setClassificationMode(FaceDetectorOptions.CLASSIFICATION_MODE_NONE)
             .setMinFaceSize(0.15f) // Minimum face size (15% of frame)
             .enableTracking() // Enable face tracking for better performance

@@ -5,6 +5,7 @@ import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.vivopulse.app.util.ErrorHandler
+import com.vivopulse.signal.AppLogger
 import com.vivopulse.app.manager.SessionManager
 import com.vivopulse.feature.capture.RecordingResult
 import com.vivopulse.feature.capture.model.Source
