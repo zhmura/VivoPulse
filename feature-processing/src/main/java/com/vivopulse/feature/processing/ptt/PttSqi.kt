@@ -178,7 +178,8 @@ object PttSqi {
         corrScore: Double,
         peakSharpness: Double,
         delayStabilityScore: Double = 1.0,
-        methodAgreeMs: Double = 0.0
+        methodAgreeMs: Double = 0.0,
+        coherenceAtHr: Double = 0.5   // Default 0.5 = neutral (no CSP data)
     ): Double {
         // ── Map each factor to membership μ ∈ (ε, 1-ε) ──
         // Clamped to (0.01, 0.99) to prevent logit(0) = -Inf
@@ -207,6 +208,10 @@ object PttSqi {
             else -> sigmoid((30.0 - methodAgreeMs) / 15.0).coerceIn(eps, 1.0 - eps)
         }
         
+        // 6. Coherence at HR harmonics: direct measure of cross-channel physiological content
+        //    γ² < 0.15 → noise; γ² > 0.30 → strong shared signal
+        val muCoherence = sigmoid((coherenceAtHr - 0.15) / 0.10).coerceIn(eps, 1.0 - eps)
+        
         // ── Logit-space weighted sum ──
         // Weights reflect relative importance:
         val weights = doubleArrayOf(
@@ -214,9 +219,10 @@ object PttSqi {
             1.5,   // Correlation (cross-channel agreement)
             0.5,   // Peak sharpness (supporting evidence)
             1.0,   // Delay stability (multi-window consistency)
-            1.0    // Method agreement (xcorr vs foot-to-foot)
+            1.0,   // Method agreement (xcorr vs foot-to-foot)
+            1.5    // Coherence at HR (cross-spectral physiological content)
         )
-        val memberships = doubleArrayOf(muSqi, muCorr, muSharpness, muStability, muAgreement)
+        val memberships = doubleArrayOf(muSqi, muCorr, muSharpness, muStability, muAgreement, muCoherence)
         
         var logitSum = 0.0
         var weightSum = 0.0

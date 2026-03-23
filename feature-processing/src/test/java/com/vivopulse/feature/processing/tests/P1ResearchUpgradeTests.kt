@@ -202,4 +202,33 @@ class P1ResearchUpgradeTests {
         assertTrue("Should return prior estimate (~100ms), got ${result.pttMs}",
             abs(result.pttMs - 100.0) < 1.0)
     }
+
+    // ═══════════════════════════════════════════════════════════════
+    // Coherence → Confidence Flow Test
+    // ═══════════════════════════════════════════════════════════════
+
+    @Test
+    fun `coherence affects PttSqi confidence score`() {
+        // High coherence should produce higher confidence
+        val confHigh = PttSqi.computeCombinedConfidence(
+            sqiFace = 80, sqiFinger = 80,
+            corrScore = 0.7, peakSharpness = 0.1,
+            delayStabilityScore = 0.8, methodAgreeMs = 10.0,
+            coherenceAtHr = 0.6  // High coherence
+        )
+
+        // Low coherence should produce lower confidence
+        val confLow = PttSqi.computeCombinedConfidence(
+            sqiFace = 80, sqiFinger = 80,
+            corrScore = 0.7, peakSharpness = 0.1,
+            delayStabilityScore = 0.8, methodAgreeMs = 10.0,
+            coherenceAtHr = 0.05  // Very low coherence
+        )
+
+        assertTrue("High coherence (conf=$confHigh) should beat low coherence (conf=$confLow)",
+            confHigh > confLow)
+        // The difference should be meaningful (not just floating point noise)
+        assertTrue("Confidence difference should be > 0.01, got ${confHigh - confLow}",
+            confHigh - confLow > 0.01)
+    }
 }

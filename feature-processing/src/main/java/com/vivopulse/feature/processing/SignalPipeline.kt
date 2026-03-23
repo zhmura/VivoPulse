@@ -492,6 +492,9 @@ class SignalPipeline(
             "confidence=${"%.3f".format(rawConfidence)} | " +
             "pipelineQuality=${"%.3f".format(pipelineQuality)} | " +
             "qualityTier=$qualityTier | " +
+            "coherence=${"%.3f".format(pttOutput.meanCoherenceAtHr)} | " +
+            "kalmanCIMs=${"%.1f".format(pttOutput.kalmanCiMs)} | " +
+            "beatCoverage=${"%.2f".format(pttOutput.beatCoverage)} | " +
             "lagMedianMs=${effectivePtt?.pttMs?.let { "%.1f".format(it) } ?: "null"} | " +
             "nBeats=$rawNBeats | " +
             "weakGates=$gateReason | " +

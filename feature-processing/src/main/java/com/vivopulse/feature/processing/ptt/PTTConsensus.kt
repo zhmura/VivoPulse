@@ -22,7 +22,10 @@ data class ConsensusPtt(
     val pttMsIqr: Double,
     val methodAgreeMs: Double,
     val nBeats: Int,
-    val delayStabilityScore: Double = 1.0
+    val delayStabilityScore: Double = 1.0,
+    val kalmanCiMs: Double = Double.MAX_VALUE,     // 95% CI half-width from Kalman
+    val meanCoherenceAtHr: Double = 0.0,           // γ²(f) at HR harmonic bins
+    val beatCoverage: Double = 0.0                 // valid beats / expected beats
 )
 
 class PTTConsensus {
@@ -93,11 +96,13 @@ class PTTConsensus {
         }
 
         // ──────────── Method D: Cross-spectral phase delay (P1.4) ────────────
+        var cspCoherence = 0.0
         if (hrAvgBpm > 30) {
             val cspResult = CrossSpectralPhaseDelay.estimateDelay(
                 face, finger, fsHz, hrAvgBpm,
                 maxHarmonics = 4, gammaMin = 0.10
             )
+            cspCoherence = cspResult.meanCoherence
             if (cspResult.standardErrorMs < 200) {
                 val cspVar = PttKalmanFuser.cspToVariance(cspResult.standardErrorMs)
                 measurements.add(PttKalmanFuser.Measurement("CSP", cspResult.delayMs, cspVar))
@@ -127,12 +132,24 @@ class PTTConsensus {
               "methods=${fusion.methodsUsed}/${measurements.size} rejected=${fusion.methodsRejected} | " +
               "agree=${"%.1f".format(methodAgree)}ms stable=${fusion.isStable}")
 
+        // Beat coverage: ratio of detected beats to expected beats from HR
+        val durationSec = face.size / fsHz
+        val expectedBeats = if (hrAvgBpm > 0) (durationSec * hrAvgBpm / 60.0).toInt() else 0
+        val beatCov = if (expectedBeats > 0) (nBeats.toDouble() / expectedBeats).coerceIn(0.0, 1.0) else 0.0
+
+        android.util.Log.i(tag, "VALIDATION_METRICS | coherence=${"%.3f".format(cspCoherence)} | " +
+              "kalmanCI=${"%.1f".format(fusion.confidenceInterval)}ms | " +
+              "beatCoverage=${"%.2f".format(beatCov)} ($nBeats/$expectedBeats)")
+
         return ConsensusPtt(
             pttMsMedian = fusion.pttMs,
             pttMsIqr = footIqr,
             methodAgreeMs = methodAgree,
             nBeats = nBeats,
-            delayStabilityScore = stability
+            delayStabilityScore = stability,
+            kalmanCiMs = fusion.confidenceInterval,
+            meanCoherenceAtHr = cspCoherence,
+            beatCoverage = beatCov
         )
     }
 

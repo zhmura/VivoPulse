@@ -116,7 +116,8 @@ object PttEngine {
             corrScore = syncMetrics.correlation,
             peakSharpness = realPeakSharpness, // P0.1 fix: real value, not 0.5
             delayStabilityScore = consensusResult.delayStabilityScore,
-            methodAgreeMs = consensusResult.methodAgreeMs
+            methodAgreeMs = consensusResult.methodAgreeMs,
+            coherenceAtHr = consensusResult.meanCoherenceAtHr
         )
         
         val qualityTier = PttSqi.getQualityTier(finalConfidence)
@@ -157,7 +158,10 @@ object PttEngine {
             fingerPeakCount = fingerPeaks.getPeakCount(),
             nBeats = consensusResult.nBeats,
             guidance = guidance,
-            isValid = finalConfidence > 0 && hrFace.isValid && hrFinger.isValid
+            isValid = finalConfidence > 0 && hrFace.isValid && hrFinger.isValid,
+            kalmanCiMs = consensusResult.kalmanCiMs,
+            meanCoherenceAtHr = consensusResult.meanCoherenceAtHr,
+            beatCoverage = consensusResult.beatCoverage
         )
     }
     
@@ -221,7 +225,10 @@ data class PttOutput(
     val fingerPeakCount: Int = 0,   // Number of finger peaks detected
     val nBeats: Int = 0,            // Number of valid foot-to-foot beats for PTT
     val guidance: List<String>? = null,
-    val isValid: Boolean = false
+    val isValid: Boolean = false,
+    val kalmanCiMs: Double = Double.MAX_VALUE,     // 95% CI half-width from Kalman fusion
+    val meanCoherenceAtHr: Double = 0.0,           // Mean coherence at HR harmonic bins
+    val beatCoverage: Double = 0.0                 // Valid beats / expected beats (0-1)
 ) {
     fun isPttReportable(): Boolean = pttMs != null && qualityTier != PttSqi.QualityTier.REJECTED
     

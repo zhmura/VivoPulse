@@ -45,6 +45,9 @@ class PTTConsensusTest {
         // PTT should be somewhere in the ballpark of 80ms
         // With Kalman fusion from multiple methods, exact value depends on weighting
         assertTrue("PTT should be reportable (non-zero)", result.pttMsMedian != 0.0)
+        // Validation metrics should be populated
+        assertTrue("Kalman CI should be finite", result.kalmanCiMs.isFinite())
+        assertTrue("Beat coverage should be non-negative", result.beatCoverage >= 0.0)
     }
     
     @Test
@@ -78,5 +81,9 @@ class PTTConsensusTest {
         assertTrue("PTT should be non-zero", kotlin.math.abs(result.pttMsMedian) > 0)
         // Stability from multi-window should be reasonable
         assertTrue("Stability should be non-negative", result.delayStabilityScore >= 0)
+        // Validation metrics should be populated for sufficient signals
+        assertTrue("Kalman CI should be finite for valid signals", result.kalmanCiMs.isFinite())
+        assertTrue("Coherence should be > 0 for correlated signals", result.meanCoherenceAtHr > 0)
+        assertTrue("Beat coverage should be non-negative for 20s signal", result.beatCoverage >= 0)
     }
 }
