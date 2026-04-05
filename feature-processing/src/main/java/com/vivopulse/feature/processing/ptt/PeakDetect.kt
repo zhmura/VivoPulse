@@ -51,7 +51,12 @@ object PeakDetect {
         val n = sorted.size
         val median = if (n % 2 == 0) (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0 else sorted[n / 2]
         val mad = sorted.map { abs(it - median) }.sorted().let { s ->
-            if (s.size % 2 == 0) (s[s.size / 2 - 1] + s[s.size / 2]) / 2.0 else s[s.size / 2]
+            when {
+                s.isEmpty() -> 0.0
+                s.size == 1 -> s[0]
+                s.size % 2 != 0 -> s[s.size / 2]
+                else -> (s[s.size / 2 - 1] + s[s.size / 2]) / 2.0
+            }
         }
         // 1.4826 converts MAD to std-equivalent for Gaussian data
         // Factor of 0.5 puts threshold at ~69th percentile of signal

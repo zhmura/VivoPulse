@@ -57,7 +57,8 @@ class PttSqiTests {
             sqiFace = veryLowSqiFace,
             sqiFinger = veryLowSqiFinger,
             corrScore = lowCorr,
-            peakSharpness = lowSharpness
+            peakSharpness = lowSharpness,
+            coherenceAtHr = 0.05  // All factors weak — coherence near noise floor
         )
         
         val tier = PttSqi.getQualityTier(confidence)

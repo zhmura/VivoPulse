@@ -539,9 +539,9 @@ Valid if ≥ 3 peaks (2 intervals), HR ∈ [30, 240] bpm
 ```
 agreement = |PTT_XCorr - PTT_FootMedian|
 
-1. nBeats > 0 AND agreement ≤ 50ms → Use Foot-to-Foot (precise), score = 1.0
+1. nBeats > 0 AND agreement ≤ 20ms → Use Foot-to-Foot (precise), score = 1.0
 2. nBeats == 0                      → Use XCorr (fallback),      score = 1.0
-3. agreement > 50ms                 → Use XCorr (robust),        score = 0.5
+3. agreement > 20ms                 → Use XCorr (robust),        score = 0.5
 ```
 
 ---

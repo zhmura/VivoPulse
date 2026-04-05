@@ -232,10 +232,10 @@ class DualCameraController(
     private val maxConsecutiveErrors = 30
     @Volatile private var circuitBreakerTripped = false
     
-    private var frontExposureLocked = false
-    private var backExposureLocked = false
-    private var frontExposureSettled = true  // true = AE converged; false = timeout-forced
-    private var backExposureSettled = true
+    @Volatile private var frontExposureLocked = false
+    @Volatile private var backExposureLocked = false
+    @Volatile private var frontExposureSettled = true  // true = AE converged; false = timeout-forced
+    @Volatile private var backExposureSettled = true
 
     // P0-A: Stability-based AE lock — replace fixed 30-frame threshold
     // Rolling luma windows per camera, lock when settled
@@ -415,7 +415,11 @@ class DualCameraController(
     }
     
     private fun setupImu() {
-        sensorManager = context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
+        sensorManager = context.getSystemService(Context.SENSOR_SERVICE) as? SensorManager
+        if (sensorManager == null) {
+            Log.w(tag, "SensorManager unavailable — IMU motion detection disabled")
+            return
+        }
         accelerometer = sensorManager?.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
         if (accelerometer == null) {
             Log.w(tag, "No accelerometer found")

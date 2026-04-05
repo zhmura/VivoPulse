@@ -53,12 +53,14 @@ object CrossSpectralPhaseDelay {
         segmentLength: Int = 256
     ): CspResult {
         if (face.size < segmentLength || finger.size < segmentLength || hrBpm <= 0) {
+            android.util.Log.d("CSP", "estimateDelay: early exit — face=${face.size} finger=${finger.size} seg=$segmentLength hr=${"%.0f".format(hrBpm)}")
             return CspResult(0.0, Double.MAX_VALUE, 0.0, 0, 0)
         }
         
         // 1. Compute Welch cross-spectral estimates
         val welch = WelchEstimator.crossSpectral(face, finger, fs, segmentLength)
         if (welch.nSegments == 0) {
+            android.util.Log.d("CSP", "estimateDelay: early exit — Welch produced 0 segments")
             return CspResult(0.0, Double.MAX_VALUE, 0.0, 0, 0)
         }
         
@@ -102,6 +104,7 @@ object CrossSpectralPhaseDelay {
         // Need at least 3 bins for meaningful regression
         if (omegaList.size < 3) {
             val meanCoh = if (weightList.isNotEmpty()) weightList.average() else 0.0
+            android.util.Log.d("CSP", "estimateDelay: early exit — only ${omegaList.size} bins (need ≥3), harmonics=$harmonicsFound")
             return CspResult(0.0, Double.MAX_VALUE, meanCoh, omegaList.size, harmonicsFound)
         }
         
@@ -121,6 +124,7 @@ object CrossSpectralPhaseDelay {
         }
         
         if (sumWOO < 1e-20) {
+            android.util.Log.d("CSP", "estimateDelay: early exit — sumWOO near zero ($sumWOO)")
             return CspResult(0.0, Double.MAX_VALUE, w.average(), omega.size, harmonicsFound)
         }
         
