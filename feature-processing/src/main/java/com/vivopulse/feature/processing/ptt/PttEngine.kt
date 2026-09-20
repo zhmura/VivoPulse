@@ -61,7 +61,11 @@ object PttEngine {
         android.util.Log.d(tag, "Consensus: PTT=${"%.1f".format(pttMsRaw)} ms, Agreement=${"%.1f".format(consensusResult.methodAgreeMs)} ms (nBeats=${consensusResult.nBeats}, stability=${"%.2f".format(consensusResult.delayStabilityScore)})")
         
         // 4. Compute per-channel SQI
-        val sqiFace = PttSqi.computeChannelSqi(
+        // P4-A FIX: Raw SQI (filtered vs raw) is misleading — "noise = raw - filtered"
+        // includes all DC offset and slow drift that the bandpass correctly removed,
+        // producing absurdly negative SNR (-47 dB) even when the filtered signal is
+        // excellent. Keep raw SQI for diagnostic logging only.
+        val rawSqiFace = PttSqi.computeChannelSqi(
             filteredSignal = faceSig,
             rawSignal = faceRaw,
             fsHz = fsHz,
@@ -69,26 +73,28 @@ object PttEngine {
             motionPenalty = faceMotionPenalty
         )
         
-        val sqiFinger = PttSqi.computeChannelSqi(
+        val rawSqiFinger = PttSqi.computeChannelSqi(
             filteredSignal = fingerSig,
             rawSignal = fingerRaw,
             fsHz = fsHz,
             peakResult = fingerPeaks,
             motionPenalty = 100.0
         )
-        android.util.Log.d(tag, "SQI: Face=${sqiFace.sqi} (SNR=${sqiFace.snrScore}), Finger=${sqiFinger.sqi} (SNR=${sqiFinger.snrScore})")
         
-        // P3-A DIAGNOSTIC: Band-limited SQI
-        val bandSqiFace = PttSqi.computeChannelSqi(
+        // P4-A: Band-limited SQI (filtered vs filtered) — this is what the PTT
+        // algorithms actually operate on. SNR here compares bandpass signal power
+        // to within-band noise (peak irregularity), which is the meaningful metric.
+        val sqiFace = PttSqi.computeChannelSqi(
             filteredSignal = faceSig, rawSignal = faceSig, fsHz = fsHz,
             peakResult = facePeaks, motionPenalty = faceMotionPenalty
         )
-        val bandSqiFinger = PttSqi.computeChannelSqi(
+        val sqiFinger = PttSqi.computeChannelSqi(
             filteredSignal = fingerSig, rawSignal = fingerSig, fsHz = fsHz,
             peakResult = fingerPeaks, motionPenalty = 100.0
         )
-        android.util.Log.i(tag, "SQI_DUAL_DIAG | face: raw=${sqiFace.sqi}(snr=${"%.1f".format(sqiFace.snrDb)}dB) band=${bandSqiFace.sqi}(snr=${"%.1f".format(bandSqiFace.snrDb)}dB) | " +
-              "finger: raw=${sqiFinger.sqi}(snr=${"%.1f".format(sqiFinger.snrDb)}dB) band=${bandSqiFinger.sqi}(snr=${"%.1f".format(bandSqiFinger.snrDb)}dB)")
+        android.util.Log.d(tag, "SQI: Face=${sqiFace.sqi} (SNR=${sqiFace.snrScore}), Finger=${sqiFinger.sqi} (SNR=${sqiFinger.snrScore})")
+        android.util.Log.i(tag, "SQI_DUAL_DIAG | face: raw=${rawSqiFace.sqi}(snr=${"%.1f".format(rawSqiFace.snrDb)}dB) band=${sqiFace.sqi}(snr=${"%.1f".format(sqiFace.snrDb)}dB) | " +
+              "finger: raw=${rawSqiFinger.sqi}(snr=${"%.1f".format(rawSqiFinger.snrDb)}dB) band=${sqiFinger.sqi}(snr=${"%.1f".format(sqiFinger.snrDb)}dB)")
         
         // P3-D DIAGNOSTIC: Adaptive bandpass
         val adaptiveLowFace = if (hrFace.hrBpm > 0) maxOf(0.5, (hrFace.hrBpm / 60.0) * 0.5) else 0.7
@@ -111,10 +117,10 @@ object PttEngine {
         val realPeakSharpness = xcorrResult.peakSharpness
         
         val finalConfidence = PttSqi.computeCombinedConfidence(
-            sqiFace = sqiFace.sqi,
-            sqiFinger = sqiFinger.sqi,
+            sqiFace = sqiFace.sqi,       // P4-A: now uses band SQI (was raw)
+            sqiFinger = sqiFinger.sqi,   // P4-A: now uses band SQI (was raw)
             corrScore = syncMetrics.correlation,
-            peakSharpness = realPeakSharpness, // P0.1 fix: real value, not 0.5
+            peakSharpness = realPeakSharpness,
             delayStabilityScore = consensusResult.delayStabilityScore,
             methodAgreeMs = consensusResult.methodAgreeMs,
             coherenceAtHr = consensusResult.meanCoherenceAtHr
@@ -126,7 +132,7 @@ object PttEngine {
               "Corr=${"%.2f".format(syncMetrics.correlation)}, " +
               "Stability=${"%.2f".format(consensusResult.delayStabilityScore)}, " +
               "Sharpness=${"%.3f".format(realPeakSharpness)}, " +
-              "SQI=face:${sqiFace.sqi}/finger:${sqiFinger.sqi}")
+              "SQI=face:${sqiFace.sqi}/finger:${sqiFinger.sqi} (raw:${rawSqiFace.sqi}/${rawSqiFinger.sqi})")
         
         // 6. Determine if PTT should be reported (P0.1: MEDIUM+ now reported)
         val shouldReport = PttSqi.shouldReportPtt(finalConfidence)

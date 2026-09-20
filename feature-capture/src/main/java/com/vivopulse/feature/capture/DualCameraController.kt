@@ -320,17 +320,17 @@ class DualCameraController(
                 .setCaptureRequestOption(CaptureRequest.CONTROL_AE_LOCK, true)
                 .setCaptureRequestOption(CaptureRequest.CONTROL_AWB_LOCK, true)
 
-            // Gap C: Conditional AF lock based on device capability
-            if (deviceCapabilities?.supportsManualFocus == true) {
-                // Manual focus: lock AF off and set explicit focus distance
-                val focusDistance = if (source == Source.FACE) 0.0f else 10.0f // Infinity for face, near/macro for finger
+            // Gap C: Conditional AF lock based on device capability (Back camera only)
+            if (deviceCapabilities?.supportsManualFocus == true && source == Source.FINGER) {
+                // Manual focus for back camera: lock AF off and set explicit focus distance
+                val focusDistance = 10.0f // near/macro for finger
                 builder.setCaptureRequestOption(CaptureRequest.CONTROL_AF_MODE, android.hardware.camera2.CameraMetadata.CONTROL_AF_MODE_OFF)
                 builder.setCaptureRequestOption(CaptureRequest.LENS_FOCUS_DISTANCE, focusDistance)
                 Log.i(PulseLog.MEASURE, "3A_LOCK | ${source.name} | manual AF | focusDist=$focusDistance")
             } else {
-                // Fallback: trigger one-shot AF then let it settle
+                // Fallback: use AF_AUTO mode (which holds current focus) but DO NOT set TRIGGER_START
+                // because addCaptureRequestOptions applies it to every repeating frame, which stalls the ISP.
                 builder.setCaptureRequestOption(CaptureRequest.CONTROL_AF_MODE, android.hardware.camera2.CameraMetadata.CONTROL_AF_MODE_AUTO)
-                builder.setCaptureRequestOption(CaptureRequest.CONTROL_AF_TRIGGER, android.hardware.camera2.CameraMetadata.CONTROL_AF_TRIGGER_START)
                 Log.w(PulseLog.MEASURE, "3A_LOCK | ${source.name} | no manual focus — best-effort AF_AUTO")
             }
 
@@ -859,7 +859,7 @@ class DualCameraController(
                 height = image.height,
                 yuvPlanes = emptyList(),
                 faceLuma = faceLuma,
-                fingerLuma = fingerLuma,
+                fingerLuma = fingerVChannel ?: fingerLuma, // Use V-Channel (PPG pulsation) for recording, consistent with live wave
                 faceRgb = faceRgb,
                 fingerRgb = fingerRgb,
                 faceMotionRms = faceMotionRms,
@@ -1195,8 +1195,8 @@ class DualCameraController(
         if (roi.isEmpty) return null
         val width = roi.width().coerceAtLeast(1)
         val height = roi.height().coerceAtLeast(1)
-        val sampledWidth = (width / step).coerceAtLeast(1)
-        val sampledHeight = (height / step).coerceAtLeast(1)
+        val sampledWidth = ((width + step - 1) / step).coerceAtLeast(1)
+        val sampledHeight = ((height + step - 1) / step).coerceAtLeast(1)
         val sampleCount = sampledWidth * sampledHeight
         
         if (sampleCount <= 0) return null

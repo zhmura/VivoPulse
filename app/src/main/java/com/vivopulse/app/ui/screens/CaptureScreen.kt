@@ -43,6 +43,11 @@ import com.vivopulse.feature.capture.roi.RoiOverlayView
 import com.vivopulse.feature.processing.realtime.ChannelQualityIndicator
 import com.vivopulse.feature.processing.realtime.QualityStatus
 import com.vivopulse.feature.processing.realtime.RealTimeQualityState
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
 import androidx.compose.material3.ColorScheme
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -616,34 +621,104 @@ fun CameraPreviewCard(
         }
     } ?: MaterialTheme.colorScheme.surfaceVariant
 
+    // Status dot color (vivid, not pastel)
+    val dotColor = quality?.status?.let {
+        when(it) {
+            QualityStatus.GREEN -> Color(0xFF4CAF50)
+            QualityStatus.YELLOW -> Color(0xFFFFC107)
+            QualityStatus.RED -> Color(0xFFF44336)
+        }
+    } ?: Color.Gray
+
+    // Human-readable status label
+    val statusLabel = quality?.status?.let {
+        when(it) {
+            QualityStatus.GREEN -> "Good"
+            QualityStatus.YELLOW -> "Weak"
+            QualityStatus.RED -> "Poor"
+        }
+    } ?: "—"
+
+    // First diagnostic reason (most important)
+    val diagnosticText = quality?.diagnostics?.firstOrNull()
+
+    // Animated pulse for the status dot
+    val infiniteTransition = rememberInfiniteTransition(label = "dotPulse")
+    val dotAlpha by infiniteTransition.animateFloat(
+        initialValue = 1f,
+        targetValue = 0.3f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(800, easing = androidx.compose.animation.core.FastOutSlowInEasing),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "dotAlpha"
+    )
+
     Card(
         modifier = modifier,
         elevation = CardDefaults.cardElevation(defaultElevation = 2.dp),
         colors = CardDefaults.cardColors(containerColor = cardColor)
     ) {
         Column(modifier = Modifier.fillMaxSize()) {
+            // ── Header bar with quality badge ──
             Surface(
                 modifier = Modifier.fillMaxWidth(),
-                color = cardColor.copy(alpha = 0.8f)
+                color = cardColor.copy(alpha = 0.9f)
             ) {
                 Row(
-                    modifier = Modifier.padding(4.dp),
+                    modifier = Modifier
+                        .padding(horizontal = 8.dp, vertical = 4.dp)
+                        .fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
+                    // Left: title
                     Text(
                         text = title,
-                        style = MaterialTheme.typography.labelSmall,
+                        style = MaterialTheme.typography.labelMedium,
                         color = MaterialTheme.colorScheme.onSurface
                     )
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        if (quality?.snrDb != null) {
+                    
+                    // Right: quality badge row
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        // HR estimate
+                        quality?.hrEstimateBpm?.let { hr ->
                             Text(
-                                text = "${String.format("%.1f", quality.snrDb)} dB",
+                                text = "${hr.toInt()} bpm",
                                 style = MaterialTheme.typography.labelSmall,
-                                modifier = Modifier.padding(end = 4.dp)
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                         }
+                        
+                        // SNR
+                        if (quality?.snrDb != null) {
+                            Text(
+                                text = "${String.format("%.0f", quality.snrDb)} dB",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        
+                        // Animated status dot
+                        Box(
+                            modifier = Modifier
+                                .size(10.dp)
+                                .background(
+                                    color = dotColor.copy(alpha = if (quality?.status == QualityStatus.RED) dotAlpha else 1f),
+                                    shape = androidx.compose.foundation.shape.CircleShape
+                                )
+                        )
+                        
+                        // Status label
+                        Text(
+                            text = statusLabel,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = dotColor
+                        )
+                        
                         if (showTorchIndicator) {
                             Icon(
                                 imageVector = Icons.Default.FlashlightOn,
@@ -656,6 +731,22 @@ fun CameraPreviewCard(
                 }
             }
             
+            // ── Diagnostic reason strip (only when not GREEN) ──
+            if (diagnosticText != null && quality?.status != QualityStatus.GREEN) {
+                Surface(
+                    modifier = Modifier.fillMaxWidth(),
+                    color = dotColor.copy(alpha = 0.15f)
+                ) {
+                    Text(
+                        text = "⚠ $diagnosticText",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = dotColor,
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp)
+                    )
+                }
+            }
+            
+            // ── Camera preview ──
             Box(
                 modifier = Modifier
                     .fillMaxSize()

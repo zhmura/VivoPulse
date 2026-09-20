@@ -35,7 +35,7 @@ object SyncMetrics {
         val hrDelta = abs(hrFaceBpm - hrFingerBpm)
         
         // Cross-correlation
-        val (corr, lagSamples, fwhmSamples) = computeCrossCorrelation(faceSig, fingerSig)
+        val (corr, lagSamples, fwhmSamples) = computeCrossCorrelation(faceSig, fingerSig, fsHz)
         
         val lagMs = (lagSamples / fsHz) * 1000.0
         val fwhmMs = (fwhmSamples / fsHz) * 1000.0
@@ -50,12 +50,17 @@ object SyncMetrics {
     
     private fun computeCrossCorrelation(
         x: DoubleArray,
-        y: DoubleArray
+        y: DoubleArray,
+        fsHz: Double = 100.0
     ): Triple<Double, Double, Double> {
         if (x.size != y.size || x.isEmpty()) return Triple(0.0, 0.0, 0.0)
         
         val n = x.size
-        val maxLag = n / 2 // +/- half window
+        // P4-B FIX: Constrain lag search to physiological PTT range (±500ms).
+        // Previous maxLag = n/2 searched ±11s on a 22s recording, finding
+        // spurious noise peaks at 4+ seconds that corrupted Kalman fusion.
+        val maxLagPhysiological = (0.5 * fsHz).toInt() // 500ms → 50 samples at 100Hz
+        val maxLag = minOf(maxLagPhysiological, n / 2)
         
         var maxCorr = -1.0
         var bestLag = 0

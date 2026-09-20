@@ -113,7 +113,10 @@ class PTTConsensus {
         }
 
         // ──────────── Kalman Fusion (P1.6) ────────────
-        kalman.reset(pttXCorr, 2500.0) // Reset per session with XCorr as prior
+        // P4-B: Use neutral physiological prior (100ms) instead of potentially
+        // wrong XCorr value. Wide initial variance (2500ms²) lets the filter
+        // converge quickly to whichever methods agree.
+        kalman.reset(100.0, 2500.0)
         val fusion = kalman.fuse(measurements)
 
         val stability = multiResult.stabilityScore.coerceIn(0.0, 1.0)

@@ -19,7 +19,7 @@ object PttSqi {
     // ── Confidence thresholds ──
     const val THRESHOLD_HIGH = 0.75
     const val THRESHOLD_MEDIUM = 0.50
-    const val THRESHOLD_LOW = 0.30
+    const val THRESHOLD_LOW = 0.20
     
     /**
      * Quality tier for PTT measurement.
@@ -27,8 +27,8 @@ object PttSqi {
     enum class QualityTier {
         HIGH,       // conf ≥ 0.75 — report with high confidence
         MEDIUM,     // conf ≥ 0.50 — report with caveat
-        LOW,        // conf ≥ 0.30 — report as experimental
-        REJECTED    // conf < 0.30 — do not report
+        LOW,        // conf ≥ 0.20 — report as experimental
+        REJECTED    // conf < 0.20 — do not report
     }
     
     /**
@@ -182,8 +182,13 @@ object PttSqi {
         coherenceAtHr: Double = 0.5   // Default 0.5 = neutral (no CSP data)
     ): Double {
         // ── Map each factor to membership μ ∈ (ε, 1-ε) ──
-        // Clamped to (0.01, 0.99) to prevent logit(0) = -Inf
-        val eps = 0.01
+        // P4-C: Raised floor from 0.01 to 0.10. At ε=0.01, logit=-4.60
+        // which means any factor bottoming out dominates the entire score.
+        // Stability & agreement are highly correlated (both measure cross-
+        // correlation quality), so when they both hit floor, they double-
+        // count the penalty. At ε=0.10, logit=-2.20 — still a strong
+        // penalty but prevents cascading collapse.
+        val eps = 0.10
         
         // 1. SQI: use soft-min instead of hard min
         //    soft-min(a,b) = -1/λ · log(e^(-λa) + e^(-λb))
