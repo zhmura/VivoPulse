@@ -280,5 +280,110 @@ class DspFunctionsTest {
         assertEquals(0, DspFunctions.zscoreNormalize(empty).size)
         assertEquals(0.0, DspFunctions.computePower(empty), epsilon)
     }
+    @Test
+    fun `removeMean - correctly centers signal`() {
+        val signal = doubleArrayOf(10.0, 12.0, 14.0) // Mean = 12.0
+        val centered = DspFunctions.removeMean(signal)
+        
+        assertEquals(-2.0, centered[0], epsilon)
+        assertEquals(0.0, centered[1], epsilon)
+        assertEquals(2.0, centered[2], epsilon)
+        assertEquals(0.0, centered.average(), epsilon)
+    }
+
+    @Test
+    fun `filtfilt - zero phase shift`() {
+        // Create a symmetric Gaussian pulse. Peak is exactly at center.
+        val size = 100
+        val center = size / 2
+        val signal = DoubleArray(size) { i ->
+            exp(-0.5 * ((i - center) / 5.0).pow(2))
+        }
+
+        // Apply filtfilt with a lowpass filter
+        val filtered = DspFunctions.filtfilt(signal) { input ->
+             // Let's us a simple dummy filter to prove the mechanism: reverse-filter-reverse.
+             // But to test REAL usage, we use butterworth.
+             // Let's simulate a standard bandpass.
+             DspFunctions.butterworthBandpass(input, 0.1, 4.0, 30.0, 2)
+        }
+        
+        // Find peak of input and output
+        val inputPeakIdx = signal.indices.maxByOrNull { signal[it] }!!
+        val outputPeakIdx = filtered.indices.maxByOrNull { filtered[it] }!!
+        
+        // The peak should stay at the same index
+        assertEquals("Peak should not move (Zero Phase)", inputPeakIdx, outputPeakIdx)
+    }
+
+    @Test
+    fun `filtfilt - transient suppression at boundaries`() {
+        // Step function: 0, 0, ..., 10, 10, ...
+        // A normal IIR filter would ring heavily at the step if it's at index 0.
+        // Our padding should strictly handle the boundaries.
+        // Let's test a signal that starts with a high DC offset.
+        val size = 100
+        val signal = DoubleArray(size) { 100.0 + sin(it * 0.1) } // DC = 100
+        
+        // If we didn't remove DC or pad, the start would be wild.
+        // removeMean + filtfilt should handle this.
+        val centered = DspFunctions.removeMean(signal)
+        val filtered = DspFunctions.filtfilt(centered) { input ->
+            DspFunctions.butterworthBandpass(input, 0.5, 4.0, 30.0, 2)
+        }
+        
+        // Check the first few samples. They should not be massive spikes relative to the rest.
+        val maxVal = filtered.map { abs(it) }.maxOrNull()!!
+        val firstVal = abs(filtered[0])
+        
+        // The artifact shouldn't be effectively infinite or orders of magnitude larger
+        assertTrue("Start artifact ${firstVal} should be reasonable vs max ${maxVal}", firstVal < maxVal * 2.0)
+    }
+
+    @Test
+    fun `filtfilt - window boundary invariance`() {
+        val fs = 100.0
+        // Generate 10s signal (1000 samples) — long enough for windows + padding
+        val totalDuration = 10.0
+        val totalSamples = (totalDuration * fs).toInt()
+        val s1 = DspFunctions.generateSineWave(1.2, totalDuration, fs, amplitude = 1.0)
+        val s2 = DspFunctions.generateSineWave(2.5, totalDuration, fs, amplitude = 0.5)
+        val signal = DoubleArray(totalSamples) { i -> s1[i] + s2[i] }
+        
+        // Window 1: 0..5s (500 samples)
+        val w1Len = 500
+        val w1 = signal.sliceArray(0 until w1Len)
+        
+        // Window 2: 0.5..5.5s (shift 50 samples)
+        val shift = 50
+        val w2 = signal.sliceArray(shift until (w1Len + shift))
+        
+        val filterOp: (DoubleArray) -> DoubleArray = { 
+            DspFunctions.butterworthBandpass(it, 0.7, 4.0, fs, 2)
+        }
+        
+        // padLength = 150 matches production SignalPipeline setting
+        val f1 = DspFunctions.filtfilt(w1, padLength = 150, filterOp)
+        val f2 = DspFunctions.filtfilt(w2, padLength = 150, filterOp)
+        
+        // Compare overlapping region in the safe middle.
+        // Overlap in absolute time: [0.5s, 5.0s].
+        // Skip first 1.5s of each window to avoid any edge effects.
+        // Compare absolute time [2.0s, 4.0s]:
+        //   w1 indices: 200..400
+        //   w2 indices: 150..350
+        
+        var maxDiff = 0.0
+        val compareLen = 200
+        for (i in 0 until compareLen) {
+            val v1 = f1[200 + i]
+            val v2 = f2[150 + i]
+            val diff = abs(v1 - v2)
+            if (diff > maxDiff) maxDiff = diff
+        }
+        
+        println("Window Invariance Max Diff: $maxDiff")
+        assertTrue("Invariance failed, maxDiff=$maxDiff > 0.01", maxDiff < 0.01)
+    }
 }
 

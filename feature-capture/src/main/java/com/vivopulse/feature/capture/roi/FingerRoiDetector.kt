@@ -102,7 +102,7 @@ object FingerRoiDetector {
     /**
      * Compute luma variance in ROI.
      */
-    private fun computeRoiVariance(
+    internal fun computeRoiVariance(
         yPlane: ByteBuffer,
         roi: Rect,
         rowStride: Int,

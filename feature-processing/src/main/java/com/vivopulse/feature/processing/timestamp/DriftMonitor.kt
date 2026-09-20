@@ -63,12 +63,15 @@ class DriftMonitor {
             return
         }
         
-        val result = TimestampSync.computeDrift(
+        val result = TimestampSync.analyzeSynchronization(
             frontTimestamps,
             backTimestamps,
             windowSizeMs = 5000
         )
         
+        // With SENSOR_TIMESTAMP, 'drift' is effectively 0.0.
+        // We report this as the metric.
+        // TODO: Update UI to show Jitter/DropRate instead of 'Drift'
         _driftMsPerSecond.value = result.driftMsPerSecond
         _isValid.value = result.isValid
     }

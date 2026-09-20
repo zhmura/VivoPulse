@@ -3,7 +3,7 @@ package com.vivopulse.app.ui.screens
 import android.widget.Toast
 import androidx.compose.foundation.layout.*
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.FileDownload
 import androidx.compose.material.icons.filled.Warning
@@ -15,6 +15,8 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
+import androidx.navigation.NavController
+import com.vivopulse.app.navigation.PROCESSING_GRAPH_ROUTE
 import com.vivopulse.app.ui.components.QualityBadge
 import com.vivopulse.app.viewmodel.ProcessingViewModel
 import com.vivopulse.app.ui.education.EducationTextProvider
@@ -26,8 +28,15 @@ import com.vivopulse.app.ui.components.PulseGraph
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ResultScreen(
+    navController: NavController,
     onNavigateBack: () -> Unit,
-    viewModel: ProcessingViewModel = hiltViewModel()
+    viewModel: ProcessingViewModel = if (
+        navController.currentBackStack.value.any { it.destination.route == PROCESSING_GRAPH_ROUTE }
+    ) {
+        hiltViewModel(navController.getBackStackEntry(PROCESSING_GRAPH_ROUTE))
+    } else {
+        hiltViewModel()  // Fallback: backstack entry not available
+    }
 ) {
     val context = LocalContext.current
     val pttResult by viewModel.pttResult.collectAsState()
@@ -62,7 +71,7 @@ fun ResultScreen(
                 title = { Text("Results") },
                 navigationIcon = {
                     IconButton(onClick = onNavigateBack) {
-                        Icon(Icons.Default.ArrowBack, contentDescription = "Back")
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
                     }
                 }
             )
@@ -115,7 +124,7 @@ fun ResultScreen(
                                     PttResult.Quality.EXCELLENT, PttResult.Quality.GOOD -> Icons.Default.CheckCircle
                                     else -> Icons.Default.Warning
                                 },
-                                contentDescription = null,
+                                contentDescription = "Quality: ${ptt.getQuality().name}",
                                 tint = when (ptt.getQuality()) {
                                     PttResult.Quality.EXCELLENT -> Color(0xFF4CAF50)
                                     PttResult.Quality.GOOD -> Color(0xFF2196F3)
@@ -144,7 +153,7 @@ fun ResultScreen(
                         
                         Spacer(modifier = Modifier.height(16.dp))
                         
-                        Divider()
+                        HorizontalDivider()
                         
                         Spacer(modifier = Modifier.height(16.dp))
                         
@@ -264,7 +273,7 @@ fun ResultScreen(
                             // Suggestions
                             if (quality.suggestions.isNotEmpty()) {
                                 Spacer(modifier = Modifier.height(12.dp))
-                                Divider()
+                                HorizontalDivider()
                                 Spacer(modifier = Modifier.height(12.dp))
                                 
                                 Text(
@@ -325,7 +334,7 @@ fun ResultScreen(
                                 val rise = wp.meanRiseTimeMs?.let { String.format("%.0f ms", it) } ?: "—"
                                 val refl = wp.meanReflectionRatio?.let { String.format("%.2f", it) } ?: "—"
                                 Spacer(modifier = Modifier.height(8.dp))
-                                Divider()
+                                HorizontalDivider()
                                 Spacer(modifier = Modifier.height(8.dp))
                                 Text(
                                     text = "Wave metrics",
@@ -426,7 +435,7 @@ fun ResultScreen(
                                 )
                                 
                                 Spacer(modifier = Modifier.height(8.dp))
-                                Divider()
+                        HorizontalDivider()
                                 Spacer(modifier = Modifier.height(8.dp))
                                 
                                 MetricRow("Mean Processing Time", String.format("%.2f ms", report.meanProcessingMs))

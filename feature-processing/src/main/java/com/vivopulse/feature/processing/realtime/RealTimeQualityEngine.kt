@@ -1,7 +1,5 @@
 package com.vivopulse.feature.processing.realtime
 
-import com.vivopulse.feature.processing.ptt.HeartRate
-import com.vivopulse.feature.processing.ptt.PeakDetect
 import com.vivopulse.feature.processing.signal.SnrEstimator
 import com.vivopulse.signal.DspFunctions
 import com.vivopulse.signal.RingBufferDouble
@@ -72,6 +70,10 @@ class RealTimeQualityEngine(
     private var lastEmitMs = 0L
     private var lastTorchEnabled = false
     private var lastState: RealTimeQualityState? = null
+
+    // P2: Smart Search — track last valid HR per channel for ±15 BPM window constraint
+    private var lastValidFaceHrBpm: Double? = null
+    private var lastValidFingerHrBpm: Double? = null
 
     fun addSample(sample: SignalSample): RealTimeQualityState? {
         sample.faceMeanLuma?.let { faceBuffer.add(it, sample.timestampNs) }
@@ -185,7 +187,20 @@ class RealTimeQualityEngine(
             sampleRateHz = fsHz
         )
         val snrDb = if (fsHz > 5.0) snrEstimator.computeSnrDb(filtered, fsHz) else null
-        val hr = if (fsHz > 5.0) computeHr(filtered, fsHz) else null
+        
+        // P2+P3: Spectral HR with Smart Search (replaces time-domain peak detection)
+        val previousHr = when (channel) {
+            ChannelType.FACE -> lastValidFaceHrBpm
+            ChannelType.FINGER -> lastValidFingerHrBpm
+        }
+        val hr = computeHrSpectral(filtered, fsHz, previousHr)
+        if (hr != null) {
+            when (channel) {
+                ChannelType.FACE -> lastValidFaceHrBpm = hr
+                ChannelType.FINGER -> lastValidFingerHrBpm = hr
+            }
+        }
+        
         val acDc = computeAcDcRatio(window.values)
         val sparkline = window.normalized()
 
@@ -208,12 +223,66 @@ class RealTimeQualityEngine(
         )
     }
 
-    private fun computeHr(signal: DoubleArray, fsHz: Double): Double? {
-        val peaks = PeakDetect.detectPeaks(signal, fsHz)
-        val hrResult = HeartRate.computeHeartRate(peaks)
-        return if (hrResult.isValid && HeartRate.isHrPlausible(hrResult.hrBpm)) {
-            hrResult.hrBpm
-        } else null
+    /**
+     * P2+P3: FFT-based HR estimation with Smart Search.
+     *
+     * Uses DFT magnitude spectrum to find dominant frequency in the pulse band.
+     * If [previousHrBpm] is available, constrains search to ±15 BPM (Smart Search
+     * from Ojas project) to prevent harmonic jumping between updates.
+     *
+     * Falls back to full-band search [0.7–3.5 Hz] when no previous HR exists.
+     */
+    private fun computeHrSpectral(
+        signal: DoubleArray,
+        fsHz: Double,
+        previousHrBpm: Double?
+    ): Double? {
+        if (signal.size < 64 || fsHz <= 5.0) return null
+
+        // Apply Hanning window to reduce spectral leakage
+        val n = signal.size
+        val windowed = DoubleArray(n) { i ->
+            val w = 0.5 * (1.0 - kotlin.math.cos(2.0 * Math.PI * i / (n - 1)))
+            signal[i] * w
+        }
+
+        val spectrum = snrEstimator.computeMagnitudeSpectrum(windowed)
+        val binWidth = fsHz / n
+
+        // Full physiological band
+        val fullLowHz = 0.7    // 42 BPM
+        val fullHighHz = 3.5   // 210 BPM
+
+        // P2: Smart Search — narrow to ±15 BPM if previous HR is available
+        val searchLowHz: Double
+        val searchHighHz: Double
+        if (previousHrBpm != null) {
+            val centerHz = previousHrBpm / 60.0
+            val deltaHz = 15.0 / 60.0  // ±15 BPM → ±0.25 Hz
+            searchLowHz = maxOf(fullLowHz, centerHz - deltaHz)
+            searchHighHz = minOf(fullHighHz, centerHz + deltaHz)
+        } else {
+            searchLowHz = fullLowHz
+            searchHighHz = fullHighHz
+        }
+
+        // Find peak in search band
+        var peakMag = 0.0
+        var peakBin = -1
+        for (k in spectrum.indices) {
+            val freq = k * binWidth
+            if (freq < searchLowHz) continue
+            if (freq > searchHighHz) break
+            if (spectrum[k] > peakMag) {
+                peakMag = spectrum[k]
+                peakBin = k
+            }
+        }
+
+        if (peakBin < 0) return null
+
+        val hrBpm = peakBin * binWidth * 60.0
+        return if (hrBpm in 40.0..210.0) hrBpm else null
     }
 
     private fun computeAcDcRatio(values: DoubleArray): Double? {

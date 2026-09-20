@@ -24,6 +24,7 @@ import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleOwner
 import com.vivopulse.signal.AppLogger
+import com.vivopulse.signal.PulseLog
 import com.vivopulse.feature.capture.analysis.SafeImageAnalyzer
 import com.vivopulse.feature.capture.camera.SequentialPrimary
 import com.vivopulse.feature.capture.model.Frame
@@ -141,11 +142,24 @@ class DualCameraController(
     val frontTimestamps: SharedFlow<Long> = _frontTimestamps.asSharedFlow()
     val backTimestamps: SharedFlow<Long> = _backTimestamps.asSharedFlow()
     
+    // AE Diagnostics: Map timestamp -> TotalCaptureResult
+    private val captureResults = java.util.concurrent.ConcurrentHashMap<Long, android.hardware.camera2.TotalCaptureResult>()
+    
     private val faceRoiTracker = FaceRoiTracker(detectionInterval = 5)
     val faceRoi: StateFlow<FaceRoi?> = faceRoiTracker.roiState
     
     private val _statusBanner = MutableStateFlow<String?>(null)
     val statusBanner: StateFlow<String?> = _statusBanner.asStateFlow()
+    
+    // Gap F: GoodSync progress — accumulated stable capture seconds
+    private val _goodSyncSeconds = MutableStateFlow(0.0)
+    val goodSyncSeconds: StateFlow<Double> = _goodSyncSeconds.asStateFlow()
+    private var stableFrameCount = 0
+    private var lastEffectiveFps = 30.0
+
+    /** Current blocking reason preventing stable data collection (null = stable). */
+    private val _goodSyncBlocker = MutableStateFlow<String?>(null)
+    val goodSyncBlocker: StateFlow<String?> = _goodSyncBlocker.asStateFlow()
     
     private val _detailedError = MutableStateFlow<String?>(null)
     val detailedError: StateFlow<String?> = _detailedError.asStateFlow()
@@ -181,6 +195,10 @@ class DualCameraController(
     private val _sequentialPrimary = MutableStateFlow(SequentialPrimary.FINGER)
     val sequentialPrimary: StateFlow<SequentialPrimary> = _sequentialPrimary.asStateFlow()
     
+    /** Whether camera FPS supports PTT (≥25Hz). False if fell back to [15,30] HR-only mode. */
+    private val _pttCapable = MutableStateFlow(true)
+    val pttCapable: StateFlow<Boolean> = _pttCapable.asStateFlow()
+    
     private var retryCount = 0
     private val maxRetries = 3
     private var currentResolutionIndex = 0
@@ -213,6 +231,121 @@ class DualCameraController(
     private val consecutiveErrors = java.util.concurrent.ConcurrentHashMap<Source, Int>()
     private val maxConsecutiveErrors = 30
     @Volatile private var circuitBreakerTripped = false
+    
+    @Volatile private var frontExposureLocked = false
+    @Volatile private var backExposureLocked = false
+    @Volatile private var frontExposureSettled = true  // true = AE converged; false = timeout-forced
+    @Volatile private var backExposureSettled = true
+
+    // P0-A: Stability-based AE lock — replace fixed 30-frame threshold
+    // Rolling luma windows per camera, lock when settled
+    private val frontLumaSamples = ArrayDeque<Double>()
+    private val backLumaSamples = ArrayDeque<Double>()
+
+    // Gap A: Post-lock AE drift monitoring — rolling EV window
+    // EV = ln(exposureTime * ISO), monitor drift after lock
+    private val frontPostLockEv = ArrayDeque<Double>()
+    private val backPostLockEv = ArrayDeque<Double>()
+    private var frontAeDrifted = false
+    private var backAeDrifted = false
+
+    // Gap B: Metadata-based photometric gate — frame-to-frame EV step detection
+    private var lastFingerEv: Double? = null
+    private var fingerExposureStepDetected = false
+
+    private companion object {
+        const val AE_STABILITY_WINDOW = 15       // ~500ms rolling window @ 30fps
+        const val AE_MIN_SAMPLES = 10            // ~330ms minimum before evaluating
+        const val AE_LUMA_CHANGE_EPSILON = 1.5   // Max mean shift between halves (~0.6% of 0-255)
+        const val AE_LUMA_VARIANCE_DELTA = 5.0   // Max variance within window
+        const val AE_MAX_WAIT_FRAMES = 90        // 3s hard timeout @ 30fps
+        // Gap A: Post-lock drift thresholds
+        const val POST_LOCK_EV_WINDOW = 30       // ~1s rolling window @ 30fps
+        const val POST_LOCK_DRIFT_THRESHOLD = 0.02  // 2% relative drift triggers instability
+        // Gap B: Exposure step thresholds
+        const val EXPOSURE_STEP_THRESHOLD = 0.03    // 3% EV step → PTT hard-off
+        const val CLIPPING_HARD_GATE_PCT = 15.0     // 15% clipping → PTT hard-off
+    }
+
+    /**
+     * Result of AE lock evaluation.
+     */
+    enum class AeLockResult { NOT_READY, SETTLED, TIMEOUT }
+
+    /**
+     * Evaluate whether AE has converged based on luma stability.
+     * Returns SETTLED when the rolling luma window shows settled mean + low variance,
+     * TIMEOUT when the hard timeout (3s) is reached, or NOT_READY otherwise.
+     */
+    private fun shouldLockExposure(luma: Double?, tracker: FpsTracker, samples: ArrayDeque<Double>): AeLockResult {
+        luma ?: return AeLockResult.NOT_READY
+        samples.addLast(luma)
+        if (samples.size > AE_STABILITY_WINDOW) samples.removeFirst()
+
+        // Hard timeout fallback (same as old 30-frame but extended to 3s)
+        if (tracker.totalFrames > AE_MAX_WAIT_FRAMES) {
+            Log.w(PulseLog.MEASURE, "AE_LOCK | TIMEOUT at ${tracker.totalFrames} frames — exposure may not have converged")
+            return AeLockResult.TIMEOUT
+        }
+
+        // Need enough samples for meaningful stability check
+        if (samples.size < AE_MIN_SAMPLES) return AeLockResult.NOT_READY
+
+        // Check stability: compare mean of first half vs second half
+        val half = samples.size / 2
+        val firstHalf = samples.take(half).average()
+        val secondHalf = samples.drop(half).average()
+        val meanChange = kotlin.math.abs(firstHalf - secondHalf)
+
+        // Check variance within window
+        val mean = samples.average()
+        val variance = samples.map { (it - mean) * (it - mean) }.average()
+
+        val settled = meanChange < AE_LUMA_CHANGE_EPSILON && variance < AE_LUMA_VARIANCE_DELTA
+        if (settled) {
+            Log.d(PulseLog.MEASURE, "AE_LOCK | luma settled (change=%.2f, var=%.2f) at frame ${tracker.totalFrames}".format(meanChange, variance))
+        }
+        return if (settled) AeLockResult.SETTLED else AeLockResult.NOT_READY
+    }
+
+    @androidx.annotation.OptIn(androidx.camera.camera2.interop.ExperimentalCamera2Interop::class)
+    private fun lockExposure(source: Source) {
+        val camera = if (source == Source.FACE) frontCamera else backCamera
+        if (camera == null) return
+
+        try {
+            val camera2Control = androidx.camera.camera2.interop.Camera2CameraControl.from(camera.cameraControl)
+            // Lock AE + AWB always
+            val builder = androidx.camera.camera2.interop.CaptureRequestOptions.Builder()
+                .setCaptureRequestOption(CaptureRequest.CONTROL_AE_LOCK, true)
+                .setCaptureRequestOption(CaptureRequest.CONTROL_AWB_LOCK, true)
+
+            // Gap C: Conditional AF lock based on device capability (Back camera only)
+            if (deviceCapabilities?.supportsManualFocus == true && source == Source.FINGER) {
+                // Manual focus for back camera: lock AF off and set explicit focus distance
+                val focusDistance = 10.0f // near/macro for finger
+                builder.setCaptureRequestOption(CaptureRequest.CONTROL_AF_MODE, android.hardware.camera2.CameraMetadata.CONTROL_AF_MODE_OFF)
+                builder.setCaptureRequestOption(CaptureRequest.LENS_FOCUS_DISTANCE, focusDistance)
+                Log.i(PulseLog.MEASURE, "3A_LOCK | ${source.name} | manual AF | focusDist=$focusDistance")
+            } else {
+                // Fallback: use AF_AUTO mode (which holds current focus) but DO NOT set TRIGGER_START
+                // because addCaptureRequestOptions applies it to every repeating frame, which stalls the ISP.
+                builder.setCaptureRequestOption(CaptureRequest.CONTROL_AF_MODE, android.hardware.camera2.CameraMetadata.CONTROL_AF_MODE_AUTO)
+                Log.w(PulseLog.MEASURE, "3A_LOCK | ${source.name} | no manual focus — best-effort AF_AUTO")
+            }
+
+            camera2Control.addCaptureRequestOptions(builder.build())
+            AppLogger.log(tag, "3A locked for ${source.name} after calibration")
+            
+            // Update status when both cameras are locked
+            if (frontExposureLocked && backExposureLocked) {
+                _statusBanner.value = null // Clear "Calibrating..." message
+            }
+        } catch (e: Exception) {
+            Log.e(tag, "Failed to lock AE/AWB for ${source.name}", e)
+            AppLogger.error(tag, "Failed to lock exposure for ${source.name}", e)
+        }
+    }
 
     fun isConcurrentCameraSupported(): Boolean {
         val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
@@ -278,14 +411,15 @@ class DualCameraController(
         setupThermalMonitoring()
         setupImu()
         
-        Log.d(tag, "Camera provider initialized")
-        Log.d(tag, "Device: ${deviceCapabilities?.deviceInfo}")
-        Log.d(tag, "Concurrent support: ${deviceCapabilities?.hasConcurrentSupport}")
-        Log.d(tag, "Recommended mode: ${_cameraMode.value}")
+        Log.i(PulseLog.HW, "CAMERA_INIT | device=${deviceCapabilities?.deviceInfo} | concurrent=${deviceCapabilities?.hasConcurrentSupport} | manualFocus=${deviceCapabilities?.supportsManualFocus} | mode=${_cameraMode.value}")
     }
     
     private fun setupImu() {
-        sensorManager = context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
+        sensorManager = context.getSystemService(Context.SENSOR_SERVICE) as? SensorManager
+        if (sensorManager == null) {
+            Log.w(tag, "SensorManager unavailable — IMU motion detection disabled")
+            return
+        }
         accelerometer = sensorManager?.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
         if (accelerometer == null) {
             Log.w(tag, "No accelerometer found")
@@ -323,7 +457,7 @@ class DualCameraController(
             return
         }
         
-        Log.d(tag, "Starting camera with mode: ${_cameraMode.value}, sequential primary: $sequentialPrimary")
+        Log.i(PulseLog.HW, "CAMERA_START | mode=${_cameraMode.value} | seqPrimary=$sequentialPrimary | targetIds=${deviceCapabilities?.concurrentPair}")
         AppLogger.log(tag, "Starting camera - Mode: ${_cameraMode.value}, Target IDs: ${deviceCapabilities?.concurrentPair}")
         
         provider.unbindAll()
@@ -333,11 +467,18 @@ class DualCameraController(
         lastBindingException = null  // Clear previous errors
         consecutiveErrors.clear()
         circuitBreakerTripped = false
+        frontExposureLocked = false
+        backExposureLocked = false
+        frontExposureSettled = true
+        backExposureSettled = true
+        frontLumaSamples.clear()
+        backLumaSamples.clear()
+        captureResults.clear()
         
         try {
             when (_cameraMode.value) {
                 com.vivopulse.feature.capture.camera.CameraMode.CONCURRENT -> {
-                    _statusBanner.value = null
+                    _statusBanner.value = "Searching — Place finger on lens"
                 }
                 com.vivopulse.feature.capture.camera.CameraMode.SAFE_MODE_SEQUENTIAL -> {
                     _statusBanner.value = "Safe Mode: Sequential camera operation"
@@ -392,11 +533,17 @@ class DualCameraController(
             frontCamera = result.first
             backCamera = result.second
             
+            // Propagate PTT capability from binding helper
+            _pttCapable.value = bindingHelper.pttCapable
+            if (!bindingHelper.pttCapable) {
+                Log.w(PulseLog.HW, "CAMERA_BIND | HR-only mode (PTT disabled, FPS < 25Hz)")
+            }
+            
             if (torchEnabled && backCamera != null) {
                 backCamera?.cameraControl?.enableTorch(true)
             }
             
-            Log.d(tag, "Cameras started successfully in mode ${_cameraMode.value}")
+            Log.i(PulseLog.HW, "CAMERA_BIND | OK | mode=${_cameraMode.value} | pttCapable=${_pttCapable.value}")
         } else {
             // Use the actual binding error if available and store it at class level
             val actualError = bindingHelper.lastBindingError
@@ -434,18 +581,18 @@ class DualCameraController(
                 if (_cameraMode.value == com.vivopulse.feature.capture.camera.CameraMode.CONCURRENT) {
                     _cameraMode.value = com.vivopulse.feature.capture.camera.CameraMode.SAFE_MODE_REDUCED
                 }
-                Log.w(tag, "Retrying with reduced resolution (index $currentResolutionIndex)")
+                Log.w(PulseLog.HW, "CAMERA_FALLBACK | reduced resolution (index $currentResolutionIndex)")
             }
             _cameraMode.value == com.vivopulse.feature.capture.camera.CameraMode.CONCURRENT || 
             _cameraMode.value == com.vivopulse.feature.capture.camera.CameraMode.SAFE_MODE_REDUCED -> {
                 _cameraMode.value = com.vivopulse.feature.capture.camera.CameraMode.SAFE_MODE_ANALYSIS_ONLY
                 currentResolutionIndex = 0
-                Log.w(tag, "Switching to analysis-only mode")
+                Log.w(PulseLog.HW, "CAMERA_FALLBACK | analysis-only mode")
             }
             _cameraMode.value == com.vivopulse.feature.capture.camera.CameraMode.SAFE_MODE_ANALYSIS_ONLY -> {
                 _cameraMode.value = com.vivopulse.feature.capture.camera.CameraMode.SAFE_MODE_SEQUENTIAL
                 currentResolutionIndex = 0
-                Log.w(tag, "Switching to sequential mode")
+                Log.w(PulseLog.HW, "CAMERA_FALLBACK | sequential mode")
             }
             else -> {
                 _statusBanner.value = "Camera initialization failed. Please restart."
@@ -542,6 +689,12 @@ class DualCameraController(
             val tracker = if (source == Source.FACE) frontFpsTracker else backFpsTracker
             tracker.onFrameReceived(image.timestamp)
 
+            // P1-B DIAGNOSTIC: Log Image.timestamp per source for clock domain analysis
+            // On-device: compare this with CaptureResult.SENSOR_TIMESTAMP when Camera2 capture callback is added
+            if (tracker.totalFrames <= 60 || tracker.totalFrames % 300 == 0) {
+                Log.d(PulseLog.FRAME, "CLOCK_DIAG | src=${source.name} | frame=${tracker.totalFrames} | imageTs=${image.timestamp} | elapsedNs=${if (tracker.totalFrames > 1) image.timestamp - (if (source == Source.FACE) _frontTimestamps.replayCache.lastOrNull() ?: image.timestamp else _backTimestamps.replayCache.lastOrNull() ?: image.timestamp) else 0}")
+            }
+
             if (source == Source.FACE) {
                 _frontTimestamps.tryEmit(image.timestamp)
             } else {
@@ -554,10 +707,12 @@ class DualCameraController(
 
             var faceLuma: Double? = null
             var fingerLuma: Double? = null
+            var fingerVChannel: Double? = null // For signal (Red-difference)
             var faceRgb: RgbData? = null
             var fingerRgb: RgbData? = null
             var faceMotionRms: Double? = null
             var fingerSaturationPct: Double? = null
+            var clippingPct: Double? = null
 
             if (source == Source.FACE) {
                 try {
@@ -579,8 +734,12 @@ class DualCameraController(
                         )
                     }
                     
-                    faceRgb = RgbExtractor.extractAverageRgb(imageProxy, roiToUse)
-                    faceLuma = faceRgb?.g
+                    // P0-B: Use green-proxy instead of full RGB for face rPPG signal
+                    faceLuma = RgbExtractor.extractAverageGreenProxy(imageProxy, roiToUse)
+                    // Full RGB only for recording/debug (not every frame)
+                    if (isRecording || frontFpsTracker.totalFrames % 30 == 0) {
+                        faceRgb = RgbExtractor.extractAverageRgb(imageProxy, roiToUse)
+                    }
                     
                     if (currentRoi != null && !currentRoi.isEmpty) {
                         val motionBuffer = yPlane.buffer.duplicate().apply { position(0) }
@@ -609,20 +768,88 @@ class DualCameraController(
                         fingerRoiRect!!
                     }
 
-                    fingerRgb = RgbExtractor.extractAverageRgb(imageProxy, roi)
-                    fingerLuma = fingerRgb?.g
+                    // P0-B: Use luma-only for finger PPG (red dominates with torch)
+                    fingerLuma = RgbExtractor.extractAverageLuma(imageProxy, roi)
+                    // V-Channel optimization (from drift): cleaner red signal
+                    fingerVChannel = RgbExtractor.extractAverageVChannel(imageProxy, roi)
+                    
+                    // Full RGB only for recording/debug (not every frame)
+                    if (isRecording || backFpsTracker.totalFrames % 30 == 0) {
+                        fingerRgb = RgbExtractor.extractAverageRgb(imageProxy, roi)
+                    }
 
 
                     val satBuffer = yPlane.buffer.duplicate().apply { position(0) }
                     fingerSaturationPct = computeSaturationPct(satBuffer, roi, rowStride)
+                    
+                    val clipBuffer = yPlane.buffer.duplicate().apply { position(0) }
+                    // Clipping detection: low < 5, high > 250
+                    clippingPct = computeClippingPct(clipBuffer, roi, rowStride)
+                    
+                    // Directional clipping feedback
+                    if (clippingPct > 0.1 && fingerFrameCounter % 30 == 0) {
+                         // Determine dominant clipping direction
+                         val highClipBuffer = yPlane.buffer.duplicate().apply { position(0) }
+                         val highPct = computeSaturationPct(highClipBuffer, roi, rowStride) // pixels >= 250
+                         if (highPct > 0.05) {
+                             _statusBanner.value = "Too bright — reduce pressure slightly"
+                         } else {
+                             _statusBanner.value = "Too dark — press fingertip firmly"
+                         }
+                    }
+                    
+                    // Finger-cover detection: low variance + reasonable luma = covered
+                    val coverBuffer = yPlane.buffer.duplicate().apply { position(0) }
+                    val roiVariance = com.vivopulse.feature.capture.roi.FingerRoiDetector.computeRoiVariance(coverBuffer, roi, rowStride, image.width, image.height)
+                    val isCovered = (fingerLuma ?: 0.0) > 30.0 && roiVariance < 800.0
+                    if (!isCovered && fingerFrameCounter % 30 == 0) {
+                        _statusBanner.value = "Cover lens fully with your fingertip"
+                    }
 
-                    fingerLuma?.let { 
+                    // Use V-Channel for signal if available, else Luma
+                    (fingerVChannel ?: fingerLuma)?.let { 
                         _fingerWave.tryEmit(it)
-                        Log.v(tag, "Finger luma: $it")
+                        Log.v(tag, "Finger signal (V): $it")
                     }
                 } catch (e: Exception) {
                     Log.e(tag, "Error processing finger channel", e)
                 }
+            }
+
+
+            // Retrieve CaptureResult metadata (AE/ISO)
+            // Note: Since ImageAnalysis may drop frames, captureResults can grow.
+            // Safety check: if map gets too big, clear it to prevent OOM.
+            if (captureResults.size > 50) {
+                captureResults.clear()
+            }
+            val result = captureResults.remove(image.timestamp)
+
+            // P0-A Hardening: Block PTT analysis until AE is locked, settled, and stable
+            // Gap A+B: Also block if post-lock drift detected or exposure step detected
+            val outputReady = if (source == Source.FACE) {
+                frontExposureLocked && frontExposureSettled && !frontAeDrifted
+            } else {
+                backExposureLocked && backExposureSettled && !backAeDrifted && !fingerExposureStepDetected
+            }
+            
+            if (!outputReady) {
+                // 3-state status feedback (E)
+                val isLocked = if (source == Source.FACE) frontExposureLocked else backExposureLocked
+                if (source == Source.FINGER && fingerFrameCounter % 30 == 0) {
+                    _statusBanner.value = if (isLocked) {
+                        // Locked but not settled (timeout case)
+                        "Unstable light — try adjusting position"
+                    } else {
+                        "Stabilizing..."
+                    }
+                }
+            } else if (_statusBanner.value?.startsWith("Stabil") == true ||
+                       _statusBanner.value?.startsWith("Searching") == true ||
+                       _statusBanner.value?.startsWith("Unstable") == true) {
+                // Transition to locked state — clear calibration messages
+                _statusBanner.value = null
+                Log.i(PulseLog.MEASURE, "3A_SETTLED | ${source.name} — Measuring")
             }
 
             val frame = Frame(
@@ -632,24 +859,175 @@ class DualCameraController(
                 height = image.height,
                 yuvPlanes = emptyList(),
                 faceLuma = faceLuma,
-                fingerLuma = fingerLuma,
+                fingerLuma = fingerVChannel ?: fingerLuma, // Use V-Channel (PPG pulsation) for recording, consistent with live wave
                 faceRgb = faceRgb,
                 fingerRgb = fingerRgb,
                 faceMotionRms = faceMotionRms,
                 fingerSaturationPct = fingerSaturationPct,
                 imuRmsG = imuRmsG,
-                faceRoiRect = if (source == Source.FACE) faceRoi.value?.rect else null
+                faceRoiRect = if (source == Source.FACE) faceRoi.value?.rect else null,
+                exposureTimeNs = result?.get(android.hardware.camera2.CaptureResult.SENSOR_EXPOSURE_TIME),
+                sensitivity = result?.get(android.hardware.camera2.CaptureResult.SENSOR_SENSITIVITY),
+                frameDurationNs = result?.get(android.hardware.camera2.CaptureResult.SENSOR_FRAME_DURATION),
+                aeState = result?.get(android.hardware.camera2.CaptureResult.CONTROL_AE_STATE),
+                awbState = result?.get(android.hardware.camera2.CaptureResult.CONTROL_AWB_STATE),
+                clippingPct = clippingPct
             )
-
-            val flowEmitted = if (source == Source.FACE) {
-                _frontFrames.tryEmit(frame)
-            } else {
-                _backFrames.tryEmit(frame)
+            
+            // AE DIAGNOSTICS (Step 1 & 6) for FINGER camera
+            if (source == Source.FINGER && frame.exposureTimeNs != null) {
+                // Log every 30th frame or if steps detected (TODO: step detection)
+                // For now, log if AE state is searching/converged transitions, or periodically
+                val aeState = frame.aeState
+                val aeStateStr = when (aeState) {
+                    android.hardware.camera2.CaptureResult.CONTROL_AE_STATE_INACTIVE -> "INACTIVE"
+                    android.hardware.camera2.CaptureResult.CONTROL_AE_STATE_SEARCHING -> "SEARCHING"
+                    android.hardware.camera2.CaptureResult.CONTROL_AE_STATE_CONVERGED -> "CONVERGED"
+                    android.hardware.camera2.CaptureResult.CONTROL_AE_STATE_LOCKED -> "LOCKED"
+                    android.hardware.camera2.CaptureResult.CONTROL_AE_STATE_FLASH_REQUIRED -> "FLASH_REQ"
+                    android.hardware.camera2.CaptureResult.CONTROL_AE_STATE_PRECAPTURE -> "PRECAPTURE"
+                    else -> "UNKNOWN($aeState)"
+                }
+                
+                // Only log interesting events or periodic sample
+                if (aeState == android.hardware.camera2.CaptureResult.CONTROL_AE_STATE_SEARCHING || 
+                    aeState == android.hardware.camera2.CaptureResult.CONTROL_AE_STATE_CONVERGED ||
+                    (fingerFrameCounter % 30 == 0)) {
+                        
+                    Log.d(PulseLog.FRAME, "AE_DIAG | FINGER | state=$aeStateStr | " +
+                          "exp=${frame.exposureTimeNs}ns | iso=${frame.sensitivity} | " +
+                          "dur=${frame.frameDurationNs}ns | meanY=${String.format("%.1f", fingerLuma ?: 0.0)}")
+                }
+            }
+            
+            // Check for AE Lock (stability-based, P0-A)
+            if (source == Source.FACE && !frontExposureLocked) {
+                val lockResult = shouldLockExposure(faceLuma, frontFpsTracker, frontLumaSamples)
+                if (lockResult != AeLockResult.NOT_READY) {
+                    lockExposure(Source.FACE)
+                    frontExposureLocked = true
+                    frontExposureSettled = (lockResult == AeLockResult.SETTLED)
+                    if (!frontExposureSettled) {
+                        Log.w(PulseLog.FRAME, "AE_TIMEOUT_DIAG | Face exposure locked via TIMEOUT — SNR may be degraded")
+                    }
+                }
+            } else if (source == Source.FINGER && !backExposureLocked) {
+                val lockResult = shouldLockExposure(fingerLuma, backFpsTracker, backLumaSamples)
+                if (lockResult != AeLockResult.NOT_READY) {
+                    lockExposure(Source.FINGER)
+                    backExposureLocked = true
+                    backExposureSettled = (lockResult == AeLockResult.SETTLED)
+                    if (!backExposureSettled) {
+                        Log.w(PulseLog.FRAME, "AE_TIMEOUT_DIAG | Finger exposure locked via TIMEOUT — SNR may be degraded")
+                    }
+                }
             }
 
-            if (!flowEmitted) {
+            // === Gap A: Post-lock AE drift monitoring ===
+            // After lock, continuously track EV = ln(exp * iso) for drift detection
+            if ((source == Source.FACE && frontExposureLocked) ||
+                (source == Source.FINGER && backExposureLocked)) {
+                val expNs = frame.exposureTimeNs
+                val iso = frame.sensitivity
+                if (expNs != null && iso != null && expNs > 0 && iso > 0) {
+                    val ev = kotlin.math.ln((expNs.toDouble() * iso.toDouble()))
+                    val evWindow = if (source == Source.FACE) frontPostLockEv else backPostLockEv
+                    evWindow.addLast(ev)
+                    if (evWindow.size > POST_LOCK_EV_WINDOW) evWindow.removeFirst()
+
+                    if (evWindow.size >= POST_LOCK_EV_WINDOW) {
+                        val evMean = evWindow.average()
+                        val evDrift = (evWindow.max() - evWindow.min()) / kotlin.math.abs(evMean)
+                        if (evDrift > POST_LOCK_DRIFT_THRESHOLD) {
+                            if (source == Source.FACE && !frontAeDrifted) {
+                                frontAeDrifted = true
+                                Log.w(PulseLog.FRAME, "AE_DRIFT | FACE | drift=${"%.1f".format(evDrift * 100)}% — blocking PTT")
+                                _statusBanner.value = "Unstable light — try adjusting position"
+                            } else if (source == Source.FINGER && !backAeDrifted) {
+                                backAeDrifted = true
+                                Log.w(PulseLog.FRAME, "AE_DRIFT | FINGER | drift=${"%.1f".format(evDrift * 100)}% — blocking PTT")
+                                _statusBanner.value = "Unstable light — try adjusting position"
+                            }
+                        }
+                    }
+
+                    // === Gap B: Metadata-based photometric gate (finger only) ===
+                    if (source == Source.FINGER) {
+                        val prevEv = lastFingerEv
+                        lastFingerEv = ev
+                        if (prevEv != null && kotlin.math.abs(prevEv) > 0.0) {
+                            val stepPct = kotlin.math.abs(ev - prevEv) / kotlin.math.abs(prevEv)
+                            val hardClip = (clippingPct ?: 0.0) > CLIPPING_HARD_GATE_PCT
+                            if (stepPct > EXPOSURE_STEP_THRESHOLD || hardClip) {
+                                if (!fingerExposureStepDetected) {
+                                    fingerExposureStepDetected = true
+                                    val reason = if (hardClip) "clipping=${"%.0f".format(clippingPct)}%" else "step=${"%.1f".format(stepPct * 100)}%"
+                                    Log.w(PulseLog.FRAME, "PHOTO_GATE | FINGER | $reason — PTT hard-off")
+                                    _statusBanner.value = "Brightness changed — restarting..."
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // === Gap F: GoodSync progress tracking ===
+            // Count stable frames where all conditions for quality capture are met
+            if (source == Source.FINGER) {
+                val isStable = outputReady &&
+                    !frontAeDrifted && !backAeDrifted &&
+                    !fingerExposureStepDetected &&
+                    (clippingPct ?: 0.0) <= CLIPPING_HARD_GATE_PCT &&
+                    imuRmsG < 0.1
+
+                if (isStable) {
+                    stableFrameCount++
+                    _goodSyncBlocker.value = null
+                } else {
+                    stableFrameCount = 0
+                    // Identify blocking reason for UX
+                    _goodSyncBlocker.value = when {
+                        !backExposureLocked -> "Finger exposure"
+                        !frontExposureLocked -> "Face exposure"
+                        backAeDrifted || frontAeDrifted -> "Lighting"
+                        fingerExposureStepDetected -> "Brightness change"
+                        (clippingPct ?: 0.0) > CLIPPING_HARD_GATE_PCT -> "Clipping"
+                        imuRmsG >= 0.1 -> "Motion"
+                        else -> "Stabilizing"
+                    }
+                }
+                _goodSyncSeconds.value = stableFrameCount / lastEffectiveFps
+            }
+
+            val flowEmitted = if (outputReady) {
+                if (source == Source.FACE) {
+                    _frontFrames.tryEmit(frame)
+                } else {
+                    _backFrames.tryEmit(frame)
+                }
+            } else {
+                // Log why frames are being dropped (PTT=0 diagnostic)
+                if (tracker.totalFrames % 60 == 0) {
+                    val reason = when {
+                        source == Source.FACE && !frontExposureLocked -> "AE_NOT_LOCKED"
+                        source == Source.FACE && !frontExposureSettled -> "AE_NOT_SETTLED"
+                        source == Source.FACE && frontAeDrifted -> "AE_DRIFTED"
+                        source == Source.FINGER && !backExposureLocked -> "AE_NOT_LOCKED"
+                        source == Source.FINGER && !backExposureSettled -> "AE_NOT_SETTLED"
+                        source == Source.FINGER && backAeDrifted -> "AE_DRIFTED"
+                        source == Source.FINGER && fingerExposureStepDetected -> "PHOTO_GATE"
+                        else -> "UNKNOWN"
+                    }
+                    Log.d(PulseLog.MEASURE, "OUTPUT_BLOCKED | ${source.name} | reason=$reason | frame=${tracker.totalFrames}")
+                }
+                false
+            }
+
+            if (!flowEmitted && outputReady) {
                 tracker.onFrameDropped()
-                Log.w(tag, "Frame dropped for ${source.name}, buffer full")
+                Log.w(PulseLog.FRAME, "BUFFER_FULL | ${source.name} | frame=${tracker.totalFrames}")
+            } else if (!flowEmitted) {
+                tracker.onFrameDropped()
             }
 
             if (isRecording && recordedFrames.size < maxRecordedFrames) {
@@ -668,7 +1046,7 @@ class DualCameraController(
                 SignalSample(
                     timestampNs = image.timestamp,
                     faceMeanLuma = faceLuma,
-                    fingerMeanLuma = fingerLuma,
+                    fingerMeanLuma = fingerVChannel ?: fingerLuma, // Use V-Channel for signal
                     faceRgb = faceRgb?.let { RgbSample(it.r, it.g, it.b) },
                     fingerRgb = fingerRgb?.let { RgbSample(it.r, it.g, it.b) },
                     faceMotionRmsPx = faceMotionRms,
@@ -720,10 +1098,15 @@ class DualCameraController(
         frontFpsTracker.reset()
         backFpsTracker.reset()
         
+        // Fix 2: Reset GoodSync counter per recording session (was accumulating across camera lifecycle)
+        stableFrameCount = 0
+        _goodSyncSeconds.value = 0.0
+        _goodSyncBlocker.value = "Stabilizing"
+        
         recordingStartTime = System.currentTimeMillis()
         isRecording = true
         
-        Log.d(tag, "Recording started - mode: ${_cameraMode.value}, sequential primary: $sequentialPrimary")
+        Log.i(PulseLog.SESSION, "SESSION_START | mode=${_cameraMode.value} | seqPrimary=$sequentialPrimary | torch=$torchEnabled")
     }
     
     fun stopRecording(): RecordingResult {
@@ -758,9 +1141,12 @@ class DualCameraController(
             )
         )
         
-        Log.d(tag, "Recording stopped: ${frames.size} frames captured, duration: ${durationMs}ms")
-        Log.d(tag, "Face camera: $frontReceived frames, $frontDropped dropped, ${String.format("%.1f", frontFps)} fps")
-        Log.d(tag, "Finger camera: $backReceived frames, $backDropped dropped, ${String.format("%.1f", backFps)} fps")
+        Log.i(PulseLog.SESSION, "SESSION_STOP | frames=${frames.size} | duration=${durationMs}ms | " +
+            "face=$frontReceived/${frontDropped}drop/${String.format("%.1f", frontFps)}fps | " +
+            "finger=$backReceived/${backDropped}drop/${String.format("%.1f", backFps)}fps | " +
+            "aeDriftFace=$frontAeDrifted | aeDriftFinger=$backAeDrifted | " +
+            "photoGate=$fingerExposureStepDetected | " +
+            "goodSync=${"%.1f".format(_goodSyncSeconds.value)}s | blocker=${_goodSyncBlocker.value ?: "none"}")
         
         return RecordingResult(frames, stats)
     }
@@ -809,8 +1195,8 @@ class DualCameraController(
         if (roi.isEmpty) return null
         val width = roi.width().coerceAtLeast(1)
         val height = roi.height().coerceAtLeast(1)
-        val sampledWidth = (width / step).coerceAtLeast(1)
-        val sampledHeight = (height / step).coerceAtLeast(1)
+        val sampledWidth = ((width + step - 1) / step).coerceAtLeast(1)
+        val sampledHeight = ((height + step - 1) / step).coerceAtLeast(1)
         val sampleCount = sampledWidth * sampledHeight
         
         if (sampleCount <= 0) return null
@@ -876,6 +1262,36 @@ class DualCameraController(
         }
         
         return if (total == 0) 0.0 else saturated.toDouble() / total.toDouble()
+    }
+    
+    private fun computeClippingPct(
+        buffer: ByteBuffer,
+        roi: Rect,
+        rowStride: Int,
+        lowThreshold: Int = 5,
+        highThreshold: Int = 250,
+        sampleStep: Int = 2
+    ): Double {
+        if (roi.isEmpty) return 0.0
+        var clipped = 0
+        var total = 0
+        
+        var y = roi.top
+        while (y < roi.bottom) {
+            val base = y * rowStride
+            var x = roi.left
+            while (x < roi.right) {
+                val value = buffer.get(base + x).toInt() and 0xFF
+                if (value <= lowThreshold || value >= highThreshold) {
+                    clipped++
+                }
+                total++
+                x += sampleStep
+            }
+            y += sampleStep
+        }
+        
+        return if (total == 0) 0.0 else clipped.toDouble() / total.toDouble()
     }
     
     fun release() {

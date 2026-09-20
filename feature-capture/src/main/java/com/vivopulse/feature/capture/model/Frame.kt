@@ -38,7 +38,15 @@ data class Frame(
     val faceMotionRms: Double? = null,
     val fingerSaturationPct: Double? = null,
     val imuRmsG: Double? = null,
-    val faceRoiRect: android.graphics.Rect? = null
+    val faceRoiRect: android.graphics.Rect? = null,
+    // Camera2 metadata (P0-A: AE Diagnostics)
+    val exposureTimeNs: Long? = null,
+    val sensitivity: Int? = null,
+    val frameDurationNs: Long? = null,
+    val aeState: Int? = null,
+    val awbState: Int? = null,
+    // Mitigation: Clipping percentage (pixels < 5 or > 250)
+    val clippingPct: Double? = null
 ) {
     /**
      * Get frame size in bytes (approximate).
@@ -85,7 +93,13 @@ data class Frame(
             faceMotionRms = faceMotionRms,
             fingerSaturationPct = fingerSaturationPct,
             imuRmsG = imuRmsG,
-            faceRoiRect = faceRoiRect
+            faceRoiRect = faceRoiRect,
+            exposureTimeNs = exposureTimeNs,
+            sensitivity = sensitivity,
+            frameDurationNs = frameDurationNs,
+            aeState = aeState,
+            awbState = awbState,
+            clippingPct = clippingPct
         )
     }
 }

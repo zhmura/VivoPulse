@@ -5,16 +5,14 @@ import androidx.compose.ui.Modifier
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
+import androidx.navigation.navigation
 import com.vivopulse.app.ui.screens.CaptureScreen
 import com.vivopulse.app.ui.screens.ProcessingScreen
 import com.vivopulse.app.ui.screens.ResultScreen
 import com.vivopulse.app.ui.screens.ReactivityProtocolScreen
-sealed class Screen(val route: String) {
-    object Capture : Screen("capture")
-    object Processing : Screen("processing")
-    object Result : Screen("result")
-    object Reactivity : Screen("reactivity")
-}
+
+/** Route for the nested graph that shares a single [ProcessingViewModel]. */
+const val PROCESSING_GRAPH_ROUTE = "processing_graph"
 
 @Composable
 fun VivoPulseNavHost(
@@ -24,43 +22,48 @@ fun VivoPulseNavHost(
     
     NavHost(
         navController = navController,
-        startDestination = Screen.Capture.route,
+        startDestination = Route.Capture.path,
         modifier = modifier
     ) {
-        composable(Screen.Capture.route) {
+        composable(Route.Capture.path) {
             CaptureScreen(
                 onNavigateToProcessing = {
-                    navController.navigate(Screen.Processing.route)
-                },
-                onNavigateToReactivity = {
-                    navController.navigate(Screen.Reactivity.route)
+                    navController.navigate(PROCESSING_GRAPH_ROUTE)
                 }
             )
         }
         
-        composable(Screen.Processing.route) {
-            ProcessingScreen(
-                onNavigateToResult = {
-                    navController.navigate(Screen.Result.route)
-                },
-                onNavigateBack = {
-                    navController.popBackStack()
-                }
-            )
+        // Nested graph so Processing & Result share the same ProcessingViewModel
+        navigation(
+            startDestination = Route.Processing.path,
+            route = PROCESSING_GRAPH_ROUTE
+        ) {
+            composable(Route.Processing.path) {
+                ProcessingScreen(
+                    navController = navController,
+                    onNavigateToResult = {
+                        navController.navigate(Route.Result.path)
+                    },
+                    onNavigateBack = {
+                        navController.popBackStack()
+                    }
+                )
+            }
+            
+            composable(Route.Result.path) {
+                ResultScreen(
+                    navController = navController,
+                    onNavigateBack = {
+                        navController.popBackStack(Route.Capture.path, inclusive = false)
+                    }
+                )
+            }
         }
         
-        composable(Screen.Result.route) {
-            ResultScreen(
-                onNavigateBack = {
-                    navController.popBackStack(Screen.Capture.route, inclusive = false)
-                }
-            )
-        }
-        
-        composable(Screen.Reactivity.route) {
+        composable(Route.Reactivity.path) {
             ReactivityProtocolScreen(
                 onNavigateBack = { navController.popBackStack() },
-                onNavigateToCapture = { navController.navigate(Screen.Capture.route) }
+                onNavigateToCapture = { navController.navigate(Route.Capture.path) }
             )
         }
     }

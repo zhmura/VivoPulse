@@ -14,7 +14,12 @@ import androidx.camera.core.ConcurrentCamera
 import androidx.camera.core.UseCaseGroup
 import com.vivopulse.feature.capture.model.Source
 import com.vivopulse.signal.AppLogger
+
 import kotlin.Pair
+import android.hardware.camera2.CaptureRequest
+import android.hardware.camera2.CaptureResult
+import android.hardware.camera2.TotalCaptureResult
+import android.hardware.camera2.CameraCaptureSession
 
 /**
  * Helper to manage CameraX lifecycle binding for dual streams.
@@ -33,12 +38,18 @@ import kotlin.Pair
 internal class CameraBindingHelper(
     private val tag: String,
     private val executor: java.util.concurrent.ExecutorService,
-    private val processFrame: (androidx.camera.core.ImageProxy, Source) -> Unit
+    private val processFrame: (androidx.camera.core.ImageProxy, Source) -> Unit,
+    private val configurator: Camera2Configurator = Camera2Configurator.Impl(),
+    private val captureResults: java.util.concurrent.ConcurrentHashMap<Long, TotalCaptureResult>? = null
 ) {
     
     // Store the last binding error for reporting
     private var _lastBindingError: Exception? = null
     val lastBindingError: Exception? get() = _lastBindingError
+    
+    /** Whether the bound FPS range supports PTT (≥25Hz). False if we fell back to [15,30]. */
+    private var _pttCapable = true
+    val pttCapable: Boolean get() = _pttCapable
     
     /**
      * Attempt to bind both cameras with progressive fallback.
@@ -82,6 +93,11 @@ internal class CameraBindingHelper(
     
     /**
      * Bind both cameras concurrently.
+     * 
+     * FPS strategy with fallback:
+     * 1. Try [25, 30] for PTT-quality frame rate (pttCapable = true)
+     * 2. If binding fails → retry with [15, 30] (pttCapable = false, HR-only mode)
+     * 3. If both fail → return null (escalate to mode fallback)
      */
     private fun bindConcurrent(
         provider: ProcessCameraProvider,
@@ -91,6 +107,59 @@ internal class CameraBindingHelper(
         resolution: Size,
         frontId: String? = null,
         backId: String? = null
+    ): Pair<Camera?, Camera?>? {
+        // Check concurrent support
+        if (provider.availableConcurrentCameraInfos.isEmpty()) {
+            AppLogger.log(tag, "bindConcurrent: No concurrent camera infos found")
+        }
+
+        AppLogger.log(tag, "bindConcurrent: Configuring cameras at $resolution")
+
+        // Strategy: Try PTT-quality range first, fall back to HR-only range
+        val pttRange = android.util.Range(25, 30)
+        val fallbackRange = android.util.Range(15, 30)
+
+        // Attempt 1: PTT-quality FPS [25, 30]
+        val pttResult = attemptConcurrentBinding(
+            provider, lifecycleOwner, frontPreviewView, backPreviewView,
+            resolution, frontId, backId, pttRange
+        )
+        if (pttResult != null) {
+            _pttCapable = true
+            AppLogger.log(tag, "Concurrent binding successful at $resolution with PTT-quality FPS $pttRange")
+            return pttResult
+        }
+
+        // Attempt 2: Fallback to HR-only FPS [15, 30]
+        AppLogger.log(tag, "PTT-quality FPS [$pttRange] binding failed, falling back to HR-only FPS $fallbackRange")
+        provider.unbindAll() // Clean up failed attempt
+        val fallbackResult = attemptConcurrentBinding(
+            provider, lifecycleOwner, frontPreviewView, backPreviewView,
+            resolution, frontId, backId, fallbackRange
+        )
+        if (fallbackResult != null) {
+            _pttCapable = false
+            AppLogger.log(tag, "Concurrent binding successful at $resolution with HR-only FPS $fallbackRange (PTT DISABLED)")
+            return fallbackResult
+        }
+
+        // Both failed
+        AppLogger.error(tag, "CONCURRENT BINDING FAILED at $resolution with both FPS ranges", null)
+        return null
+    }
+
+    /**
+     * Attempt a single concurrent binding with the given FPS range.
+     */
+    private fun attemptConcurrentBinding(
+        provider: ProcessCameraProvider,
+        lifecycleOwner: LifecycleOwner,
+        frontPreviewView: PreviewView,
+        backPreviewView: PreviewView,
+        resolution: Size,
+        frontId: String?,
+        backId: String?,
+        fpsRange: android.util.Range<Int>
     ): Pair<Camera?, Camera?>? {
         val frontSelector = if (frontId != null) {
             createSelectorForId(frontId, CameraSelector.LENS_FACING_FRONT)
@@ -105,13 +174,7 @@ internal class CameraBindingHelper(
         }
 
         return try {
-            // Check concurrent support
-            if (provider.availableConcurrentCameraInfos.isEmpty()) {
-                AppLogger.log(tag, "bindConcurrent: No concurrent camera infos found")
-                // Fallback or error? Let's treat as error for now in this mode
-            }
-
-            AppLogger.log(tag, "bindConcurrent: Configuring cameras at $resolution")
+            AppLogger.log(tag, "Attempting FPS Range: $fpsRange")
 
             // FRONT Config
             val frontPreview = Preview.Builder()
@@ -119,16 +182,33 @@ internal class CameraBindingHelper(
                 .build()
                 .also { it.setSurfaceProvider(frontPreviewView.surfaceProvider) }
             
-            val frontAnalysis = ImageAnalysis.Builder()
+            val frontBuilder = ImageAnalysis.Builder()
                 .setTargetResolution(resolution)
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                 .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
-                .build()
-                .also { 
-                    it.setAnalyzer(executor, com.vivopulse.feature.capture.analysis.SafeImageAnalyzer { img -> 
-                        processFrame(img, Source.FACE) 
-                    })
-                }
+
+            configurator.setTargetFpsRange(frontBuilder, fpsRange)
+            configurator.disablePostProcessing(frontBuilder)
+
+            // Inject CaptureCallback if results map provided
+            val callback = if (captureResults != null) object : CameraCaptureSession.CaptureCallback() {
+                 override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
+                     val ts = result.get(CaptureResult.SENSOR_TIMESTAMP)
+                     if (ts != null) {
+                         captureResults[ts] = result
+                     }
+                 }
+            } else null
+            
+            if (callback != null) {
+                configurator.setSessionCaptureCallback(frontBuilder, callback)
+            }
+
+            val frontAnalysis = frontBuilder.build().also { analysis ->
+                analysis.setAnalyzer(executor, com.vivopulse.feature.capture.analysis.SafeImageAnalyzer { img -> 
+                    processFrame(img, Source.FACE) 
+                })
+            }
                 
             val frontUseCaseGroup = UseCaseGroup.Builder()
                 .addUseCase(frontPreview)
@@ -147,16 +227,23 @@ internal class CameraBindingHelper(
                 .build()
                 .also { it.setSurfaceProvider(backPreviewView.surfaceProvider) }
             
-            val backAnalysis = ImageAnalysis.Builder()
+            val backBuilder = ImageAnalysis.Builder()
                 .setTargetResolution(resolution)
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                 .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
-                .build()
-                .also { 
-                    it.setAnalyzer(executor, com.vivopulse.feature.capture.analysis.SafeImageAnalyzer { img -> 
-                        processFrame(img, Source.FINGER) 
-                    })
-                }
+
+            configurator.setTargetFpsRange(backBuilder, fpsRange)
+            configurator.disablePostProcessing(backBuilder)
+            
+            if (callback != null) {
+                configurator.setSessionCaptureCallback(backBuilder, callback)
+            }
+
+            val backAnalysis = backBuilder.build().also { analysis ->
+                analysis.setAnalyzer(executor, com.vivopulse.feature.capture.analysis.SafeImageAnalyzer { img -> 
+                    processFrame(img, Source.FINGER) 
+                })
+            }
                 
             val backUseCaseGroup = UseCaseGroup.Builder()
                 .addUseCase(backPreview)
@@ -184,12 +271,11 @@ internal class CameraBindingHelper(
                 AppLogger.log(tag, "bindConcurrent: Back camera bound successfully")
             }
             
-            AppLogger.log(tag, "Concurrent binding successful at $resolution")
             Pair(frontCamera, backCamera)
             
         } catch (e: Exception) {
             _lastBindingError = e
-            AppLogger.error(tag, "CONCURRENT BINDING FAILED at $resolution: ${e.javaClass.simpleName}: ${e.message}", e)
+            AppLogger.error(tag, "Binding attempt with FPS $fpsRange FAILED: ${e.javaClass.simpleName}: ${e.message}", e)
             null
         }
     }
@@ -204,11 +290,29 @@ internal class CameraBindingHelper(
     ): Pair<Camera?, Camera?>? {
         return try {
             AppLogger.log(tag, "bindAnalysisOnly: Creating front analysis at $resolution")
-            val frontAnalysis = ImageAnalysis.Builder()
+            AppLogger.log(tag, "bindAnalysisOnly: Creating front analysis at $resolution")
+            val frontBuilder = ImageAnalysis.Builder()
                 .setTargetResolution(resolution)
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                 .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
-                .build()
+            
+            configurator.disablePostProcessing(frontBuilder)
+            
+            // Inject CaptureCallback if results map provided
+            val callback = if (captureResults != null) object : CameraCaptureSession.CaptureCallback() {
+                 override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
+                     val ts = result.get(CaptureResult.SENSOR_TIMESTAMP)
+                     if (ts != null) {
+                         captureResults[ts] = result
+                     }
+                 }
+            } else null
+            
+            if (callback != null) {
+                configurator.setSessionCaptureCallback(frontBuilder, callback)
+            }
+
+            val frontAnalysis = frontBuilder.build()
                 .also { 
                     it.setAnalyzer(executor, com.vivopulse.feature.capture.analysis.SafeImageAnalyzer { img -> 
                         processFrame(img, Source.FACE) 
@@ -223,11 +327,18 @@ internal class CameraBindingHelper(
             )
             AppLogger.log(tag, "bindAnalysisOnly: FRONT camera bound successfully")
             
-            val backAnalysis = ImageAnalysis.Builder()
+            val backBuilder = ImageAnalysis.Builder()
                 .setTargetResolution(resolution)
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                 .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
-                .build()
+            
+            configurator.disablePostProcessing(backBuilder)
+            
+            if (callback != null) {
+                configurator.setSessionCaptureCallback(backBuilder, callback)
+            }
+
+            val backAnalysis = backBuilder.build()
                 .also { 
                     it.setAnalyzer(executor, com.vivopulse.feature.capture.analysis.SafeImageAnalyzer { img -> 
                         processFrame(img, Source.FINGER) 
@@ -278,11 +389,26 @@ internal class CameraBindingHelper(
                 .build()
                 .also { it.setSurfaceProvider(previewView.surfaceProvider) }
             
-            val analysis = ImageAnalysis.Builder()
+            val analysisBuilder = ImageAnalysis.Builder()
                 .setTargetResolution(resolution)
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                 .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
-                .build()
+
+            configurator.disablePostProcessing(analysisBuilder)
+
+            // Inject CaptureCallback if results map provided
+            if (captureResults != null) {
+                configurator.setSessionCaptureCallback(analysisBuilder, object : CameraCaptureSession.CaptureCallback() {
+                     override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
+                         val ts = result.get(CaptureResult.SENSOR_TIMESTAMP)
+                         if (ts != null) {
+                             captureResults[ts] = result
+                         }
+                     }
+                })
+            }
+
+            val analysis = analysisBuilder.build()
                 .also { 
                     it.setAnalyzer(executor, com.vivopulse.feature.capture.analysis.SafeImageAnalyzer { img -> 
                         processFrame(img, source) 

@@ -19,8 +19,8 @@ class IMUMotionDetector(context: Context) : SensorEventListener {
     
     private val tag = "IMUMotionDetector"
     
-    private val sensorManager = context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
-    private val accelerometer = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
+    private val sensorManager = context.getSystemService(Context.SENSOR_SERVICE) as? SensorManager
+    private val accelerometer = sensorManager?.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
     
     companion object {
         const val MOTION_THRESHOLD_RMS = 0.5  // m/s² RMS threshold for motion
@@ -41,7 +41,7 @@ class IMUMotionDetector(context: Context) : SensorEventListener {
             return
         }
         
-        sensorManager.registerListener(
+        sensorManager?.registerListener(
             this,
             accelerometer,
             SensorManager.SENSOR_DELAY_GAME // ~50-100 Hz
@@ -57,7 +57,7 @@ class IMUMotionDetector(context: Context) : SensorEventListener {
     fun stopMonitoring() {
         if (!isMonitoring) return
         
-        sensorManager.unregisterListener(this)
+        sensorManager?.unregisterListener(this)
         isMonitoring = false
         
         Log.d(tag, "IMU monitoring stopped")

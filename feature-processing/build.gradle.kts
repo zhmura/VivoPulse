@@ -6,7 +6,7 @@ plugins {
 
 android {
     namespace = "com.vivopulse.feature.processing"
-    compileSdk = 35
+    compileSdk = 36
 
     defaultConfig {
         minSdk = 29
@@ -25,6 +25,10 @@ android {
         }
     }
     
+    testOptions {
+        unitTests.isReturnDefaultValues = true
+    }
+    
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
@@ -37,6 +41,7 @@ android {
     testOptions {
         unitTests {
             isIncludeAndroidResources = true
+            isReturnDefaultValues = true
         }
     }
 }

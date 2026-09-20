@@ -42,3 +42,6 @@ Thumbs.db
 
 # Embedded JDK
 .jdk/
+
+# antigravity rules
+.agent/rules/android-kotlin-development

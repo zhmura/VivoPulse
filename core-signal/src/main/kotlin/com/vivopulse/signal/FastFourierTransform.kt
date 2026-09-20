@@ -60,12 +60,12 @@ object FastFourierTransform {
             
             for (k in 0 until halfL) {
                 for (i in k until n step l) {
-                    val j = i + halfL
-                    val tempReal = wReal * xReal[j] - wImag * xImag[j]
-                    val tempImag = wReal * xImag[j] + wImag * xReal[j]
+                    val butterflyIndex = i + halfL
+                    val tempReal = wReal * xReal[butterflyIndex] - wImag * xImag[butterflyIndex]
+                    val tempImag = wReal * xImag[butterflyIndex] + wImag * xReal[butterflyIndex]
                     
-                    xReal[j] = xReal[i] - tempReal
-                    xImag[j] = xImag[i] - tempImag
+                    xReal[butterflyIndex] = xReal[i] - tempReal
+                    xImag[butterflyIndex] = xImag[i] - tempImag
                     xReal[i] += tempReal
                     xImag[i] += tempImag
                 }
@@ -79,6 +79,35 @@ object FastFourierTransform {
         return Pair(xReal, xImag)
     }
     
+    /**
+     * Compute inverse FFT.
+     *
+     * Uses conjugate trick: IFFT(X) = conj(FFT(conj(X))) / N
+     *
+     * @param real Real part of frequency domain input
+     * @param imag Imaginary part of frequency domain input
+     * @return Pair(real, imag) time-domain output arrays
+     */
+    fun ifft(real: DoubleArray, imag: DoubleArray): Pair<DoubleArray, DoubleArray> {
+        val n = real.size
+        if (n == 0) return Pair(doubleArrayOf(), doubleArrayOf())
+
+        // Conjugate input
+        val conjImag = DoubleArray(n) { -imag[it] }
+
+        // Forward FFT on conjugated input
+        val (outReal, outImag) = fft(real, conjImag)
+
+        // Conjugate and scale by 1/N
+        val invN = 1.0 / n
+        for (i in 0 until n) {
+            outReal[i] *= invN
+            outImag[i] = -outImag[i] * invN
+        }
+
+        return Pair(outReal, outImag)
+    }
+
     /**
      * Find next power of 2.
      */

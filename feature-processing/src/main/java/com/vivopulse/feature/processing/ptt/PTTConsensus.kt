@@ -4,14 +4,33 @@ import com.vivopulse.feature.processing.sync.SyncMetrics
 import com.vivopulse.feature.processing.sync.Window
 import kotlin.math.abs
 
+/**
+ * P1.6: Multi-method PTT consensus with Kalman fusion.
+ *
+ * Fuses up to 4 estimation methods:
+ *   A) NCC cross-correlation (existing)
+ *   B) ITM foot-to-foot (P1.5 upgrade)
+ *   C) GCC-PHAT / multi-window (existing)
+ *   D) Cross-spectral phase-slope (P1.4 upgrade, new)
+ *
+ * Instead of threshold-based switching ("if disagree > 50ms → use xcorr"),
+ * each method provides (value, variance) and a scalar Kalman filter fuses
+ * them with outlier gating.
+ */
 data class ConsensusPtt(
     val pttMsMedian: Double,
     val pttMsIqr: Double,
     val methodAgreeMs: Double,
-    val nBeats: Int
+    val nBeats: Int,
+    val delayStabilityScore: Double = 1.0,
+    val kalmanCiMs: Double = Double.MAX_VALUE,     // 95% CI half-width from Kalman
+    val meanCoherenceAtHr: Double = 0.0,           // γ²(f) at HR harmonic bins
+    val beatCoverage: Double = 0.0                 // valid beats / expected beats
 )
 
 class PTTConsensus {
+
+    private val kalman = PttKalmanFuser()
 
     fun estimateConsensusPtt(
         face: DoubleArray,
@@ -19,136 +38,134 @@ class PTTConsensus {
         fsHz: Double,
         hrFaceBpm: Double,
         hrFingerBpm: Double,
-        @Suppress("UNUSED_PARAMETER") segment: Window
+        @Suppress("UNUSED_PARAMETER") segment: Window,
+        footDetectionEnabled: Boolean = true
     ): ConsensusPtt {
-        // Method A: XCorr lag
-        // We can reuse SyncMetrics logic but we need just the lag
-        // Assuming face and finger are already windowed to 'segment'
-        
+
+        val tag = "PTTConsensus"
+        val measurements = mutableListOf<PttKalmanFuser.Measurement>()
+        val hrAvgBpm = if (hrFaceBpm > 0 && hrFingerBpm > 0)
+            (hrFaceBpm + hrFingerBpm) / 2.0 else maxOf(hrFaceBpm, hrFingerBpm)
+
+        // ──────────── Method A: NCC cross-correlation ────────────
         val syncResult = SyncMetrics.computeMetrics(face, finger, hrFaceBpm, hrFingerBpm, fsHz)
         val pttXCorr = syncResult.lagMs
-        
-        // Method B: Foot-to-Foot
-        // Detect feet (onset)
-        val faceFeet = detectFeet(face, fsHz)
-        val fingerFeet = detectFeet(finger, fsHz)
-        
-        val beatLags = mutableListOf<Double>()
-        
-        // Match feet
-        for (tFace in faceFeet) {
-            // Find closest finger foot after face foot (within reasonable PTT range e.g. 100-400ms)
-            // Or just closest.
-            val tFinger = fingerFeet.minByOrNull { abs(it - tFace) } ?: continue
-            
-            val lag = tFinger - tFace
-            // PTT should be positive (Face -> Finger)
-            // But depending on phase, it might wrap.
-            // Let's assume aligned signals where lag is roughly 200ms.
-            
-            if (lag in 50.0..500.0) {
-                beatLags.add(lag)
+        val xcorrVar = PttKalmanFuser.corrToVariance(syncResult.correlation, pttXCorr)
+        measurements.add(PttKalmanFuser.Measurement("XCorr", pttXCorr, xcorrVar))
+        android.util.Log.d(tag, "XCorr: lag=${"%.1f".format(pttXCorr)}ms corr=${"%.2f".format(syncResult.correlation)} var=${"%.0f".format(xcorrVar)}")
+
+        // ──────────── Method B: ITM Foot-to-Foot (P1.5) ────────────
+        var nBeats = 0
+        var footIqr = 0.0
+        if (footDetectionEnabled) {
+            val facePeaks = PeakDetect.detectPeaks(face, fsHz)
+            val fingerPeaks = PeakDetect.detectPeaks(finger, fsHz)
+
+            if (facePeaks.isValid && fingerPeaks.isValid) {
+                val faceFeet = IntersectingTangentFoot.detectFeet(face, fsHz, facePeaks.indices)
+                val fingerFeet = IntersectingTangentFoot.detectFeet(finger, fsHz, fingerPeaks.indices)
+                val f2fPtts = IntersectingTangentFoot.computeFootToFootPtt(faceFeet, fingerFeet)
+
+                if (f2fPtts.size >= 2) {
+                    val sorted = f2fPtts.sorted()
+                    val pttFoot = median(sorted)
+                    footIqr = iqr(sorted)
+                    val footVar = PttKalmanFuser.iqrToVariance(footIqr.coerceAtLeast(5.0))
+                    nBeats = f2fPtts.size
+
+                    measurements.add(PttKalmanFuser.Measurement("F2F", pttFoot, footVar))
+                    android.util.Log.d(tag, "ITM F2F: median=${"%.1f".format(pttFoot)}ms iqr=${"%.1f".format(footIqr)}ms nBeats=$nBeats var=${"%.0f".format(footVar)}")
+                } else {
+                    android.util.Log.d(tag, "ITM F2F: insufficient beats (${f2fPtts.size})")
+                }
             }
         }
-        
-        if (beatLags.isEmpty()) {
-            return ConsensusPtt(0.0, 0.0, 0.0, 0)
+
+        // ──────────── Method C: GCC-PHAT / Multi-window ────────────
+        val gccResult = CrossCorr.gccPhatLag(face, finger, fsHz)
+        val multiResult = CrossCorr.multiWindowLag(face, finger, fsHz)
+
+        if (multiResult.isValid) {
+            val madVar = PttKalmanFuser.madToVariance(multiResult.madMs.coerceAtLeast(3.0))
+            measurements.add(PttKalmanFuser.Measurement("GCC-MW", multiResult.medianLagMs, madVar))
+            android.util.Log.d(tag, "GCC-MW: lag=${"%.1f".format(multiResult.medianLagMs)}ms mad=${"%.1f".format(multiResult.madMs)}ms stability=${"%.2f".format(multiResult.stabilityScore)} var=${"%.0f".format(madVar)}")
+        } else {
+            val gccVar = PttKalmanFuser.corrToVariance(gccResult.peakSharpness, gccResult.lagMs)
+            measurements.add(PttKalmanFuser.Measurement("GCC", gccResult.lagMs, gccVar))
+            android.util.Log.d(tag, "GCC: lag=${"%.1f".format(gccResult.lagMs)}ms var=${"%.0f".format(gccVar)}")
         }
-        
-        val pttFootMedian = median(beatLags)
-        val pttFootIqr = iqr(beatLags)
-        
-        val agreement = abs(pttXCorr - pttFootMedian)
-        
-        // If agreement is bad, maybe return "uncertain"?
-        // For now, return stats.
-        
+
+        // ──────────── Method D: Cross-spectral phase delay (P1.4) ────────────
+        var cspCoherence = 0.0
+        if (hrAvgBpm > 30) {
+            val cspResult = CrossSpectralPhaseDelay.estimateDelay(
+                face, finger, fsHz, hrAvgBpm,
+                maxHarmonics = 4, gammaMin = 0.10
+            )
+            cspCoherence = cspResult.meanCoherence
+            if (cspResult.standardErrorMs < 200) {
+                val cspVar = PttKalmanFuser.cspToVariance(cspResult.standardErrorMs)
+                measurements.add(PttKalmanFuser.Measurement("CSP", cspResult.delayMs, cspVar))
+                android.util.Log.d(tag, "CSP: delay=${"%.1f".format(cspResult.delayMs)}ms se=${"%.1f".format(cspResult.standardErrorMs)}ms coh=${"%.2f".format(cspResult.meanCoherence)} bins=${cspResult.nBins} var=${"%.0f".format(cspVar)}")
+            } else {
+                android.util.Log.d(tag, "CSP: rejected (SE=${"%.0f".format(cspResult.standardErrorMs)}ms)")
+            }
+        }
+
+        // ──────────── Kalman Fusion (P1.6) ────────────
+        // P4-B: Use neutral physiological prior (100ms) instead of potentially
+        // wrong XCorr value. Wide initial variance (2500ms²) lets the filter
+        // converge quickly to whichever methods agree.
+        kalman.reset(100.0, 2500.0)
+        val fusion = kalman.fuse(measurements)
+
+        val stability = multiResult.stabilityScore.coerceIn(0.0, 1.0)
+
+        // Method agreement: max pairwise difference among valid measurements
+        val validVals = measurements.filter {
+            it.valueMsOrNull != null && it.varianceMs2.isFinite()
+        }.mapNotNull { it.valueMsOrNull }
+        val methodAgree = if (validVals.size >= 2) {
+            validVals.maxOrNull()!! - validVals.minOrNull()!!
+        } else {
+            Double.MAX_VALUE
+        }
+
+        android.util.Log.i(tag, "FUSION | ptt=${"%.1f".format(fusion.pttMs)}ms ±${"%.1f".format(fusion.confidenceInterval)}ms | " +
+              "methods=${fusion.methodsUsed}/${measurements.size} rejected=${fusion.methodsRejected} | " +
+              "agree=${"%.1f".format(methodAgree)}ms stable=${fusion.isStable}")
+
+        // Beat coverage: ratio of detected beats to expected beats from HR
+        val durationSec = face.size / fsHz
+        val expectedBeats = if (hrAvgBpm > 0) (durationSec * hrAvgBpm / 60.0).toInt() else 0
+        val beatCov = if (expectedBeats > 0) (nBeats.toDouble() / expectedBeats).coerceIn(0.0, 1.0) else 0.0
+
+        android.util.Log.i(tag, "VALIDATION_METRICS | coherence=${"%.3f".format(cspCoherence)} | " +
+              "kalmanCI=${"%.1f".format(fusion.confidenceInterval)}ms | " +
+              "beatCoverage=${"%.2f".format(beatCov)} ($nBeats/$expectedBeats)")
+
         return ConsensusPtt(
-            pttMsMedian = pttFootMedian, // Prefer foot-to-foot for beat-level precision? Or XCorr for robustness?
-            // Prompt says: "Agreement check: |PTT_xcorr - PTT_foot| <= 20 ms"
-            // If agrees, use median.
-            pttMsIqr = pttFootIqr,
-            methodAgreeMs = agreement,
-            nBeats = beatLags.size
+            pttMsMedian = fusion.pttMs,
+            pttMsIqr = footIqr,
+            methodAgreeMs = methodAgree,
+            nBeats = nBeats,
+            delayStabilityScore = stability,
+            kalmanCiMs = fusion.confidenceInterval,
+            meanCoherenceAtHr = cspCoherence,
+            beatCoverage = beatCov
         )
     }
-    
-    private fun detectFeet(signal: DoubleArray, fsHz: Double): List<Double> {
-        if (signal.size < 3) return emptyList()
-        
-        // 1. Compute 1st derivative (central difference)
-        val diff = DoubleArray(signal.size)
-        for (i in 1 until signal.size - 1) {
-            diff[i] = (signal[i + 1] - signal[i - 1]) / 2.0
-        }
-        
-        // 2. Find max d/dt (steepest systolic upstroke)
-        val maxSlope = diff.maxOrNull() ?: return emptyList()
-        val slopeThreshold = maxSlope * 0.05 // 5% of max slope - robust for smoother signals
-        
-        val feet = mutableListOf<Double>()
-        
-        // 3. Find feet
-        // Look for local maxima in derivative that exceed threshold
-        var i = 1
-        while (i < diff.size - 1) {
-            // Check if i is a local max of derivative and exceeds threshold
-            if (diff[i] > slopeThreshold && diff[i] >= diff[i-1] && diff[i] >= diff[i+1]) {
-                
-                // This is a systolic upstroke peak velocity.
-                // The foot is the minimum value point preceding this upstroke.
-                // Search backwards for local minimum in the signal.
-                // Limit search window to e.g. 500ms (50 samples) to cover slow HR (0.6 Hz)
-                
-                val searchLimit = 50
-                var bestK = i
-                var minVal = signal[i]
-                
-                for (k in i downTo maxOf(0, i - searchLimit)) {
-                    if (signal[k] <= minVal) {
-                        minVal = signal[k]
-                        bestK = k
-                    }
-                    
-                    // Check if we found a local minimum (valley)
-                    // k < k-1 and k <= k+1
-                    if (k > 0 && k < i) {
-                        if (signal[k] < signal[k-1] && signal[k] <= signal[k+1]) {
-                            // Found local min
-                            bestK = k
-                            break
-                        }
-                    }
-                }
-                
-                feet.add((bestK / fsHz) * 1000.0)
-                
-                // Skip forward to avoid detecting same beat
-                i += 30
-            } else {
-                i++
-            }
-        }
-        
-        return feet
-    }
-    
+
     private fun median(list: List<Double>): Double {
         if (list.isEmpty()) return 0.0
         val sorted = list.sorted()
         val n = sorted.size
-        return if (n % 2 == 0) {
-            (sorted[n/2 - 1] + sorted[n/2]) / 2.0
-        } else {
-            sorted[n/2]
-        }
+        return if (n % 2 == 0) (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0 else sorted[n / 2]
     }
-    
+
     private fun iqr(list: List<Double>): Double {
         if (list.size < 4) return 0.0
         val sorted = list.sorted()
-        val q1 = sorted[sorted.size / 4]
-        val q3 = sorted[sorted.size * 3 / 4]
-        return q3 - q1
+        return sorted[sorted.size * 3 / 4] - sorted[sorted.size / 4]
     }
 }
