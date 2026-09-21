@@ -50,6 +50,9 @@ object CrossCorr {
                 message = "Insufficient samples for correlation (need ≥100)"
             )
         }
+        if (!hasVariation(xWindow) || !hasVariation(yWindow)) {
+            return CrossCorrResult(0.0, 0.0, 0.0, false, message = "No finite varying signal")
+        }
         
         // P3-B: Max lag ±400ms — aligned with foot-to-foot detection range
         val maxLagSamples = (fsHz * 0.4).toInt() // 400ms
@@ -219,31 +222,37 @@ object CrossCorr {
     /**
      * Compute time delay using GCC-PHAT.
      *
-     * Unlike Pearson NCC, GCC-PHAT whitens the cross-power spectrum
-     * (divides by magnitude), keeping only phase information.
-     * This produces sharper peaks and is more robust under
-     * amplitude distortion (AE steps, varying SNR, illumination changes).
+     * Partially whitens the pulse-band cross-power spectrum. A relative
+     * magnitude floor prevents weak leakage bins from dominating the delay.
+     * The floor and beta are engineering regularization parameters; they do
+     * not establish robustness to motion, exposure changes or morphology.
      *
-     * R_PHAT(τ) = IFFT[ X*(f)·Y(f) / |X*(f)·Y(f)| ]
+     * R(τ) = IFFT[ G(f) / max(|G(f)|, 0.01 max|G|)^beta ], G = X*·Y.
      *
      * @param x First signal (e.g., face PPG)
      * @param y Second signal (e.g., finger PPG)
      * @param fsHz Sample rate in Hz
-     * @param minLagMs Minimum physiological lag (default 30ms)
+     * @param minLagMs Minimum absolute search lag (default 0ms, includes no delay)
      * @param maxLagMs Maximum physiological lag (default 400ms)
      * @param windowSec Window duration in seconds (default 20.0s)
-     * @param beta PHAT weighting exponent: 1.0 = full whitening, 0.0 = standard CC
+     * @param beta Whitening exponent: 1.0 = regularized PHAT, 0.0 = band-limited CC
      * @return CrossCorrResult with lag, correlation, peak sharpness
      */
     fun gccPhatLag(
         x: DoubleArray,
         y: DoubleArray,
         fsHz: Double,
-        minLagMs: Double = 30.0,
+        minLagMs: Double = 0.0,
         maxLagMs: Double = 400.0,
         windowSec: Double = 20.0,
         beta: Double = 0.8
     ): CrossCorrResult {
+        fun invalid(reason: String) = CrossCorrResult(0.0, 0.0, 0.0, false, message = reason)
+        if (!fsHz.isFinite() || fsHz <= 0.0 || !windowSec.isFinite() || windowSec <= 0.0 ||
+            !minLagMs.isFinite() || !maxLagMs.isFinite() || minLagMs < 0.0 || maxLagMs < minLagMs ||
+            !beta.isFinite() || beta !in 0.0..1.0 || x.size != y.size) {
+            return invalid("Invalid GCC configuration or unequal input lengths")
+        }
         // Use last windowSec of signal
         val windowSamples = (windowSec * fsHz).toInt()
         val startIdx = maxOf(0, x.size - windowSamples)
@@ -258,6 +267,9 @@ object CrossCorr {
                 isValid = false, message = "Insufficient samples for GCC-PHAT (need ≥64)"
             )
         }
+        if (!hasVariation(xWindow) || !hasVariation(yWindow)) {
+            return CrossCorrResult(0.0, 0.0, 0.0, false, message = "No finite varying signal")
+        }
         
         // Zero-pad to next power of 2
         val nfft = com.vivopulse.signal.FastFourierTransform.nextPowerOf2(n * 2)
@@ -270,7 +282,11 @@ object CrossCorr {
         // Remove mean (DC removal)
         val xMean = xPad.take(n).average()
         val yMean = yPad.take(n).average()
-        for (i in 0 until n) { xPad[i] -= xMean; yPad[i] -= yMean }
+        for (i in 0 until n) {
+            val window = 0.5 - 0.5 * cos(2.0 * PI * i / (n - 1))
+            xPad[i] = (xPad[i] - xMean) * window
+            yPad[i] = (yPad[i] - yMean) * window
+        }
         
         // Forward FFT
         val (xReal, xImag) = com.vivopulse.signal.FastFourierTransform.fft(xPad)
@@ -280,8 +296,32 @@ object CrossCorr {
         // Then PHAT whitening: W = G / |G|^beta
         val gReal = DoubleArray(nfft)
         val gImag = DoubleArray(nfft)
+        val totalX = xReal.indices.sumOf { xReal[it] * xReal[it] + xImag[it] * xImag[it] }
+        val totalY = yReal.indices.sumOf { yReal[it] * yReal[it] + yImag[it] * yImag[it] }
+        if (!totalX.isFinite() || !totalY.isFinite() || totalX <= 1e-12 || totalY <= 1e-12)
+            return invalid("No finite spectral energy")
+        var retainedX = 0.0
+        var retainedY = 0.0
+        var peakCrossMagnitude = 0.0
+        for (i in 0 until nfft) {
+            val frequency = minOf(i, nfft - i) * fsHz / nfft
+            if (frequency < 0.5 || frequency > minOf(4.0, fsHz / 2.0)) continue
+            val powerX = xReal[i] * xReal[i] + xImag[i] * xImag[i]
+            val powerY = yReal[i] * yReal[i] + yImag[i] * yImag[i]
+            peakCrossMagnitude = maxOf(peakCrossMagnitude, sqrt(powerX * powerY))
+        }
+        // Regularized PHAT: weak leakage bins must not acquire the same weight
+        // as observed pulse components. The relative floor is amplitude invariant.
+        val whiteningFloor = maxOf(1e-12, 0.01 * peakCrossMagnitude)
         
         for (i in 0 until nfft) {
+            // Whitening tiny stop-band residuals can create a zero-lag edge
+            // spike. This estimator receives pulse-band signals; retain only
+            // that band's positive and mirrored negative frequencies.
+            val frequency = minOf(i, nfft - i) * fsHz / nfft
+            if (frequency < 0.5 || frequency > minOf(4.0, fsHz / 2.0)) continue
+            retainedX += xReal[i] * xReal[i] + xImag[i] * xImag[i]
+            retainedY += yReal[i] * yReal[i] + yImag[i] * yImag[i]
             // X* · Y = (xR - j·xI)(yR + j·yI) = (xR·yR + xI·yI) + j(xR·yI - xI·yR)
             val cpReal = xReal[i] * yReal[i] + xImag[i] * yImag[i]
             val cpImag = xReal[i] * yImag[i] - xImag[i] * yReal[i]
@@ -289,12 +329,14 @@ object CrossCorr {
             val magnitude = sqrt(cpReal * cpReal + cpImag * cpImag)
             
             if (magnitude > 1e-12) {
-                // PHAT whitening: divide by |G|^beta
-                val weight = magnitude.pow(beta)
+                val weight = maxOf(magnitude, whiteningFloor).pow(beta)
                 gReal[i] = cpReal / weight
                 gImag[i] = cpImag / weight
             }
         }
+        // A tiny leakage tail from an out-of-band tone is not pulse evidence.
+        if (retainedX / totalX < 1e-6 || retainedY / totalY < 1e-6)
+            return invalid("No meaningful retained pulse-band power")
         
         // IFFT to get GCC-PHAT correlation
         val (rReal, _) = com.vivopulse.signal.FastFourierTransform.ifft(gReal, gImag)
@@ -302,6 +344,7 @@ object CrossCorr {
         // Extract lags in physiological range [minLagMs, maxLagMs]
         val minLagSamples = (minLagMs * fsHz / 1000.0).toInt()
         val maxLagSamples = (maxLagMs * fsHz / 1000.0).toInt()
+        if (minLagSamples > minOf(maxLagSamples, nfft / 2 - 1)) return invalid("Empty GCC lag search")
         
         // In IFFT output, positive lags are at indices [0, nfft/2)
         // and negative lags at indices [nfft/2, nfft)
@@ -324,6 +367,7 @@ object CrossCorr {
                 bestLag = -lag
             }
         }
+        if (!bestVal.isFinite() || bestVal <= 1e-12) return invalid("No finite positive GCC peak")
         
         // Sub-sample refinement via quadratic interpolation
         val peakIdx = if (bestLag >= 0) bestLag else nfft + bestLag
@@ -350,6 +394,7 @@ object CrossCorr {
         
         // Normalize correlation score to [0, 1]
         val maxR = rReal.maxOrNull() ?: 1.0
+        if (!maxR.isFinite() || maxR <= 1e-12) return invalid("No finite positive GCC correlation")
         val corrScore = if (maxR > 1e-12) (bestVal / maxR).coerceIn(0.0, 1.0) else 0.0
         
         // Confidence decay beyond 200ms
@@ -383,7 +428,7 @@ object CrossCorr {
      * @param fsHz Sample rate in Hz
      * @param windowSec Subwindow duration (default 5.0s)
      * @param overlapFrac Overlap fraction (default 0.5 = 50%)
-     * @param minLagMs Minimum physiological lag (default 30ms)
+     * @param minLagMs Minimum absolute search lag (default 0ms)
      * @param maxLagMs Maximum physiological lag (default 400ms)
      * @return MultiWindowResult with median lag, MAD, stability score
      */
@@ -393,7 +438,7 @@ object CrossCorr {
         fsHz: Double,
         windowSec: Double = 5.0,
         overlapFrac: Double = 0.5,
-        minLagMs: Double = 30.0,
+        minLagMs: Double = 0.0,
         maxLagMs: Double = 400.0
     ): MultiWindowResult {
         val windowSamples = (windowSec * fsHz).toInt()
@@ -494,7 +539,7 @@ object CrossCorr {
      * @param x First signal (face PPG)
      * @param y Second signal (finger PPG)
      * @param fsHz Sample rate in Hz
-     * @param minLagMs Min physiological lag (default 30ms)
+     * @param minLagMs Minimum absolute search lag (default 0ms)
      * @param maxLagMs Max physiological lag (default 400ms)
      * @param windowSec Analysis window (default 20s)
      * @param welchSegment Welch segment length for coherence estimation
@@ -505,7 +550,7 @@ object CrossCorr {
         x: DoubleArray,
         y: DoubleArray,
         fsHz: Double,
-        minLagMs: Double = 30.0,
+        minLagMs: Double = 0.0,
         maxLagMs: Double = 400.0,
         windowSec: Double = 20.0,
         welchSegment: Int = 256,
@@ -632,6 +677,12 @@ object CrossCorr {
             lagConfidence = if (abs(lagMs) > 200.0) 1.0 - ((abs(lagMs) - 200.0) / 300.0).coerceIn(0.0, 0.5) else 1.0,
             message = "AdaptiveGCC: PTT=${"%.2f".format(lagMs)}ms, adaptive=$isAdaptive, Sharp=${"%.3f".format(sharpness)}"
         )
+    }
+
+    private fun hasVariation(signal: DoubleArray): Boolean {
+        if (signal.isEmpty() || signal.any { !it.isFinite() }) return false
+        val mean = signal.average()
+        return signal.sumOf { (it - mean) * (it - mean) } / signal.size > 1e-12
     }
 }
 

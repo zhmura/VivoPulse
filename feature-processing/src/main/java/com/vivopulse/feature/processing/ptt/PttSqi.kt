@@ -42,12 +42,12 @@ object PttSqi {
     fun computeChannelSqi(
         filteredSignal: DoubleArray,
         rawSignal: DoubleArray,
-        @Suppress("UNUSED_PARAMETER") fsHz: Double,
+        fsHz: Double,
         peakResult: PeakDetectResult,
         motionPenalty: Double = 100.0
     ): ChannelSqiResult {
         // 1. SNR component (0-70 points)
-        val snrDb = computeBandSnr(filteredSignal, rawSignal)
+        val snrDb = computeBandSnr(rawSignal, fsHz, peakResult)
         val snrScore = computeSnrScore(snrDb) // 0-70
         
         // 2. Peak regularity component (0-30 points)
@@ -73,29 +73,36 @@ object PttSqi {
     }
     
     /**
-     * Compute band-limited SNR.
+     * Spectral concentration around pulse harmonics versus residual power.
+     * Both powers come from the same demeaned raw trace, so DC removal and
+     * z-score normalization cannot manufacture a zero-noise residual.
+     * This is a signal-quality heuristic, not a physiological accuracy estimate.
      */
-    private fun computeBandSnr(filtered: DoubleArray, raw: DoubleArray): Double {
-        val n = minOf(filtered.size, raw.size)
-        
+    private fun computeBandSnr(raw: DoubleArray, fs: Double, peaks: PeakDetectResult): Double {
+        if (raw.size < 64 || fs <= 0 || !fs.isFinite() || raw.any { !it.isFinite() } ||
+            !peaks.isValid || peaks.rrIntervalsMs.isEmpty()) return Double.NEGATIVE_INFINITY
+        val mean = raw.average()
+        val variance = raw.sumOf { (it - mean) * (it - mean) } / raw.size
+        if (variance <= 1e-12) return Double.NEGATIVE_INFINITY
+        val fundamental = 1000.0 / peaks.rrIntervalsMs.sorted()[peaks.rrIntervalsMs.size / 2]
+        val nfft = com.vivopulse.signal.FastFourierTransform.nextPowerOf2(raw.size)
+        val windowed = DoubleArray(nfft)
+        for (i in raw.indices) {
+            windowed[i] = (raw[i] - mean) * (0.5 - 0.5 * cos(2.0 * PI * i / (raw.size - 1)))
+        }
+        val (real, imag) = com.vivopulse.signal.FastFourierTransform.fft(windowed)
+        val halfWidth = maxOf(0.10, 1.5 * fs / raw.size)
         var signalPower = 0.0
-        var noisePower = 0.0
-        
-        for (i in 0 until n) {
-            val sig = filtered[i]
-            val noise = raw[i] - filtered[i]
-            signalPower += sig * sig
-            noisePower += noise * noise
+        var residualPower = 0.0
+        for (k in 1..nfft / 2) {
+            val f = k * fs / nfft
+            if (f < 0.5 || f > minOf(8.0, fs / 2.0)) continue
+            val power = real[k] * real[k] + imag[k] * imag[k]
+            val harmonic = (1..3).any { h -> h * fundamental <= 4.0 && abs(f - h * fundamental) <= halfWidth }
+            if (harmonic) signalPower += power else residualPower += power
         }
-        
-        signalPower /= n
-        noisePower /= n
-        
-        return if (noisePower > 1e-10) {
-            10.0 * log10(signalPower / noisePower)
-        } else {
-            40.0 // Very high SNR
-        }
+        if (signalPower <= 1e-12) return Double.NEGATIVE_INFINITY
+        return (10.0 * log10(signalPower / residualPower.coerceAtLeast(signalPower * 1e-4))).coerceAtMost(40.0)
     }
     
     /**

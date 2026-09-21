@@ -3,15 +3,12 @@ package com.vivopulse.feature.processing
 import com.vivopulse.feature.processing.timestamp.TimestampedValue
 import org.junit.Assert.*
 import org.junit.Test
-import org.junit.runner.RunWith
-import org.robolectric.RobolectricTestRunner
 import kotlin.math.sin
 
 /**
  * Integration tests for the complete signal processing pipeline.
  * Tests the flow from raw data to processed series with metrics.
  */
-@RunWith(RobolectricTestRunner::class)
 class SignalPipelineIntegrationTest {
 
     private val pipeline = SignalPipeline(
@@ -42,7 +39,8 @@ class SignalPipelineIntegrationTest {
         
         val rawBuffer = RawSeriesBuffer(
             faceData = faceData,
-            fingerData = fingerData
+            fingerData = fingerData, provenance = SignalProvenance.SYNTHETIC,
+            timingVerified = true, hardwarePttCapable = true
         )
         
         val result = pipeline.process(rawBuffer)
@@ -131,7 +129,8 @@ class SignalPipelineIntegrationTest {
         
         val rawBuffer = RawSeriesBuffer(
             faceData = faceData,
-            fingerData = fingerData
+            fingerData = fingerData, provenance = SignalProvenance.SYNTHETIC,
+            timingVerified = true, hardwarePttCapable = true
         )
         
         val result = pipeline.process(rawBuffer)
@@ -142,26 +141,9 @@ class SignalPipelineIntegrationTest {
         val pttOutput = result.pttOutput
         assertNotNull("PTT output should not be null", pttOutput)
         
-        // PTT calculation is complex and may not always converge to expected value
-        // due to filtering, resampling, and phase estimation artifacts.
-        // For integration test, just verify processing completes successfully.
-        assertTrue("PTT output should exist", pttOutput != null)
-        if (pttOutput != null && pttOutput.isValid) {
-            val expectedPttMs = pttDelayS * 1000 // 80ms
-            val actualPttMs = pttOutput.pttMs ?: 0.0
-            
-            println("PTT test: expected=${expectedPttMs}ms, actual=${actualPttMs}ms")
-            
-            // PTT of 0 indicates quality rejection - acceptable for synthetic signals
-            if (actualPttMs > 0) {
-                assertTrue("PTT should be in plausible range (30-200ms)",
-                    actualPttMs in 30.0..200.0)
-            } else {
-                println("PTT was 0 due to quality rejection - acceptable for synthetic signals")
-            }
-        }
+        assertTrue("Estimator must report a finite delay", pttOutput!!.isValid && pttOutput.pttMs?.isFinite() == true)
+        assertEquals("Known synthetic delay", pttDelayS * 1000, pttOutput.pttMs!!, 10.0)
     }
-
     @Test
     fun `pipeline handles mismatched sample rates gracefully`() {
         // Face at 30Hz, Finger at 25Hz
@@ -175,7 +157,8 @@ class SignalPipelineIntegrationTest {
         
         val rawBuffer = RawSeriesBuffer(
             faceData = faceData,
-            fingerData = fingerData
+            fingerData = fingerData, provenance = SignalProvenance.SYNTHETIC,
+            timingVerified = true, hardwarePttCapable = true
         )
         
         val result = pipeline.process(rawBuffer)

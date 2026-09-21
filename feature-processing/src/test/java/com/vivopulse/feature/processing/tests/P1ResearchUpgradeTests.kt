@@ -17,7 +17,7 @@ import kotlin.math.sin
  * 2. Savitzky-Golay derivative preserves slope timing
  * 3. CSP delay estimator recovers known delay
  * 4. ITM foot detection finds correct onset times
- * 5. Kalman fusion produces lower variance than any single method
+ * 5. Same-data fusion does not claim independent precision gains
  */
 class P1ResearchUpgradeTests {
 
@@ -77,13 +77,24 @@ class P1ResearchUpgradeTests {
 
     @Test
     fun `SG smoothing preserves DC level`() {
-        val signal = DoubleArray(100) { 5.0 + (Math.random() - 0.5) * 0.01 }
+        val random = java.util.Random(12)
+        val signal = DoubleArray(100) { 5.0 + (random.nextDouble() - 0.5) * 0.01 }
         val smoothed = SavitzkyGolay.smooth(signal, windowSamples = 5)
 
         val meanOriginal = signal.average()
         val meanSmoothed = smoothed.average()
         assertTrue("DC level should be preserved, diff=${abs(meanOriginal - meanSmoothed)}",
             abs(meanOriginal - meanSmoothed) < 0.01)
+    }
+
+    @Test
+    fun `cubic derivative reproduces polynomial including zero derivative at origin`() {
+        val signal = DoubleArray(101) { val t = (it - 50) / 100.0; t * t * t }
+        val derivative = SavitzkyGolay.firstDerivative(signal, 100.0, 7, 3)
+        for (i in 7 until 94) {
+            val t = (i - 50) / 100.0
+            assertEquals(3.0 * t * t, derivative[i], 1e-10)
+        }
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -93,26 +104,19 @@ class P1ResearchUpgradeTests {
     @Test
     fun `CSP recovers known delay in synthetic signal`() {
         val fs = 100.0
-        val n = 2000 // 20 seconds
-        val hrHz = 1.2 // 72 bpm
-        val trueDelayMs = 80.0 // 80ms PTT
-        val delaySamples = (trueDelayMs / 1000.0 * fs).toInt()
-
-        val finger = DoubleArray(n) { sin(2.0 * PI * hrHz * it / fs) +
-                                      0.3 * sin(2.0 * PI * 2 * hrHz * it / fs) }
-        val face = DoubleArray(n) { i ->
-            val delayed = i - delaySamples
-            if (delayed >= 0 && delayed < n) finger[delayed] else 0.0
+        val n = 6000
+        val hrHz = 1.171875 // Exact Welch bin, three informative harmonics
+        fun pulse(t: Double) = sin(2 * PI * hrHz * t) + 0.4 * sin(4 * PI * hrHz * t) + 0.2 * sin(6 * PI * hrHz * t)
+        for (trueDelayMs in listOf(-80.0, 0.0, 80.0)) {
+            val face = DoubleArray(n) { pulse(it / fs) }
+            val finger = DoubleArray(n) { pulse(it / fs - trueDelayMs / 1000.0) }
+            val result = CrossSpectralPhaseDelay.estimateDelay(
+                face, finger, fs, hrHz * 60, maxHarmonics = 3, segmentLength = 512
+            )
+            assertTrue("Must have informative phase bins", result.nBins >= 3)
+            assertEquals("Positive delay means finger later than face", trueDelayMs, result.delayMs, 5.0)
+            assertTrue("SE should be finite", result.standardErrorMs.isFinite())
         }
-
-        val result = CrossSpectralPhaseDelay.estimateDelay(
-            face, finger, fs, hrHz * 60, maxHarmonics = 3, segmentLength = 128
-        )
-
-        // Should recover delay within ±20ms
-        assertTrue("CSP delay should be near ${trueDelayMs}ms, got ${result.delayMs}ms (SE=${result.standardErrorMs})",
-            abs(result.delayMs - trueDelayMs) < 20.0 || result.standardErrorMs > 100)
-        assertTrue("SE should be finite", result.standardErrorMs.isFinite())
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -136,7 +140,8 @@ class P1ResearchUpgradeTests {
         }
 
         val peaks = PeakDetect.detectPeaks(signal, fs)
-        if (peaks.isValid && peaks.indices.size >= 2) {
+        assertTrue("Synthetic pulse peaks must be detected", peaks.isValid && peaks.indices.size >= 2)
+        run {
             val feet = IntersectingTangentFoot.detectFeet(signal, fs, peaks.indices)
             
             val validFeet = feet.count { it.valid }
@@ -150,7 +155,7 @@ class P1ResearchUpgradeTests {
     // ═══════════════════════════════════════════════════════════════
 
     @Test
-    fun `Kalman fusion produces lower variance than any single method`() {
+    fun `fusion preserves uncertainty for correlated same-data methods`() {
         val fuser = PttKalmanFuser(initialPttMs = 100.0, initialVariance = 2500.0)
 
         val measurements = listOf(
@@ -162,11 +167,15 @@ class P1ResearchUpgradeTests {
 
         val result = fuser.fuse(measurements)
 
-        // Fused variance should be less than smallest individual variance
+        // These algorithms observe the same samples, so covariance is unknown.
         val minIndividualVar = measurements.minOf { it.varianceMs2 }
-        assertTrue("Fused variance (${result.varianceMs2}) should be < min individual ($minIndividualVar)",
-            result.varianceMs2 < minIndividualVar)
+        assertTrue("Fusion must not invent independent precision", result.varianceMs2 >= minIndividualVar)
         assertEquals("All 4 methods should contribute", 4, result.methodsUsed)
+        val reversed = PttKalmanFuser().fuse(measurements.reversed())
+        assertEquals("Evidence order must not affect estimate", result.pttMs, reversed.pttMs, 1e-10)
+        val one = PttKalmanFuser().fuse(listOf(PttKalmanFuser.Measurement("A", 80.0, 100.0)))
+        val duplicated = PttKalmanFuser().fuse(List(4) { PttKalmanFuser.Measurement("A", 80.0, 100.0) })
+        assertEquals("Duplicated evidence must not reduce variance", one.varianceMs2, duplicated.varianceMs2, 1e-10)
     }
 
     @Test
@@ -198,9 +207,8 @@ class P1ResearchUpgradeTests {
         val result = fuser.fuse(measurements)
 
         assertEquals("No methods should contribute", 0, result.methodsUsed)
-        // Should return prior (100ms) with increased uncertainty
-        assertTrue("Should return prior estimate (~100ms), got ${result.pttMs}",
-            abs(result.pttMs - 100.0) < 1.0)
+        assertTrue("No evidence must not return a finite prior as measurement", !result.pttMs.isFinite())
+        assertFalse(result.isStable)
     }
 
     // ═══════════════════════════════════════════════════════════════

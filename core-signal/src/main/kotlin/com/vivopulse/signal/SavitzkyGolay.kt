@@ -28,20 +28,32 @@ object SavitzkyGolay {
         signal: DoubleArray,
         fs: Double,
         windowSamples: Int = 5,
-        @Suppress("UNUSED_PARAMETER") polyOrder: Int = 3
+        polyOrder: Int = 3
     ): DoubleArray {
         val n = signal.size
-        val m = windowSamples.coerceIn(2, n / 2 - 1)
+        require(fs > 0 && fs.isFinite()) { "Sampling frequency must be positive and finite" }
+        require(polyOrder in 1..3) { "Supported derivative polynomial orders are 1 to 3" }
+        if (n < 3) return DoubleArray(n)
+        val m = windowSamples.coerceIn(1, (n - 1) / 2)
         
-        // Compute SG first-derivative coefficients for cubic polynomial
-        // For cubic fit over [-m, m], the derivative coefficients are:
-        //   c_k = 3k / (m(m+1)(2m+1)) — standard result for order-3 SG first deriv
-        // This is the closed-form for the least-squares first-derivative filter.
+        // Solve the odd part of the polynomial normal equations. A cubic fit
+        // needs both k and k^3 terms; k/sum(k^2) alone is only a linear fit.
         val windowLen = 2 * m + 1
         val coeffs = DoubleArray(windowLen)
-        val denom = m.toDouble() * (m + 1).toDouble() * (2 * m + 1).toDouble() / 3.0
+        var s2 = 0.0
+        var s4 = 0.0
+        var s6 = 0.0
         for (k in -m..m) {
-            coeffs[k + m] = k.toDouble() / denom
+            val k2 = k.toDouble() * k
+            s2 += k2
+            s4 += k2 * k2
+            s6 += k2 * k2 * k2
+        }
+        val cubic = polyOrder == 3 && m >= 2
+        val denom = s2 * s6 - s4 * s4
+        for (k in -m..m) {
+            val x = k.toDouble()
+            coeffs[k + m] = if (cubic) (s6 * x - s4 * x * x * x) / denom else x / s2
         }
         
         // Apply convolution
@@ -79,7 +91,8 @@ object SavitzkyGolay {
         @Suppress("UNUSED_PARAMETER") polyOrder: Int = 3
     ): DoubleArray {
         val n = signal.size
-        val m = windowSamples.coerceIn(2, n / 2 - 1)
+        if (n < 5) return signal.copyOf()
+        val m = windowSamples.coerceIn(2, (n - 1) / 2)
         val windowLen = 2 * m + 1
         
         // For cubic polynomial, smoothing coefficients (zeroth derivative):

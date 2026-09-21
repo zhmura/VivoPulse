@@ -1,497 +1,107 @@
 package com.vivopulse.feature.processing.timestamp
 
 import kotlin.math.abs
+import kotlin.math.roundToInt
 
-/**
- * Timestamp synchronization and drift detection utilities.
- * 
- * Ensures timestamp integrity between dual camera streams and provides
- * drift detection, normalization, and resampling to a unified timeline.
- */
+/** Timestamp integrity and bounded resampling. These operations do not establish clock synchronization. */
 object TimestampSync {
-    private const val TAG = "TimestampSync"
-    private var debugEnabled = false
-    
-    /**
-     * Enable debug logging (for testing).
-     */
-    fun setDebugEnabled(enabled: Boolean) {
-        debugEnabled = enabled
-    }
-    
-    private fun logD(message: String) {
-        if (debugEnabled) {
-            println("$TAG: $message")
-        }
-    }
-    
-    /**
-     * Validates monotonicity of timestamps in a stream.
-     * 
-     * @param timestamps List of timestamps in nanoseconds
-     * @return ValidationResult with status and details
-     */
+    fun setDebugEnabled(enabled: Boolean) = Unit
+
     fun validateMonotonicity(timestamps: List<Long>): ValidationResult {
-        if (timestamps.isEmpty()) {
-            return ValidationResult(
-                isValid = true,
-                violations = 0,
-                message = "Empty timestamp list"
-            )
-        }
-        
-        var violations = 0
-        val violationIndices = mutableListOf<Int>()
-        
-        for (i in 1 until timestamps.size) {
-            if (timestamps[i] <= timestamps[i - 1]) {
-                violations++
-                violationIndices.add(i)
-            }
-        }
-        
-        return ValidationResult(
-            isValid = violations == 0,
-            violations = violations,
-            message = if (violations == 0) {
-                "All timestamps monotonically increasing"
-            } else {
-                "Found $violations non-monotonic timestamps at indices: ${violationIndices.take(5)}"
-            },
-            violationIndices = violationIndices
-        )
+        val violations = (1 until timestamps.size).filter { timestamps[it] <= timestamps[it - 1] }
+        return ValidationResult(violations.isEmpty(), violations.size,
+            if (violations.isEmpty()) "Monotonic timestamps" else "NONMONOTONIC_TIMESTAMPS", violations)
     }
-    
-    /**
-     * Estimates the median frame interval for a stream.
-     * 
-     * @param timestamps List of timestamps in nanoseconds
-     * @return Median interval in milliseconds, or null if insufficient data
-     */
+
+    private fun median(values: List<Double>): Double {
+        if (values.isEmpty()) return Double.NaN
+        val sorted = values.sorted()
+        return if (sorted.size % 2 == 0) (sorted[sorted.size / 2 - 1] + sorted[sorted.size / 2]) / 2 else sorted[sorted.size / 2]
+    }
+
     fun estimateFrameInterval(timestamps: List<Long>): Double? {
-        if (timestamps.size < 2) return null
-        
-        val intervals = mutableListOf<Long>()
-        for (i in 1 until timestamps.size) {
-            val interval = timestamps[i] - timestamps[i - 1]
-            if (interval > 0) { // Only valid intervals
-                intervals.add(interval)
-            }
-        }
-        
-        if (intervals.isEmpty()) return null
-        
-        intervals.sort()
-        val median = if (intervals.size % 2 == 0) {
-            (intervals[intervals.size / 2 - 1] + intervals[intervals.size / 2]) / 2.0
-        } else {
-            intervals[intervals.size / 2].toDouble()
-        }
-        
-        // Convert nanoseconds to milliseconds
-        return median / 1_000_000.0
+        if (timestamps.size < 2 || !validateMonotonicity(timestamps).isValid) return null
+        return median(timestamps.zipWithNext { a, b -> (b - a) / 1e6 })
     }
-    
-    /**
-     * Analyzes synchronization between two streams.
-     * 
-     * Checks for:
-     * 1. Temporal overlap
-     * 2. Frame rate consistency
-     * 3. Start time offset
-     * 
-     * NOTE: Does NOT calculate "clock drift" based on frame rate differences, as
-     * SENSOR_TIMESTAMP (BOOTTIME) is shared ground truth. Rate differences are expected.
-     * 
-     * @param stream1Timestamps First stream timestamps (nanoseconds)
-     * @param stream2Timestamps Second stream timestamps (nanoseconds)
-     * @param windowSizeMs Time window for analysis (default 5000ms)
-     * @return DriftResult with sync statistics
-     */
-    fun analyzeSynchronization(
-        stream1Timestamps: List<Long>,
-        stream2Timestamps: List<Long>,
-        windowSizeMs: Long = 5000
-    ): DriftResult {
-        if (stream1Timestamps.size < 2 || stream2Timestamps.size < 2) {
-            return DriftResult(
-                driftMsPerSecond = 0.0,
-                isValid = false,
-                message = "Insufficient timestamps for sync analysis"
-            )
+
+    fun analyzeSynchronization(stream1Timestamps: List<Long>, stream2Timestamps: List<Long>, windowSizeMs: Long = 5000): DriftResult {
+        if (stream1Timestamps.size < 2 || stream2Timestamps.size < 2)
+            return DriftResult(Double.NaN, false, message = "INSUFFICIENT_TIMESTAMPS", offsetValid = false)
+        if (!validateMonotonicity(stream1Timestamps).isValid || !validateMonotonicity(stream2Timestamps).isValid)
+            return DriftResult(Double.NaN, false, message = "NONMONOTONIC_TIMESTAMPS", offsetValid = false)
+        val start = maxOf(stream1Timestamps.first(), stream2Timestamps.first())
+        val end = minOf(stream1Timestamps.last(), stream2Timestamps.last())
+        val dt1 = estimateFrameInterval(stream1Timestamps)!!
+        val dt2 = estimateFrameInterval(stream2Timestamps)!!
+        fun jitter(stream: List<Long>, dt: Double) = median(stream.zipWithNext { a, b -> abs((b - a) / 1e6 - dt) })
+        fun drops(stream: List<Long>, dt: Double): Double {
+            val missing = stream.zipWithNext { a, b -> maxOf(0, (((b - a) / 1e6) / dt).roundToInt() - 1) }.sum()
+            return missing.toDouble() / (stream.size - 1 + missing)
         }
-        
-        // Convert window to nanoseconds
-        val windowNs = windowSizeMs * 1_000_000L
-        
-        // Find overlapping time range
-        val minStart = maxOf(stream1Timestamps.first(), stream2Timestamps.first())
-        val maxEnd = minOf(stream1Timestamps.last(), stream2Timestamps.last())
-        
-        if (maxEnd - minStart < windowNs) {
-             // Just warn if overlap is small but strictly positive
-             if (maxEnd > minStart) {
-                 logD("Short overlap: ${(maxEnd - minStart)/1e6} ms")
-             } else {
-                return DriftResult(
-                    driftMsPerSecond = 0.0,
-                    isValid = false,
-                    message = "Insufficient overlap between streams"
-                )
-             }
-        }
-        
-        // Analyze frame rates using Median Interval (robust to drops)
-        val interval1Ms = estimateFrameInterval(stream1Timestamps)
-        val interval2Ms = estimateFrameInterval(stream2Timestamps)
-        
-        val rate1 = if (interval1Ms != null && interval1Ms > 0) 1000.0 / interval1Ms else 0.0
-        val rate2 = if (interval2Ms != null && interval2Ms > 0) 1000.0 / interval2Ms else 0.0
-        
-        // Calculate Jitter (MAD of intervals)
-        val jitter1 = calculateJitterMs(stream1Timestamps, interval1Ms)
-        val jitter2 = calculateJitterMs(stream2Timestamps, interval2Ms)
-        
-        // Calculate Drop Rate (fraction of intervals > 1.5 * median)
-        val drops1 = calculateDropRate(stream1Timestamps, interval1Ms)
-        val drops2 = calculateDropRate(stream2Timestamps, interval2Ms)
-        
-        // Calculate Robust Offset using median of first N pairs (P2-B: also returns rate ratio + stddev)
-        val offsetResult = calculateRobustOffset(stream1Timestamps, stream2Timestamps)
-        val offsetMs = offsetResult.medianMs ?: 0.0
-        val offsetValid = offsetResult.medianMs != null
-        val offsetPairs = offsetResult.pairCount
-        val rateRatio = offsetResult.rateRatio
-        val offsetStdMs = offsetResult.stdMs
-        
-        // Start Overlap Duration
-        val overlapDurationMs = (maxEnd - minStart) / 1_000_000.0
-        
-        logD("Sync Analysis: Rates ${"%.1f".format(rate1)}/${"%.1f".format(rate2)} fps, " +
-             "Offset ${"%.1f".format(offsetMs)}±${"%.1f".format(offsetStdMs)} ms (valid=$offsetValid, n=$offsetPairs), " +
-             "Jitter ${"%.1f".format(jitter1)}/${"%.1f".format(jitter2)} ms, " +
-             "Drops ${"%.1f".format(drops1 * 100)}%/${"%.1f".format(drops2 * 100)}%")
-        
+        // Frame phase/start offsets and unequal acquisition spans are not clock drift.
+        // Independent clocks cannot be calibrated by pairing arbitrary nearest frames.
         return DriftResult(
-            driftMsPerSecond = 0.0, // Assumed 0 for shared clock (SENSOR_TIMESTAMP)
-            isValid = overlapDurationMs > 0 && offsetValid,
-            stream1Rate = rate1,
-            stream2Rate = rate2,
-            stream1JitterMs = jitter1,
-            stream2JitterMs = jitter2,
-            stream1DropRate = drops1,
-            stream2DropRate = drops2,
-            offsetMs = offsetMs,
-            offsetValid = offsetValid,
-            offsetPairs = offsetPairs,
-            offsetStdMs = offsetStdMs,
-            overlapDurationMs = overlapDurationMs,
-            rateRatio = rateRatio,
-            message = if (offsetValid) {
-                "Sync: Offset ${"%.0f".format(offsetMs)}ms (n=$offsetPairs), Rates ${"%.1f".format(rate1)}/${"%.1f".format(rate2)} fps"
-            } else {
-                "Sync: FAILED (Invalid Offset, n=$offsetPairs), Rates ${"%.1f".format(rate1)}/${"%.1f".format(rate2)} fps"
-            }
-        )
-    }
-    
-    private fun calculateJitterMs(timestamps: List<Long>, medianIntervalMs: Double?): Double {
-        if (timestamps.size < 3 || medianIntervalMs == null) return 0.0
-        
-        val intervalsMs = mutableListOf<Double>()
-        for (i in 1 until timestamps.size) {
-            val dt = (timestamps[i] - timestamps[i - 1]) / 1_000_000.0
-            intervalsMs.add(dt)
-        }
-        
-        // Calculate deviations from median
-        val deviations = intervalsMs.map { abs(it - medianIntervalMs) }.sorted()
-        
-        // Return Median Absolute Deviation
-        val mid = deviations.size / 2
-        return if (deviations.size % 2 == 0) {
-            (deviations[mid - 1] + deviations[mid]) / 2.0
-        } else {
-            deviations[mid]
-        }
+            driftMsPerSecond = Double.NaN, isValid = end > start,
+            stream1Rate = 1000 / dt1, stream2Rate = 1000 / dt2,
+            stream1JitterMs = jitter(stream1Timestamps, dt1), stream2JitterMs = jitter(stream2Timestamps, dt2),
+            stream1DropRate = drops(stream1Timestamps, dt1), stream2DropRate = drops(stream2Timestamps, dt2),
+            offsetMs = Double.NaN, offsetValid = false, offsetPairs = 0, offsetStdMs = Double.NaN,
+            overlapDurationMs = maxOf(0.0, (end - start) / 1e6), rateRatio = Double.NaN,
+            message = if (end > start) "Timeline overlap; shared clock must be verified by acquisition metadata" else "NO_TEMPORAL_OVERLAP")
     }
 
-    /**
-     * Calculates a robust offset between two streams using the median difference
-     * of temporally closest pairs, with monotonic pairing constraint.
-     *
-     * Hardening:
-     * 1. Warmup skip: ignores first 0.5s of each stream (cadence/latency stabilization).
-     * 2. Monotonic constraint: cursor j only advances forward, preventing re-pairing.
-     * 3. Adaptive tolerance: max(50ms, 1.5 * max(medianDt1, medianDt2)) — scales with cadence.
-     * 4. Median aggregation: robust to remaining outliers.
-     * 5. P2-B: Linear rate ratio estimation for drift compensation.
-     *
-     * @return Triple of (offset in ms or null, number of valid pairs, rate ratio or 1.0)
-     */
-    private fun calculateRobustOffset(stream1: List<Long>, stream2: List<Long>, n: Int = 30): OffsetResult {
-        if (stream1.isEmpty() || stream2.isEmpty()) return OffsetResult(null, 0, 1.0, 0.0)
-
-        // 1. Skip warmup frames (first 0.5s — cadence/latency stabilization)
-        val warmupNs = 500_000_000L
-        val s1Start = stream1.first()
-        val s2Start = stream2.first()
-        val s1 = stream1.filter { it >= s1Start + warmupNs }
-        val s2 = stream2.filter { it >= s2Start + warmupNs }
-
-        // Fall back to original streams if warmup skip removed everything
-        val effectiveS1 = if (s1.size >= 5) s1 else stream1
-        val effectiveS2 = if (s2.size >= 5) s2 else stream2
-
-        // 3. Adaptive tolerance: max(50ms, 1.5 * max(medianDt1, medianDt2))
-        val medianDt1Ns = medianIntervalNs(effectiveS1)
-        val medianDt2Ns = medianIntervalNs(effectiveS2)
-        val maxMedianDtNs = maxOf(medianDt1Ns, medianDt2Ns)
-        val adaptiveToleranceNs = maxOf(50_000_000L, (1.5 * maxMedianDtNs).toLong())
-
-        val diffs = mutableListOf<Double>()
-        val maxIter = minOf(n, effectiveS1.size)
-
-        // 2. Monotonic cursor: j only advances forward
-        var j = 0
-        for (i in 0 until maxIter) {
-            if (j >= effectiveS2.size) break
-            val t1 = effectiveS1[i]
-
-            // Advance j to the closest point to t1 (monotonically)
-            while (j + 1 < effectiveS2.size &&
-                   abs(effectiveS2[j + 1] - t1) < abs(effectiveS2[j] - t1)) {
-                j++
-            }
-
-            // Adaptive tolerance check
-            val diff = effectiveS2[j] - t1
-            if (abs(diff) <= adaptiveToleranceNs) {
-                diffs.add(diff / 1_000_000.0) // ns → ms
-            }
-
-            // Advance j past this match to enforce one-to-one pairing
-            j++
-        }
-
-        if (diffs.isEmpty()) return OffsetResult(null, 0, 1.0, 0.0)
-
-        diffs.sort()
-        val mid = diffs.size / 2
-        val median = if (diffs.size % 2 == 0) {
-            (diffs[mid - 1] + diffs[mid]) / 2.0
-        } else {
-            diffs[mid]
-        }
-        
-        // Offset stability: stddev of diffs (lower = more stable timestamps)
-        val mean = diffs.average()
-        val variance = diffs.map { (it - mean) * (it - mean) }.average()
-        val stdMs = kotlin.math.sqrt(variance)
-        
-        // P2-B: Elapsed-span clock drift (FPS-independent)
-        val rateRatio = computeRateRatio(effectiveS1, effectiveS2)
-        
-        return OffsetResult(median, diffs.size, rateRatio, stdMs)
-    }
-    
-    /**
-     * P2-B: Measure clock drift by comparing elapsed time spans.
-     *
-     * Previous approach (linear regression on paired timestamps) was incorrect:
-     * it measured FPS ratio, not clock drift, because nearest-neighbor pairing
-     * of streams with different FPS creates a biased slope (30fps/25fps ≈ 1.2).
-     *
-     * Correct approach: if both cameras use the same clock, the total elapsed
-     * time span of each stream should be nearly identical regardless of FPS.
-     * rateRatio = span_s2 / span_s1 → should be ~1.0 for shared clocks.
-     *
-     * @param stream1 Timestamps from stream 1 (face), already warmup-stripped
-     * @param stream2 Timestamps from stream 2 (finger), already warmup-stripped
-     * @return rate ratio (≈1.0 for shared clock; >>1.0 for different clock domains)
-     */
-    private fun computeRateRatio(stream1: List<Long>, stream2: List<Long>): Double {
-        if (stream1.size < 5 || stream2.size < 5) return 1.0
-        
-        val span1 = (stream1.last() - stream1.first()).toDouble()
-        val span2 = (stream2.last() - stream2.first()).toDouble()
-        
-        if (span1 < 1e6 || span2 < 1e6) return 1.0 // Less than 1ms of data
-        
-        val ratio = span2 / span1
-        
-        if (abs(ratio - 1.0) > 0.001) { // > 1000ppm
-            logD("Clock drift: spanRatio = ${"%.6f".format(ratio)} " +
-                 "(${"%.0f".format((ratio - 1.0) * 1_000_000)} ppm) " +
-                 "span1=${"%.1f".format(span1 / 1e9)}s span2=${"%.1f".format(span2 / 1e9)}s")
-        }
-        
-        return ratio
-    }
-
-    /** Compute median inter-frame interval in nanoseconds. */
-    private fun medianIntervalNs(timestamps: List<Long>): Long {
-        if (timestamps.size < 2) return 33_333_333L // default ~30fps
-        val intervals = LongArray(timestamps.size - 1) { i -> timestamps[i + 1] - timestamps[i] }
-        intervals.sort()
-        val mid = intervals.size / 2
-        return if (intervals.size % 2 == 0) {
-            (intervals[mid - 1] + intervals[mid]) / 2
-        } else {
-            intervals[mid]
-        }
-    }
-    
-    private fun calculateDropRate(timestamps: List<Long>, medianIntervalMs: Double?): Double {
-        if (timestamps.size < 2 || medianIntervalMs == null || medianIntervalMs <= 0.0) return 0.0
-        
-        val thresholdMs = medianIntervalMs * 1.5
-        var dropCount = 0
-        var totalIntervals = 0
-        
-        for (i in 1 until timestamps.size) {
-            val dt = (timestamps[i] - timestamps[i - 1]) / 1_000_000.0
-            if (dt > thresholdMs) {
-                dropCount++
-            }
-            totalIntervals++
-        }
-        
-        return if (totalIntervals > 0) dropCount.toDouble() / totalIntervals else 0.0
-    }
-    
-    /**
-     * Resamples two streams to a unified timeline at specified frequency.
-     * 
-     * Uses linear interpolation to align streams to common sample points.
-     * 
-     * @param stream1Data List of (timestamp, value) pairs for stream 1
-     * @param stream2Data List of (timestamp, value) pairs for stream 2
-     * @param targetFrequencyHz Target sampling frequency (default 100 Hz)
-     * @return ResampledData with unified timeline and interpolated values
-     */
     fun resampleToUnifiedTimeline(
-        stream1Data: List<TimestampedValue>,
-        stream2Data: List<TimestampedValue>,
-        targetFrequencyHz: Double = 100.0
+        stream1Data: List<TimestampedValue>, stream2Data: List<TimestampedValue>,
+        targetFrequencyHz: Double = 100.0, maxGapMs: Double = 100.0
     ): ResampledData {
-        if (stream1Data.isEmpty() || stream2Data.isEmpty()) {
-            return ResampledData(
-                unifiedTimestamps = emptyList(),
-                stream1Values = emptyList(),
-                stream2Values = emptyList(),
-                isValid = false,
-                message = "Empty input streams"
-            )
-        }
-        
-        // Find overlapping time range
-        val minStart = maxOf(stream1Data.first().timestampNs, stream2Data.first().timestampNs)
-        val maxEnd = minOf(stream1Data.last().timestampNs, stream2Data.last().timestampNs)
-        
-        if (maxEnd <= minStart) {
-            return ResampledData(
-                unifiedTimestamps = emptyList(),
-                stream1Values = emptyList(),
-                stream2Values = emptyList(),
-                isValid = false,
-                message = "No temporal overlap between streams"
-            )
-        }
-        
-        // Calculate sample interval in nanoseconds
-        val sampleIntervalNs = (1_000_000_000.0 / targetFrequencyHz).toLong()
-        
-        // Generate unified timeline
-        val unifiedTimestamps = mutableListOf<Long>()
-        var currentTime = minStart
-        while (currentTime <= maxEnd) {
-            unifiedTimestamps.add(currentTime)
-            currentTime += sampleIntervalNs
-        }
-        
-        // Interpolate stream 1
-        val stream1Interpolated = interpolateStream(stream1Data, unifiedTimestamps)
-        
-        // Interpolate stream 2
-        val stream2Interpolated = interpolateStream(stream2Data, unifiedTimestamps)
-        
-        logD("Resampled to ${unifiedTimestamps.size} samples at ${targetFrequencyHz} Hz")
-        
-        return ResampledData(
-            unifiedTimestamps = unifiedTimestamps,
-            stream1Values = stream1Interpolated,
-            stream2Values = stream2Interpolated,
-            isValid = true,
-            sampleRate = targetFrequencyHz,
-            message = "Successfully resampled to ${unifiedTimestamps.size} samples"
-        )
+        fun invalid(reason: String) = ResampledData(emptyList(), emptyList(), emptyList(), false, message = reason)
+        if (stream1Data.isEmpty() || stream2Data.isEmpty()) return invalid("MISSING_CHANNEL")
+        if (!targetFrequencyHz.isFinite() || targetFrequencyHz <= 0 || targetFrequencyHz > 10000 || !maxGapMs.isFinite() || maxGapMs <= 0)
+            return invalid("INVALID_RESAMPLING_CONFIGURATION")
+        if (!validateMonotonicity(stream1Data.map { it.timestampNs }).isValid || !validateMonotonicity(stream2Data.map { it.timestampNs }).isValid)
+            return invalid("NONMONOTONIC_TIMESTAMPS")
+        if ((stream1Data + stream2Data).any { !it.value.isFinite() }) return invalid("NONFINITE_SAMPLE")
+        val start = maxOf(stream1Data.first().timestampNs, stream2Data.first().timestampNs)
+        val end = minOf(stream1Data.last().timestampNs, stream2Data.last().timestampNs)
+        if (end <= start) return invalid("NO_TEMPORAL_OVERLAP")
+        val count = ((end - start) / 1e9 * targetFrequencyHz).toLong() + 1
+        if (count !in 2..2_000_000) return invalid("INVALID_TIMELINE_SIZE")
+        val times = List(count.toInt()) { start + (it * (1e9 / targetFrequencyHz)).toLong() }
+        val first = interpolateStream(stream1Data, times, maxGapMs)
+        val second = interpolateStream(stream2Data, times, maxGapMs)
+        val mask = times.indices.map { first[it].isFinite() && second[it].isFinite() }
+        val valid = mask.all { it }
+        return ResampledData(times, first, second, valid, targetFrequencyHz,
+            if (valid) "Resampled with bounded interpolation" else "INTERPOLATION_GAP", mask)
     }
-    
-    /**
-     * Interpolates stream values at specified timestamps using linear interpolation.
-     */
-    /**
-     * Interpolates stream values at specified timestamps using linear interpolation.
-     */
-    fun interpolateStream(
-        data: List<TimestampedValue>,
-        targetTimestamps: List<Long>
-    ): List<Double> {
-        val result = mutableListOf<Double>()
-        var dataIndex = 0
-        
-        for (targetTime in targetTimestamps) {
-            // Find surrounding data points
-            while (dataIndex < data.size - 1 && data[dataIndex + 1].timestampNs < targetTime) {
-                dataIndex++
-            }
-            
-            if (dataIndex >= data.size - 1) {
-                // Use last value if beyond range
-                result.add(data.last().value)
-            } else if (targetTime <= data[dataIndex].timestampNs) {
-                // Use first value if before range
-                result.add(data[dataIndex].value)
-            } else {
-                // Linear interpolation
-                val t0 = data[dataIndex].timestampNs
-                val t1 = data[dataIndex + 1].timestampNs
-                val v0 = data[dataIndex].value
-                val v1 = data[dataIndex + 1].value
-                
-                val fraction = (targetTime - t0).toDouble() / (t1 - t0).toDouble()
-                val interpolated = v0 + fraction * (v1 - v0)
-                
-                result.add(interpolated)
-            }
-        }
-        
-        return result
-    }
-    
-    /**
-     * Creates a unified sample tuple from resampled data.
-     * 
-     * @param resampledData Resampled stream data
-     * @return List of SampleTuple with (time, stream1, stream2) values
-     */
-    fun createSampleTuples(resampledData: ResampledData): List<SampleTuple> {
-        if (!resampledData.isValid) return emptyList()
-        
-        return resampledData.unifiedTimestamps.indices.map { i ->
-            SampleTuple(
-                timeMillis = resampledData.unifiedTimestamps[i] / 1_000_000.0,
-                stream1Value = resampledData.stream1Values[i],
-                stream2Value = resampledData.stream2Values[i]
-            )
-        }
-    }
-}
 
-/**
- * Result of timestamp validation.
- */
+    /** No extrapolation and no reconstruction across gaps longer than maxGapMs. */
+    fun interpolateStream(data: List<TimestampedValue>, targetTimestamps: List<Long>, maxGapMs: Double = 100.0): List<Double> {
+        if (data.isEmpty() || !validateMonotonicity(data.map { it.timestampNs }).isValid)
+            return List(targetTimestamps.size) { Double.NaN }
+        var index = 0
+        return targetTimestamps.map { time ->
+            while (index + 1 < data.size && data[index + 1].timestampNs <= time) index++
+            val left = data[index]
+            when {
+                time < data.first().timestampNs || time > data.last().timestampNs -> Double.NaN
+                time == left.timestampNs -> left.value
+                index + 1 >= data.size -> Double.NaN
+                else -> {
+                    val right = data[index + 1]
+                    val gap = right.timestampNs - left.timestampNs
+                    if (gap <= 0 || gap / 1e6 > maxGapMs || !left.value.isFinite() || !right.value.isFinite()) Double.NaN
+                    else left.value + (right.value - left.value) * ((time - left.timestampNs).toDouble() / gap)
+                }
+            }
+        }
+    }
+
+    fun createSampleTuples(resampledData: ResampledData): List<SampleTuple> =
+        if (!resampledData.isValid) emptyList() else resampledData.unifiedTimestamps.indices.map {
+            SampleTuple(resampledData.unifiedTimestamps[it] / 1e6, resampledData.stream1Values[it], resampledData.stream2Values[it])
+        }
+}
 data class ValidationResult(
     val isValid: Boolean,
     val violations: Int = 0,
@@ -516,7 +126,7 @@ data class DriftResult(
     val offsetPairs: Int = 0,
     val offsetStdMs: Double = 0.0,     // Offset stability (stddev of paired diffs)
     val overlapDurationMs: Double = 0.0,
-    val rateRatio: Double = 1.0,       // P2-B: inter-stream clock rate ratio (1.0 = no drift)
+    val rateRatio: Double = Double.NaN, // Unknown: acquisition spans do not establish clock drift.
     val message: String
 )
 
@@ -547,7 +157,8 @@ data class ResampledData(
     val stream2Values: List<Double>,
     val isValid: Boolean,
     val sampleRate: Double = 0.0,
-    val message: String
+    val message: String,
+    val validityMask: List<Boolean> = emptyList()
 )
 
 /**

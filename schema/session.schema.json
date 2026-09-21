@@ -1,108 +1,759 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "title": "VivoPulse Session Metadata (Clinician Grade)",
+  "title": "VivoPulse research session export 1.2 (both exporter variants)",
+  "description": "Structural validation only; passing does not establish physiological or clinical accuracy.",
   "type": "object",
   "required": [
     "schema_version",
     "export_type",
-    "exported_at_iso",
     "device",
     "app",
     "session",
     "camera",
     "ptt",
     "quality",
-    "processing_params"
+    "measurement_provenance",
+    "timing_verified",
+    "ptt_valid",
+    "rejection_reasons",
+    "algorithm_revision",
+    "measurement_type",
+    "source_samples",
+    "export_limitations"
   ],
   "properties": {
-    "schema_version": { "type": "string" },
-    "export_type": { "type": "string" },
-    "exported_at_iso": { "type": "string" },
+    "schema_version": {
+      "const": "1.2"
+    },
+    "export_type": {
+      "enum": [
+        "research_signals",
+        "research_with_plots"
+      ]
+    },
+    "measurement_provenance": {
+      "enum": [
+        "UNKNOWN",
+        "REAL",
+        "SYNTHETIC"
+      ]
+    },
+    "timing_verified": {
+      "type": "boolean"
+    },
+    "ptt_valid": {
+      "type": "boolean"
+    },
+    "rejection_reasons": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "algorithm_revision": {
+      "type": "string",
+      "minLength": 1
+    },
+    "measurement_type": {
+      "const": "experimental_inter_site_optical_delay"
+    },
     "device": {
       "type": "object",
-      "required": ["manufacturer", "model", "android_api"],
       "properties": {
-        "manufacturer": { "type": "string" },
-        "model": { "type": "string" },
-        "android_api": { "type": "string" }
-      }
+        "manufacturer": {
+          "type": "string"
+        },
+        "model": {
+          "type": "string"
+        },
+        "android_version": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "manufacturer",
+        "model",
+        "android_version"
+      ]
     },
     "app": {
       "type": "object",
-      "required": ["version", "name"],
       "properties": {
-        "version": { "type": "string" },
-        "name": { "type": "string" }
-      }
+        "name": {
+          "const": "VivoPulse"
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "version"
+      ]
     },
     "session": {
+      "type": "object"
+    },
+    "source_samples": {
       "type": "object",
-      "required": ["id", "start_ts_iso", "end_ts_iso", "duration_s"],
       "properties": {
-        "id": { "type": "string" },
-        "start_ts_iso": { "type": "string" },
-        "end_ts_iso": { "type": "string" },
-        "duration_s": { "type": "number", "minimum": 0 }
-      }
+        "face_available": {
+          "type": "boolean"
+        },
+        "finger_available": {
+          "type": "boolean"
+        },
+        "timestamp_unit": {
+          "const": "monotonic_nanoseconds"
+        }
+      },
+      "required": [
+        "face_available",
+        "finger_available",
+        "timestamp_unit"
+      ]
+    },
+    "export_limitations": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "minItems": 1
     },
     "camera": {
       "type": "object",
-      "required": ["fps_face", "fps_finger"],
       "properties": {
-        "fps_face": { "type": "number", "minimum": 0 },
-        "fps_finger": { "type": "number", "minimum": 0 },
-        "drift_ms_per_second": { "type": "number" }
-      }
+        "native_face_rate_hz": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "native_finger_rate_hz": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "drift_ms_per_second": {
+          "type": [
+            "number",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "native_face_rate_hz",
+        "native_finger_rate_hz",
+        "drift_ms_per_second"
+      ]
     },
     "ptt": {
       "type": "object",
-      "required": ["ptt_ms_mean", "ptt_ms_sd", "corr_score"],
       "properties": {
-        "ptt_ms_mean": { "type": "number" },
-        "ptt_ms_sd": { "type": "number", "minimum": 0 },
-        "corr_score": { "type": "number", "minimum": 0, "maximum": 1 },
-        "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
-        "quality": { "type": "string" }
-      }
+        "valid": {
+          "type": "boolean"
+        },
+        "quality": {
+          "type": "string"
+        },
+        "value_ms": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "correlation": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 1
+        },
+        "stability_ms": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "confidence_percent": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 100
+        },
+        "ptt_ms_mean": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "ptt_ms_sd": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "corr_score": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 1
+        },
+        "confidence_0_to_1": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 1
+        }
+      },
+      "required": [
+        "valid",
+        "quality"
+      ]
     },
     "quality": {
-      "type": "object",
-      "required": ["sqi_face", "sqi_finger", "sqi_combined"],
-      "properties": {
-        "sqi_face": { "type": "number", "minimum": 0, "maximum": 100 },
-        "sqi_finger": { "type": "number", "minimum": 0, "maximum": 100 },
-        "sqi_combined": { "type": "number", "minimum": 0, "maximum": 100 }
+      "type": "object"
+    },
+    "segments": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "start_time_s": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "end_time_s": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "ptt_ms": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "correlation": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "minimum": 0,
+            "maximum": 1
+          },
+          "sqi_face": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "minimum": 0,
+            "maximum": 100
+          },
+          "sqi_finger": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "minimum": 0,
+            "maximum": 100
+          }
+        },
+        "required": [
+          "start_time_s",
+          "end_time_s",
+          "ptt_ms",
+          "correlation",
+          "sqi_face",
+          "sqi_finger"
+        ]
       }
     },
-    "processing_params": {
+    "experimental_analysis": {
       "type": "object",
-      "required": ["filters", "fs"],
       "properties": {
-        "filters": { "type": "string" },
-        "fs": { "type": "number" },
-        "roi_face": { "type": "string" },
-        "roi_finger": { "type": "string" }
-      }
+        "clinically_validated": {
+          "const": false
+        }
+      },
+      "required": [
+        "clinically_validated"
+      ]
+    },
+    "derived_analysis_omitted": {
+      "const": true
     },
     "three_a_state": {
       "type": "object",
       "properties": {
-        "ae_locked_at_s": { "type": ["number", "null"] },
-        "awb_locked_at_s": { "type": ["number", "null"] },
-        "af_mode": { "type": "string" }
-      }
+        "ae_locked_at_s": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "awb_locked_at_s": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "af_mode": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "ae_locked_at_s",
+        "awb_locked_at_s",
+        "af_mode"
+      ]
     },
     "thermal_events": {
       "type": "array",
       "items": {
         "type": "object",
         "properties": {
-          "time_s": { "type": "number" },
-          "state": { "type": "string" }
-        }
+          "time_s": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "state": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "time_s",
+          "state"
+        ]
       }
     }
   },
+  "oneOf": [
+    {
+      "properties": {
+        "export_type": {
+          "const": "research_signals"
+        },
+        "exported_at": {
+          "type": "integer"
+        },
+        "session": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "start_timestamp": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 1
+            },
+            "end_timestamp": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 1
+            },
+            "duration_seconds": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "minimum": 0
+            }
+          },
+          "required": [
+            "id",
+            "start_timestamp",
+            "end_timestamp",
+            "duration_seconds"
+          ]
+        },
+        "signal": {
+          "type": "object",
+          "properties": {
+            "sample_rate_hz": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "sample_count": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "duration_seconds": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "minimum": 0
+            }
+          },
+          "required": [
+            "sample_rate_hz",
+            "sample_count",
+            "duration_seconds"
+          ]
+        },
+        "camera": {
+          "type": "object",
+          "properties": {
+            "face_fps": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "finger_fps": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "minimum": 0
+            }
+          },
+          "required": [
+            "face_fps",
+            "finger_fps"
+          ]
+        },
+        "ptt": {
+          "required": [
+            "value_ms",
+            "correlation",
+            "stability_ms",
+            "confidence_percent"
+          ]
+        },
+        "quality": {
+          "type": "object",
+          "properties": {
+            "face_sqi": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "minimum": 0,
+              "maximum": 100
+            },
+            "finger_sqi": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "minimum": 0,
+              "maximum": 100
+            },
+            "combined_sqi": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "minimum": 0,
+              "maximum": 100
+            }
+          },
+          "required": [
+            "face_sqi",
+            "finger_sqi",
+            "combined_sqi"
+          ]
+        }
+      },
+      "required": [
+        "exported_at",
+        "signal"
+      ]
+    },
+    {
+      "properties": {
+        "export_type": {
+          "const": "research_with_plots"
+        },
+        "exported_at_iso": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "session": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "start_ts_iso": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "format": "date-time"
+            },
+            "end_ts_iso": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "format": "date-time"
+            },
+            "duration_s": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "minimum": 0
+            }
+          },
+          "required": [
+            "id",
+            "start_ts_iso",
+            "end_ts_iso",
+            "duration_s"
+          ]
+        },
+        "camera": {
+          "type": "object",
+          "properties": {
+            "fps_face": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "fps_finger": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "minimum": 0
+            }
+          },
+          "required": [
+            "fps_face",
+            "fps_finger"
+          ]
+        },
+        "ptt": {
+          "required": [
+            "ptt_ms_mean",
+            "ptt_ms_sd",
+            "corr_score",
+            "confidence_0_to_1",
+            "confidence_percent"
+          ]
+        },
+        "quality": {
+          "type": "object",
+          "properties": {
+            "sqi_face": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "minimum": 0,
+              "maximum": 100
+            },
+            "sqi_finger": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "minimum": 0,
+              "maximum": 100
+            },
+            "sqi_combined": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "minimum": 0,
+              "maximum": 100
+            }
+          },
+          "required": [
+            "sqi_face",
+            "sqi_finger",
+            "sqi_combined"
+          ]
+        },
+        "processing_params": {
+          "type": "object",
+          "properties": {
+            "algorithm_revision": {
+              "type": "string"
+            },
+            "processing_grid_hz": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "filter_parameters": {
+              "type": "null"
+            },
+            "roi_geometry": {
+              "type": "null"
+            },
+            "configuration_note": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "algorithm_revision",
+            "processing_grid_hz",
+            "filter_parameters",
+            "roi_geometry",
+            "configuration_note"
+          ]
+        }
+      },
+      "required": [
+        "exported_at_iso",
+        "processing_params",
+        "segments"
+      ]
+    }
+  ],
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "ptt_valid": {
+            "const": false
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "ptt": {
+            "properties": {
+              "valid": {
+                "const": false
+              },
+              "quality": {
+                "const": "UNAVAILABLE"
+              },
+              "value_ms": {
+                "type": "null"
+              },
+              "correlation": {
+                "type": "null"
+              },
+              "stability_ms": {
+                "type": "null"
+              },
+              "confidence_percent": {
+                "type": "null"
+              },
+              "ptt_ms_mean": {
+                "type": "null"
+              },
+              "ptt_ms_sd": {
+                "type": "null"
+              },
+              "corr_score": {
+                "type": "null"
+              },
+              "confidence_0_to_1": {
+                "type": "null"
+              }
+            }
+          },
+          "segments": {
+            "items": {
+              "properties": {
+                "ptt_ms": {
+                  "type": "null"
+                },
+                "correlation": {
+                  "type": "null"
+                },
+                "ptt_mean_raw": {
+                  "type": "null"
+                },
+                "ptt_mean_denoised": {
+                  "type": "null"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "ptt_valid": {
+            "const": true
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "timing_verified": {
+            "const": true
+          },
+          "rejection_reasons": {
+            "maxItems": 0
+          },
+          "ptt": {
+            "properties": {
+              "valid": {
+                "const": true
+              },
+              "value_ms": {
+                "type": "number"
+              },
+              "ptt_ms_mean": {
+                "type": "number"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "experimental_analysis"
+        ]
+      },
+      "then": {
+        "properties": {
+          "measurement_provenance": {
+            "const": "REAL"
+          },
+          "ptt_valid": {
+            "const": true
+          }
+        }
+      }
+    }
+  ],
   "additionalProperties": true
 }
-

@@ -5,7 +5,7 @@ import com.vivopulse.feature.processing.sync.Window
 import kotlin.math.abs
 
 /**
- * P1.6: Multi-method PTT consensus with Kalman fusion.
+ * Multi-method optical-delay consensus with conservative same-window fusion.
  *
  * Fuses up to 4 estimation methods:
  *   A) NCC cross-correlation (existing)
@@ -13,9 +13,9 @@ import kotlin.math.abs
  *   C) GCC-PHAT / multi-window (existing)
  *   D) Cross-spectral phase-slope (P1.4 upgrade, new)
  *
- * Instead of threshold-based switching ("if disagree > 50ms → use xcorr"),
- * each method provides (value, variance) and a scalar Kalman filter fuses
- * them with outlier gating.
+ * Each method provides a value and an estimated spread. The combiner uses
+ * robust outlier gating and gives no independent-precision credit for methods
+ * observing the same samples. Its uncertainty has no validated clinical coverage.
  */
 data class ConsensusPtt(
     val pttMsMedian: Double,
@@ -23,9 +23,10 @@ data class ConsensusPtt(
     val methodAgreeMs: Double,
     val nBeats: Int,
     val delayStabilityScore: Double = 1.0,
-    val kalmanCiMs: Double = Double.MAX_VALUE,     // 95% CI half-width from Kalman
+    val kalmanCiMs: Double = Double.MAX_VALUE,     // Legacy field name: approximate model spread
     val meanCoherenceAtHr: Double = 0.0,           // γ²(f) at HR harmonic bins
-    val beatCoverage: Double = 0.0                 // valid beats / expected beats
+    val beatCoverage: Double = 0.0,                // valid beats / expected beats
+    val methodsUsed: Int = 0
 )
 
 class PTTConsensus {
@@ -112,10 +113,8 @@ class PTTConsensus {
             }
         }
 
-        // ──────────── Kalman Fusion (P1.6) ────────────
-        // P4-B: Use neutral physiological prior (100ms) instead of potentially
-        // wrong XCorr value. Wide initial variance (2500ms²) lets the filter
-        // converge quickly to whichever methods agree.
+        // Same-window combination. Reset only clears cached diagnostics; the
+        // combiner must never report its initialization as observed evidence.
         kalman.reset(100.0, 2500.0)
         val fusion = kalman.fuse(measurements)
 
@@ -141,7 +140,7 @@ class PTTConsensus {
         val beatCov = if (expectedBeats > 0) (nBeats.toDouble() / expectedBeats).coerceIn(0.0, 1.0) else 0.0
 
         android.util.Log.i(tag, "VALIDATION_METRICS | coherence=${"%.3f".format(cspCoherence)} | " +
-              "kalmanCI=${"%.1f".format(fusion.confidenceInterval)}ms | " +
+              "modelSpread=${"%.1f".format(fusion.confidenceInterval)}ms | " +
               "beatCoverage=${"%.2f".format(beatCov)} ($nBeats/$expectedBeats)")
 
         return ConsensusPtt(
@@ -152,7 +151,8 @@ class PTTConsensus {
             delayStabilityScore = stability,
             kalmanCiMs = fusion.confidenceInterval,
             meanCoherenceAtHr = cspCoherence,
-            beatCoverage = beatCov
+            beatCoverage = beatCov,
+            methodsUsed = fusion.methodsUsed
         )
     }
 

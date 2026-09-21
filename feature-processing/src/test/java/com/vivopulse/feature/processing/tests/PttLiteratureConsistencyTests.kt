@@ -2,15 +2,25 @@ package com.vivopulse.feature.processing.tests
 
 import com.vivopulse.feature.processing.ProcessedSeries
 import com.vivopulse.feature.processing.PttCalculator
+import com.vivopulse.feature.processing.RawSeriesBuffer
+import com.vivopulse.feature.processing.SignalPipeline
+import com.vivopulse.feature.processing.SignalProvenance
+import com.vivopulse.feature.processing.timestamp.TimestampedValue
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import kotlin.math.abs
 
-import org.junit.runner.RunWith
-import org.robolectric.RobolectricTestRunner
 
-@RunWith(RobolectricTestRunner::class)
 class PttLiteratureConsistencyTests {
+    // Accuracy fixtures exercise production preprocessing and gates, not a manually
+    // declared valid series that bypasses acquisition validation.
+    private fun processRaw(series: ProcessedSeries): ProcessedSeries = SignalPipeline(targetSampleRateHz = series.sampleRateHz).process(
+        RawSeriesBuffer(
+            series.rawFaceSignal.mapIndexed { i, value -> TimestampedValue((series.timeMillis[i] * 1e6).toLong(), value) },
+            series.rawFingerSignal.mapIndexed { i, value -> TimestampedValue((series.timeMillis[i] * 1e6).toLong(), value) },
+            provenance = SignalProvenance.SYNTHETIC, timingVerified = true, hardwarePttCapable = true
+        )
+    )
     @Test
     fun knownLag_highSnr_errorUnder5ms() {
         val fs = 100.0
@@ -31,7 +41,7 @@ class PttLiteratureConsistencyTests {
             sampleRateHz = fs,
             isValid = true
         )
-        val result = PttCalculator.computePtt(series)
+        val result = PttCalculator.computePtt(processRaw(series))
         assertTrue(result.isValid)
         assertTrue(abs(result.pttMs - lagMs) <= 5.0)
     }
@@ -75,7 +85,7 @@ class PttLiteratureConsistencyTests {
             sampleRateHz = fs,
             isValid = true
         )
-        val r1 = PttCalculator.computePtt(s1)
+        val r1 = PttCalculator.computePtt(processRaw(s1))
         assertTrue(r1.isValid)
         assertTrue(abs(r1.pttMs - 70.0) <= 10.0)
 
@@ -89,7 +99,7 @@ class PttLiteratureConsistencyTests {
             sampleRateHz = fs,
             isValid = true
         )
-        val r2 = PttCalculator.computePtt(s2)
+        val r2 = PttCalculator.computePtt(processRaw(s2))
         assertTrue(r2.isValid)
         // Monotonic: reduced true lag -> reduced measured PTT
         assertTrue(r2.pttMs < r1.pttMs)
@@ -146,7 +156,7 @@ class PttLiteratureConsistencyTests {
             sampleRateHz = fs,
             isValid = true
         )
-        val result = PttCalculator.computePtt(series)
+        val result = PttCalculator.computePtt(processRaw(series))
         assertTrue("Result should be valid with moderate noise", result.isValid)
         assertTrue(
             "PTT error ${abs(result.pttMs - lagMs)}ms should be < 15ms",

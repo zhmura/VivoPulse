@@ -82,7 +82,7 @@ class TimestampSyncTest {
     }
     
     @Test
-    fun `analyzeSynchronization - zero drift assumed`() {
+    fun `analyzeSynchronization - drift remains unknown without common events`() {
         // Two streams with identical frame rates (30 fps) over 6 seconds
         val intervalNs = 33_333_333L
         val stream1 = (0..179).map { it * intervalNs } // 180 frames = 6 seconds at 30fps
@@ -92,8 +92,8 @@ class TimestampSyncTest {
         
         println("Zero drift test: drift=${result.driftMsPerSecond}, isValid=${result.isValid}")
         assertTrue("Sync calculation should be valid", result.isValid)
-        // Drift should be exactly 0.0
-        assertEquals(0.0, result.driftMsPerSecond, 0.001)
+        // Identical sampling cadence does not identify clock drift.
+        assertTrue("Frame cadence cannot establish clock drift", result.driftMsPerSecond.isNaN())
         assertEquals(30.0, result.stream1Rate, 0.5)
         assertEquals(30.0, result.stream2Rate, 0.5)
     }
@@ -113,8 +113,8 @@ class TimestampSyncTest {
         
         assertTrue("Sync calculation should be valid", result.isValid)
         
-        // Critical: Drift should be 0.0 despite rate difference!
-        assertEquals(0.0, result.driftMsPerSecond, 0.001)
+        // Different frame rates do not identify clock drift either.
+        assertTrue("Frame cadence cannot establish clock drift", result.driftMsPerSecond.isNaN())
         
         // Rates should be correctly reported
         assertEquals(30.0, result.stream1Rate, 0.5)
@@ -162,7 +162,8 @@ class TimestampSyncTest {
         
         // Simple first-frame diff would be 0 - (-50) = 50ms
         // Robust median offset should be closer to 0ms
-        assertEquals(0.0, result.offsetMs, 1.0)
+        assertFalse("Nearest frames are not common synchronization events", result.offsetValid)
+        assertTrue(result.offsetMs.isNaN())
     }
     
     @Test
@@ -280,7 +281,7 @@ class TimestampSyncTest {
         val result = TimestampSync.resampleToUnifiedTimeline(
             stream1,
             stream2,
-            targetFrequencyHz = 10.0  // 10 samples over 1 second
+            targetFrequencyHz = 10.0, maxGapMs = 1000.0 // Explicit wide gap for this interpolation arithmetic test only
         )
         
         assertTrue(result.isValid)
@@ -357,11 +358,11 @@ class TimestampSyncTest {
             windowSizeMs = 3500 // 3.5s
         )
         
-        // Verified: New logic returns 0.0 drift appropriately!
+        // Missing frames do not provide an external clock reference.
         println("Frame Drop Test: Drift=${result.driftMsPerSecond}")
         
-        // Assert exactly 0.0 drift
-        assertEquals(0.0, result.driftMsPerSecond, 0.001)
+        // Drift remains unknown.
+        assertTrue("Frame cadence cannot establish clock drift", result.driftMsPerSecond.isNaN())
         
         // Verify rates are detected correctly despite drops (median interval handles it)
         assertEquals(30.0, result.stream1Rate, 0.5)

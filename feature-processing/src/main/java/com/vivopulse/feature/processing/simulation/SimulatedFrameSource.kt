@@ -85,7 +85,9 @@ class SimulatedFrameSource(
             TimestampedValue(timestampNs, finalFinger[i])
         }
         
-        return RawSeriesBuffer(faceData, fingerData)
+        return RawSeriesBuffer(faceData, fingerData,
+            provenance = com.vivopulse.feature.processing.SignalProvenance.SYNTHETIC,
+            timingVerified = true, hardwarePttCapable = true)
     }
     
     /**

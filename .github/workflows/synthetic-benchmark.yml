@@ -1,0 +1,51 @@
+name: Synthetic measurement checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  signal-benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Fetch pinned Kotlin compiler
+        shell: bash
+        run: |
+          curl --fail --location --retry 3 -o "$RUNNER_TEMP/kotlin.zip" https://github.com/JetBrains/kotlin/releases/download/v1.9.24/kotlin-compiler-1.9.24.zip
+          echo "eb7b68e01029fa67bc8d060ee54c12018f2c60ddc438cf21db14517229aa693b  $RUNNER_TEMP/kotlin.zip" | sha256sum --check
+          unzip -q "$RUNNER_TEMP/kotlin.zip" -d "$RUNNER_TEMP/kotlin"
+      - name: Compile and run production signal pipeline
+        run: python tools/synthetic-benchmark/run.py --kotlin-home "$RUNNER_TEMP/kotlin/kotlinc"
+      - name: Compile and run JVM regressions
+        run: |
+          python tools/synthetic-benchmark/fetch_test_deps.py
+          python tools/synthetic-benchmark/run.py --kotlin-home "$RUNNER_TEMP/kotlin/kotlinc" --unit-tests --output build/synthetic-benchmark/unit-tests
+      - name: Validate export schemas
+        run: |
+          python -m pip install jsonschema==4.23.0
+          python schema/test_export_schemas.py
+      - name: Preserve measurements and reproducibility manifest
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: synthetic-benchmark
+          path: |
+            build/synthetic-benchmark/results/*.csv
+            build/synthetic-benchmark/results/*.txt
+            build/synthetic-benchmark/results/*.json
+            build/synthetic-benchmark/results/*.log
+            build/synthetic-benchmark/unit-tests/*.log
+            build/synthetic-benchmark/unit-tests/*.json

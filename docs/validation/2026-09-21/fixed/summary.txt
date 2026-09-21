@@ -1,0 +1,17 @@
+Synthetic scenarios=48; failed=0; diagnostic=9. Numerical probes=16; failed=0. These are engineering checks, not clinical validation.
+{group=clean/must_measure, cases=12, reported=12, rejected=0, gate_failures=0, error_sample_count=12, bias_ms=0.43992366264337096, mae_ms=0.43992366264337096, rmse_ms=0.4769549705846742, worst_absolute_error_ms=0.7277688497605936}
+{group=sign/diagnostic, cases=2, reported=2, rejected=0, gate_failures=0, error_sample_count=2, bias_ms=-0.25122205604856696, mae_ms=0.25122205604856696, rmse_ms=0.33343748770740816, worst_absolute_error_ms=0.4704662960261743}
+{group=sampling/accurate_or_reject, cases=4, reported=3, rejected=1, gate_failures=0, error_sample_count=3, bias_ms=0.4203999743408862, mae_ms=0.4203999743408862, rmse_ms=0.4558666395339077, worst_absolute_error_ms=0.6512159168740226}
+{group=dropouts/accurate_or_reject, cases=2, reported=2, rejected=0, gate_failures=0, error_sample_count=2, bias_ms=0.3583577347797302, mae_ms=0.3583577347797302, rmse_ms=0.35872476990598645, worst_absolute_error_ms=0.3745810041063322}
+{group=dropouts/must_reject, cases=2, reported=0, rejected=2, gate_failures=0, error_sample_count=0, bias_ms=null, mae_ms=null, rmse_ms=null, worst_absolute_error_ms=null}
+{group=clock/must_reject, cases=3, reported=0, rejected=3, gate_failures=0, error_sample_count=0, bias_ms=null, mae_ms=null, rmse_ms=null, worst_absolute_error_ms=null}
+{group=clock/diagnostic, cases=2, reported=2, rejected=0, gate_failures=0, error_sample_count=1, bias_ms=0.551480118676551, mae_ms=0.551480118676551, rmse_ms=0.551480118676551, worst_absolute_error_ms=0.551480118676551}
+{group=invalid_signal/must_reject, cases=7, reported=0, rejected=7, gate_failures=0, error_sample_count=0, bias_ms=null, mae_ms=null, rmse_ms=null, worst_absolute_error_ms=null}
+{group=noise/accurate_or_reject, cases=1, reported=1, rejected=0, gate_failures=0, error_sample_count=1, bias_ms=-2.1807517546052395, mae_ms=2.1807517546052395, rmse_ms=2.1807517546052395, worst_absolute_error_ms=2.1807517546052395}
+{group=optical/diagnostic, cases=1, reported=1, rejected=0, gate_failures=0, error_sample_count=0, bias_ms=null, mae_ms=null, rmse_ms=null, worst_absolute_error_ms=null}
+{group=pressure_sensitivity/accurate_or_reject, cases=3, reported=3, rejected=0, gate_failures=0, error_sample_count=3, bias_ms=0.3357677850542207, mae_ms=0.3357677850542207, rmse_ms=0.36654676969157984, worst_absolute_error_ms=0.49268793202780614}
+{group=pressure_sensitivity/diagnostic, cases=3, reported=3, rejected=0, gate_failures=0, error_sample_count=0, bias_ms=null, mae_ms=null, rmse_ms=null, worst_absolute_error_ms=null}
+{group=heart_rate/accurate_or_reject, cases=3, reported=3, rejected=0, gate_failures=0, error_sample_count=3, bias_ms=0.11401681340629939, mae_ms=0.3271876677996062, rmse_ms=0.3380095144612606, worst_absolute_error_ms=0.4346172641842685}
+{group=motion/must_reject, cases=1, reported=0, rejected=1, gate_failures=0, error_sample_count=0, bias_ms=null, mae_ms=null, rmse_ms=null, worst_absolute_error_ms=null}
+{group=identifiability/diagnostic, cases=1, reported=1, rejected=0, gate_failures=0, error_sample_count=0, bias_ms=null, mae_ms=null, rmse_ms=null, worst_absolute_error_ms=null}
+{group=duration/must_reject, cases=1, reported=0, rejected=1, gate_failures=0, error_sample_count=0, bias_ms=null, mae_ms=null, rmse_ms=null, worst_absolute_error_ms=null}

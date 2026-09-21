@@ -61,10 +61,9 @@ object PttEngine {
         android.util.Log.d(tag, "Consensus: PTT=${"%.1f".format(pttMsRaw)} ms, Agreement=${"%.1f".format(consensusResult.methodAgreeMs)} ms (nBeats=${consensusResult.nBeats}, stability=${"%.2f".format(consensusResult.delayStabilityScore)})")
         
         // 4. Compute per-channel SQI
-        // P4-A FIX: Raw SQI (filtered vs raw) is misleading — "noise = raw - filtered"
-        // includes all DC offset and slow drift that the bandpass correctly removed,
-        // producing absurdly negative SNR (-47 dB) even when the filtered signal is
-        // excellent. Keep raw SQI for diagnostic logging only.
+        // Raw spectral quality plus detected-beat regularity. DC is removed
+        // within the spectral estimator without subtracting differently scaled
+        // raw and normalized traces.
         val rawSqiFace = PttSqi.computeChannelSqi(
             filteredSignal = faceSig,
             rawSignal = faceRaw,
@@ -81,20 +80,11 @@ object PttEngine {
             motionPenalty = 100.0
         )
         
-        // P4-A: Band-limited SQI (filtered vs filtered) — this is what the PTT
-        // algorithms actually operate on. SNR here compares bandpass signal power
-        // to within-band noise (peak irregularity), which is the meaningful metric.
-        val sqiFace = PttSqi.computeChannelSqi(
-            filteredSignal = faceSig, rawSignal = faceSig, fsHz = fsHz,
-            peakResult = facePeaks, motionPenalty = faceMotionPenalty
-        )
-        val sqiFinger = PttSqi.computeChannelSqi(
-            filteredSignal = fingerSig, rawSignal = fingerSig, fsHz = fsHz,
-            peakResult = fingerPeaks, motionPenalty = 100.0
-        )
+        // Spectral quality is computed from the observed raw trace. Never use
+        // filtered-minus-itself as a noise estimate.
+        val sqiFace = rawSqiFace
+        val sqiFinger = rawSqiFinger
         android.util.Log.d(tag, "SQI: Face=${sqiFace.sqi} (SNR=${sqiFace.snrScore}), Finger=${sqiFinger.sqi} (SNR=${sqiFinger.snrScore})")
-        android.util.Log.i(tag, "SQI_DUAL_DIAG | face: raw=${rawSqiFace.sqi}(snr=${"%.1f".format(rawSqiFace.snrDb)}dB) band=${sqiFace.sqi}(snr=${"%.1f".format(sqiFace.snrDb)}dB) | " +
-              "finger: raw=${rawSqiFinger.sqi}(snr=${"%.1f".format(rawSqiFinger.snrDb)}dB) band=${sqiFinger.sqi}(snr=${"%.1f".format(sqiFinger.snrDb)}dB)")
         
         // P3-D DIAGNOSTIC: Adaptive bandpass
         val adaptiveLowFace = if (hrFace.hrBpm > 0) maxOf(0.5, (hrFace.hrBpm / 60.0) * 0.5) else 0.7
@@ -117,8 +107,8 @@ object PttEngine {
         val realPeakSharpness = xcorrResult.peakSharpness
         
         val finalConfidence = PttSqi.computeCombinedConfidence(
-            sqiFace = sqiFace.sqi,       // P4-A: now uses band SQI (was raw)
-            sqiFinger = sqiFinger.sqi,   // P4-A: now uses band SQI (was raw)
+            sqiFace = sqiFace.sqi,
+            sqiFinger = sqiFinger.sqi,
             corrScore = syncMetrics.correlation,
             peakSharpness = realPeakSharpness,
             delayStabilityScore = consensusResult.delayStabilityScore,
@@ -135,7 +125,11 @@ object PttEngine {
               "SQI=face:${sqiFace.sqi}/finger:${sqiFinger.sqi} (raw:${rawSqiFace.sqi}/${rawSqiFinger.sqi})")
         
         // 6. Determine if PTT should be reported (P0.1: MEDIUM+ now reported)
-        val shouldReport = PttSqi.shouldReportPtt(finalConfidence)
+        val evidenceValid = consensusResult.methodsUsed > 0 && pttMsRaw.isFinite() &&
+            hrFace.isValid && hrFinger.isValid &&
+            HeartRate.checkHrAgreement(hrFace.hrBpm, hrFinger.hrBpm) &&
+            sqiFace.snrDb >= 0.0 && sqiFinger.snrDb >= 0.0
+        val shouldReport = evidenceValid && PttSqi.shouldReportPtt(finalConfidence)
         val pttMs = if (shouldReport) pttMsRaw else null
         
         if (!shouldReport) {
@@ -143,7 +137,9 @@ object PttEngine {
         }
         
         // 7. Generate guidance if confidence low
-        val guidance = if (qualityTier == PttSqi.QualityTier.LOW || 
+        val guidance = if (!evidenceValid) {
+            listOf("No reliable shared pulse-delay evidence; repeat the recording")
+        } else if (qualityTier == PttSqi.QualityTier.LOW ||
                           qualityTier == PttSqi.QualityTier.REJECTED) {
             generateLowConfidenceGuidance(sqiFace, sqiFinger, syncMetrics.correlation)
         } else {
@@ -154,7 +150,7 @@ object PttEngine {
             pttMs = pttMs,
             corrScore = syncMetrics.correlation,
             confidence = finalConfidence,
-            qualityTier = qualityTier,
+            qualityTier = if (shouldReport) qualityTier else PttSqi.QualityTier.REJECTED,
             hrFaceBpm = hrFace.hrBpm,
             hrFingerBpm = hrFinger.hrBpm,
             sqiFace = sqiFace.sqi,
@@ -164,10 +160,11 @@ object PttEngine {
             fingerPeakCount = fingerPeaks.getPeakCount(),
             nBeats = consensusResult.nBeats,
             guidance = guidance,
-            isValid = finalConfidence > 0 && hrFace.isValid && hrFinger.isValid,
+            isValid = shouldReport,
             kalmanCiMs = consensusResult.kalmanCiMs,
             meanCoherenceAtHr = consensusResult.meanCoherenceAtHr,
-            beatCoverage = consensusResult.beatCoverage
+            beatCoverage = consensusResult.beatCoverage,
+            methodsUsed = consensusResult.methodsUsed
         )
     }
     
@@ -232,11 +229,12 @@ data class PttOutput(
     val nBeats: Int = 0,            // Number of valid foot-to-foot beats for PTT
     val guidance: List<String>? = null,
     val isValid: Boolean = false,
-    val kalmanCiMs: Double = Double.MAX_VALUE,     // 95% CI half-width from Kalman fusion
+    val kalmanCiMs: Double = Double.MAX_VALUE,     // Approximate model uncertainty; coverage unvalidated
     val meanCoherenceAtHr: Double = 0.0,           // Mean coherence at HR harmonic bins
-    val beatCoverage: Double = 0.0                 // Valid beats / expected beats (0-1)
+    val beatCoverage: Double = 0.0,                // Valid beats / expected beats (0-1)
+    val methodsUsed: Int = 0
 ) {
-    fun isPttReportable(): Boolean = pttMs != null && qualityTier != PttSqi.QualityTier.REJECTED
+    fun isPttReportable(): Boolean = isValid && pttMs?.isFinite() == true && qualityTier != PttSqi.QualityTier.REJECTED
     
     fun hrAgreementGood(toleranceBpm: Double = 5.0): Boolean {
         return HeartRate.checkHrAgreement(hrFaceBpm, hrFingerBpm, toleranceBpm)

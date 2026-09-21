@@ -1,0 +1,19 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Observed source signal CSV header 1.2",
+  "description": "Validates a JSON descriptor of the CSV header, not raw CSV text or clinical validity.",
+  "type": "object",
+  "required": [
+    "columns"
+  ],
+  "properties": {
+    "columns": {
+      "const": [
+        "timestamp_ns",
+        "raw_value",
+        "interpolated"
+      ]
+    }
+  },
+  "additionalProperties": false
+}

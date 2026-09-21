@@ -99,7 +99,7 @@ object WelchEstimator {
                 
                 // Cross-spectrum: X*(k) · Y(k) = (xR - j·xI)(yR + j·yI)
                 sxyRealAccum[k] += xReal[k] * yReal[k] + xImag[k] * yImag[k]
-                sxyImagAccum[k] += xImag[k] * yReal[k] - xReal[k] * yImag[k]
+                sxyImagAccum[k] += xReal[k] * yImag[k] - xImag[k] * yReal[k]
             }
             
             nSegments++

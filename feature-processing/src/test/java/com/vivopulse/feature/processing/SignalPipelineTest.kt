@@ -4,127 +4,48 @@ import com.vivopulse.feature.processing.timestamp.TimestampedValue
 import com.vivopulse.signal.ProcessedSignal
 import org.junit.Assert.*
 import org.junit.Test
-import org.junit.runner.RunWith
-import org.robolectric.RobolectricTestRunner
 
-@RunWith(RobolectricTestRunner::class)
 class SignalPipelineTest {
+    private val pipeline = SignalPipeline(targetSampleRateHz = 100.0, lowCutoffHz = 0.5, highCutoffHz = 4.0)
+    private fun source() = (0..600).map { TimestampedValue(it * 33_333_333L, 100.0 + kotlin.math.sin(it * 0.25)) }
 
-    private val pipeline = SignalPipeline(
-        targetSampleRateHz = 100.0,
-        lowCutoffHz = 0.5,
-        highCutoffHz = 4.0
-    )
-
-    @Test
-    fun `process aligns signals to 100 Hz`() {
-        // Input: 30 Hz data
-        val rawBuffer = RawSeriesBuffer(
-            faceData = (0..30).map { 
-                TimestampedValue(it * 33333333L, 100.0) 
-            },
-            fingerData = (0..30).map { 
-                TimestampedValue(it * 33333333L, 100.0) 
-            }
-        )
-        
-        val result = pipeline.process(rawBuffer)
-        
-        assertTrue("Result should be valid", result.isValid)
-        assertEquals("Sample rate should be 100", 100.0, result.sampleRateHz, 0.1)
-        
-        // 1 second of data -> 100 samples (approx)
-        val count = result.timeMillis.size
-        assertTrue("Should have ~100 samples, got $count", count in 95..105)
+    @Test fun `process aligns signals to 100 Hz and preserves observations`() {
+        val input = source()
+        val result = pipeline.process(RawSeriesBuffer(input, input))
+        assertTrue(result.isValid)
+        assertEquals(100.0, result.sampleRateHz, 0.1)
+        assertTrue(result.timeMillis.size in 1780..1805)
+        assertEquals(input, result.sourceFaceData)
+        assertTrue("UNVERIFIED_TIMEBASE" in result.invalidReasons)
+        assertNull(result.pttOutput)
     }
 
-    @Test
-    fun `process integrates metrics from real-time signals`() {
-        val rawBuffer = RawSeriesBuffer(
-            faceData = (0..30).map { TimestampedValue(it * 33333333L, 100.0) },
-            fingerData = (0..30).map { TimestampedValue(it * 33333333L, 100.0) }
-        )
-        
-        // Pre-processed signals with metrics (sparse, 30Hz)
-        val preProcessed = (0..30).map { i ->
-            ProcessedSignal(
-                heartRate = 60f,
-                signalQuality = 1.0f,
-                timestamp = i * 33L,
-                processedData = floatArrayOf(),
-                faceMotionRms = 0.5, // Test value
-                fingerSaturationPct = 0.0,
-                imuRmsG = 0.1, // Test value
-                faceSqi = 80,
-                fingerSqi = 90
-            )
-        }
-        
-        val result = pipeline.process(rawBuffer, preProcessed)
-        
-        assertTrue("Result should be valid", result.isValid)
-        
-        // Metrics should be resampled/propagated
-        // Check if imuRmsG is present and non-zero (resampling might smooth it but avg should be close)
-        val avgImu = result.imuRmsG.average()
-        assertEquals("IMU RMS should be propagated", 0.1, avgImu, 0.01)
-        
-        val avgMotion = result.faceMotionRms.average()
-        assertEquals("Face Motion should be propagated", 0.5, avgMotion, 0.01)
+    @Test fun `process propagates timestamped acquisition quality without inventing sample correspondence`() {
+        val input = source()
+        val result = pipeline.process(RawSeriesBuffer(input, input,
+            faceMotion = input.map { it.copy(value = 0.5) },
+            imuRms = input.map { it.copy(value = 0.02) }))
+        assertTrue(result.isValid)
+        assertEquals(0.02, result.imuRmsG.average(), 0.001)
+        assertEquals(0.5, result.faceMotionRms.average(), 0.001)
     }
-    
-    @Test
-    fun `process handles empty input gracefully`() {
-        val empty = RawSeriesBuffer(emptyList(), emptyList())
-        val result = pipeline.process(empty)
-        
-        assertFalse("Result should be invalid for empty input", result.isValid)
+
+    @Test fun `process handles empty input gracefully`() {
+        val result = pipeline.process(RawSeriesBuffer(emptyList(), emptyList()))
+        assertFalse(result.isValid)
+        assertEquals(listOf("MISSING_CHANNEL"), result.invalidReasons)
     }
-    @Test
-    fun `process filters frames with high motion`() {
-        // Create raw buffer with some frames having high IMU motion
-        val rawBuffer = RawSeriesBuffer(
-            faceData = (0..50).map { i ->
-                TimestampedValue(i * 20000000L, 100.0) 
-            },
-            fingerData = (0..50).map { i ->
-                TimestampedValue(i * 20000000L, 100.0) 
-            }
-        )
-        
-        // Pre-processed signals where some have high IMU RMS
-        val preProcessed = (0..50).map { i ->
-            ProcessedSignal(
-                heartRate = 60f,
-                signalQuality = 1.0f,
-                timestamp = i * 20L,
-                processedData = floatArrayOf(),
-                faceMotionRms = 0.05,
-                fingerSaturationPct = 0.0,
-                // Inject high motion (gt 0.1) for indices 20-30
-                imuRmsG = if (i in 20..30) 0.5 else 0.05,
-                faceSqi = 80,
-                fingerSqi = 90
-            )
-        }
-        
-        // Note: The SignalPipeline.process logic might require us to mock how it uses preProcessed 
-        // to filter the raw buffer. Alternatively, if the motion rejection is done INSIDE processChannel
-        // or prior to resampling, the result should reflect this.
-        // Looking at SignalPipeline.kt, it filters rawBuffer using preProcessed timestamps & imuRmsG
-        // BEFORE resampling.
-        
-        val result = pipeline.process(rawBuffer, preProcessed)
-        
-        assertTrue("Result should be valid", result.isValid)
-        
-        // If filtration works, we might see gaps or interpolation in the result 
-        // corresponding to the high motion period. 
-        // Or, more simply, we check if the metrics in the result align.
-        
-        // Check if the output 'imuRmsG' array mirrors the input distribution
-        // The resampled IMU signal should show the spike
-        val maxImu = result.imuRmsG.maxOrNull() ?: 0.0
-        assertTrue("High motion should be captured/propagated", maxImu > 0.4)
+
+    @Test fun `high motion invalidates delay without repairing waveform`() {
+        val input = source()
+        val imu = input.mapIndexed { i, value -> value.copy(value = if (i in 200..300) 0.5 else 0.02) }
+        val result = pipeline.process(RawSeriesBuffer(input, input, imuRms = imu,
+            provenance = SignalProvenance.SYNTHETIC, timingVerified = true, hardwarePttCapable = true))
+        assertTrue(result.isValid)
+        assertTrue((result.imuRmsG.maxOrNull() ?: 0.0) > 0.4)
+        assertEquals(input, result.sourceFaceData)
+        assertTrue("MOTION" in result.invalidReasons)
+        assertNull(result.pttOutput)
+        assertFalse(PttCalculator.computePtt(result).isValid)
     }
 }

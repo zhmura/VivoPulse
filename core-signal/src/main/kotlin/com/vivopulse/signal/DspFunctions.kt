@@ -90,6 +90,9 @@ object DspFunctions {
         order: Int = 2
     ): DoubleArray {
         if (signal.isEmpty()) return doubleArrayOf()
+        require(sampleRateHz.isFinite() && sampleRateHz > 0.0)
+        require(lowCutoffHz > 0.0 && lowCutoffHz < highCutoffHz && highCutoffHz < sampleRateHz / 2.0)
+        require(order >= 2 && order % 2 == 0) { "Butterworth order must be positive and even" }
         
         // Design bandpass as cascade of high-pass and low-pass
         var filtered = signal
@@ -167,7 +170,8 @@ object DspFunctions {
         
         // Apply biquad sections (order/2 times)
         for (section in 0 until order / 2) {
-            filtered = biquadLowpass(filtered, cutoffHz, sampleRateHz)
+            val q = 1.0 / (2.0 * cos((2 * section + 1) * PI / (2.0 * order)))
+            filtered = biquadLowpass(filtered, cutoffHz, sampleRateHz, q)
         }
         
         return filtered
@@ -186,7 +190,8 @@ object DspFunctions {
         
         // Apply biquad sections (order/2 times)
         for (section in 0 until order / 2) {
-            filtered = biquadHighpass(filtered, cutoffHz, sampleRateHz)
+            val q = 1.0 / (2.0 * cos((2 * section + 1) * PI / (2.0 * order)))
+            filtered = biquadHighpass(filtered, cutoffHz, sampleRateHz, q)
         }
         
         return filtered
@@ -197,14 +202,14 @@ object DspFunctions {
      * 
      * Direct Form II implementation.
      */
-    private fun biquadLowpass(signal: DoubleArray, cutoffHz: Double, sampleRateHz: Double): DoubleArray {
+    private fun biquadLowpass(signal: DoubleArray, cutoffHz: Double, sampleRateHz: Double, q: Double): DoubleArray {
         if (signal.isEmpty()) return doubleArrayOf()
         
         // Calculate filter coefficients
         val omega = 2.0 * PI * cutoffHz / sampleRateHz
         val sn = sin(omega)
         val cs = cos(omega)
-        val alpha = sn / sqrt(2.0)
+        val alpha = sn / (2.0 * q)
         
         val b0 = (1.0 - cs) / 2.0
         val b1 = 1.0 - cs
@@ -222,8 +227,8 @@ object DspFunctions {
         
         // Apply filter (Direct Form II)
         val filtered = DoubleArray(signal.size)
-        var w1 = 0.0
-        var w2 = 0.0
+        var w1 = signal[0] / (1.0 + a1n + a2n)
+        var w2 = w1
         
         for (i in signal.indices) {
             val w0 = signal[i] - a1n * w1 - a2n * w2
@@ -238,14 +243,14 @@ object DspFunctions {
     /**
      * Second-order biquad high-pass filter.
      */
-    private fun biquadHighpass(signal: DoubleArray, cutoffHz: Double, sampleRateHz: Double): DoubleArray {
+    private fun biquadHighpass(signal: DoubleArray, cutoffHz: Double, sampleRateHz: Double, q: Double): DoubleArray {
         if (signal.isEmpty()) return doubleArrayOf()
         
         // Calculate filter coefficients
         val omega = 2.0 * PI * cutoffHz / sampleRateHz
         val sn = sin(omega)
         val cs = cos(omega)
-        val alpha = sn / sqrt(2.0)
+        val alpha = sn / (2.0 * q)
         
         val b0 = (1.0 + cs) / 2.0
         val b1 = -(1.0 + cs)
@@ -263,8 +268,8 @@ object DspFunctions {
         
         // Apply filter (Direct Form II)
         val filtered = DoubleArray(signal.size)
-        var w1 = 0.0
-        var w2 = 0.0
+        var w1 = signal[0] / (1.0 + a1n + a2n)
+        var w2 = w1
         
         for (i in signal.indices) {
             val w0 = signal[i] - a1n * w1 - a2n * w2
@@ -366,8 +371,8 @@ object DspFunctions {
      * zero-phase filtering with padding to minimize boundary effects.
      * 
      * Applies the given filter forward and then backward.
-     * Uses odd-symmetric extension (Gustafsson's method approx) at boundaries 
-     * to reduce startup transients.
+     * Uses odd-symmetric extension at boundaries. The biquad filters initialize
+     * to the padded endpoint's steady state; this is not Gustafsson's method.
      * 
      * @param signal Input signal
      * @param filterFunc filtering function to apply
@@ -382,7 +387,7 @@ object DspFunctions {
         if (signal.isEmpty()) return doubleArrayOf()
         
         val n = signal.size
-        val pad = if (padLength > 0) padLength else min(n - 1, 30)
+        val pad = if (padLength > 0) min(padLength, n - 1) else min(n - 1, 30)
         
         // 1. Create padded signal with odd symmetry
         // leftPad = 2*signal[0] - signal[pad..1]

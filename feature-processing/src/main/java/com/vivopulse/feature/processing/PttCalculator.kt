@@ -1,10 +1,8 @@
 package com.vivopulse.feature.processing
 
-import com.vivopulse.feature.processing.ptt.PttEngine
 import com.vivopulse.feature.processing.sync.GoodSyncDetector
 import com.vivopulse.feature.processing.sync.GoodSyncSegment
-import com.vivopulse.signal.CrossCorrelation
-import com.vivopulse.signal.LagStabilityResult
+import com.vivopulse.feature.processing.ptt.CrossCorr
 
 /**
  * Pulse Transit Time (PTT) calculator.
@@ -28,13 +26,17 @@ object PttCalculator {
      * @return PttResult with lag, correlation, and stability metrics
      */
     fun computePtt(processedSeries: ProcessedSeries): PttResult {
-        if (!processedSeries.isValid || !processedSeries.isAligned()) {
+        val pttOutput = processedSeries.pttOutput
+        if (!processedSeries.isValid || !processedSeries.isAligned() ||
+            processedSeries.invalidReasons.isNotEmpty() || pttOutput == null ||
+            !pttOutput.isValid || pttOutput.pttMs?.isFinite() != true) {
             return PttResult(
-                pttMs = 0.0,
+                pttMs = Double.NaN,
                 correlationScore = 0.0,
-                stabilityMs = 0.0,
+                stabilityMs = Double.NaN,
                 isValid = false,
-                message = "Invalid or misaligned signal series"
+                message = processedSeries.invalidReasons.takeIf { it.isNotEmpty() }?.joinToString("|")
+                    ?: pttOutput?.guidance?.joinToString("|") ?: "NO_REPORTABLE_DELAY"
             )
         }
         
@@ -42,38 +44,37 @@ object PttCalculator {
         val fingerSignal = processedSeries.fingerSignal
         val sampleRate = processedSeries.sampleRateHz
         
-        // Compute PTT using PttEngine (Consensus)
-        val pttOutput = PttEngine.computePtt(
-            faceSig = faceSignal,
-            fingerSig = fingerSignal,
-            faceRaw = processedSeries.rawFaceSignal,
-            fingerRaw = processedSeries.rawFingerSignal,
-            fsHz = sampleRate
-        )
+        // The pipeline is the single authority. Never recompute around its rejection gates.
         
-        // Compute stability across sliding windows (Legacy metric, still useful for variability)
-        val stabilityResult = CrossCorrelation.computeLagStability(
-            faceSignal,
-            fingerSignal,
-            sampleRateHz = sampleRate,
-            windowSizeS = 10.0,
-            overlapS = 5.0
-        )
+        // Use the same bounded GCC family as consensus. The legacy whole-lag
+        // search can jump by entire cardiac cycles and mislabel a steady delay.
+        // This SD describes variation across overlapping windows, not clinical
+        // precision or a confidence interval for the session estimate.
+        val windowResult = CrossCorr.multiWindowLag(faceSignal, fingerSignal, sampleRate,
+            windowSec = 5.0, overlapFrac = 0.5, minLagMs = 0.0, maxLagMs = 400.0)
+        val windowLags = windowResult.perWindowLagMs.filter { it.isFinite() }
+        val stabilityAvailable = windowResult.isValid && windowLags.size >= 2
+        val stabilityMs = if (stabilityAvailable) {
+            val mean = windowLags.average()
+            kotlin.math.sqrt(windowLags.sumOf { (it - mean) * (it - mean) } / windowLags.size)
+        } else Double.NaN
         
         // Detect GoodSync segments for UI visualization and further analysis
         val goodSyncDetector = GoodSyncDetector()
         val segments = goodSyncDetector.detectSessionSegments(faceSignal, fingerSignal, sampleRate)
         
         return PttResult(
-            pttMs = pttOutput.pttMs ?: 0.0,
+            pttMs = pttOutput.pttMs!!,
             correlationScore = pttOutput.corrScore,
-            stabilityMs = if (stabilityResult.isValid) stabilityResult.stdLagMs else 0.0,
-            windowCount = stabilityResult.windowCount,
+            stabilityMs = stabilityMs,
+            windowCount = if (stabilityAvailable) windowLags.size else 0,
             isValid = pttOutput.isValid,
-            isReliable = pttOutput.confidence >= 60.0,
+            isReliable = pttOutput.confidence >= 0.60,
             isPlausible = pttOutput.pttMs != null,
-            isStable = stabilityResult.isStable(),
-            message = pttOutput.guidance?.joinToString(", ") ?: stabilityResult.message,
+            isStable = stabilityAvailable && stabilityMs <= 25.0,
+            message = pttOutput.guidance?.joinToString(", ") ?: if (stabilityAvailable)
+                "Experimental optical delay; bounded window SD ${"%.1f".format(java.util.Locale.US, stabilityMs)} ms (${windowLags.size} windows)"
+                else "Experimental optical delay; insufficient windows to assess stability",
             goodSegments = segments
         )
     }
@@ -88,8 +89,8 @@ data class PttResult(
     val stabilityMs: Double,        // Standard deviation of PTT across windows
     val windowCount: Int = 0,       // Number of windows analyzed
     val isValid: Boolean,
-    val isReliable: Boolean = false, // Correlation > 0.7
-    val isPlausible: Boolean = false, // PTT in 30-200ms range
+    val isReliable: Boolean = false, // Algorithmic quality >= 0.60, not calibrated probability
+    val isPlausible: Boolean = false, // A finite accepted optical delay, not a clinical range check
     val isStable: Boolean = false,    // Stability < 25ms
     val message: String = "",
     val goodSegments: List<GoodSyncSegment> = emptyList()

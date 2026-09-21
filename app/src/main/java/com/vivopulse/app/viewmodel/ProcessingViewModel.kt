@@ -17,6 +17,7 @@ import com.vivopulse.feature.processing.QualityReport
 import com.vivopulse.feature.processing.RawSeriesBuffer
 import com.vivopulse.feature.processing.SessionSummary
 import com.vivopulse.feature.processing.SignalPipeline
+import com.vivopulse.feature.processing.SignalProvenance
 import com.vivopulse.feature.processing.wave.WaveFeatures
 import com.vivopulse.feature.processing.simulation.SimulatedFrameSource
 import com.vivopulse.feature.processing.simulation.SimulationConfig
@@ -109,11 +110,20 @@ class ProcessingViewModel @Inject constructor(
     /**
      * Process recorded frames.
      * 
-     * Uses real frames if available, otherwise falls back to synthetic data.
+     * Synthetic data is available only when the explicit debug simulation flag is on.
      */
     fun processFrames() {
+        if (_isProcessing.value) return
         viewModelScope.launch {
             _isProcessing.value = true
+            _processedSeries.value = null
+            _pttResult.value = null
+            _qualityReport.value = null
+            _waveProfile.value = null
+            _wavePatternHint.value = null
+            _vascularTrend.value = null
+            _sessionSummary.value = null
+            _biomarkers.value = null
             performanceMetrics.reset()
             performanceMetrics.recordStart()
             
@@ -124,13 +134,14 @@ class ProcessingViewModel @Inject constructor(
                 val recordingResult = sessionManager.lastRecordingResult.value
                 
                 val processedSeries = withContext(Dispatchers.Default) {
-                    if (recordingResult != null && recordingResult.frames.isNotEmpty()) {
+                    if (FeatureFlags.isSimulatedModeEnabled()) {
+                        generateSyntheticData()
+                    } else if (recordingResult != null && recordingResult.frames.isNotEmpty()) {
                         // Process real frames
                         val signals = sessionManager.lastProcessedSignals.value
                         processRealFrames(recordingResult, signals)
                     } else {
-                        // Fallback to synthetic data
-                        generateSyntheticData()
+                        signalPipeline.process(RawSeriesBuffer(emptyList(), emptyList()))
                     }
                 }
                 
@@ -139,13 +150,12 @@ class ProcessingViewModel @Inject constructor(
                 
                 _processedSeries.value = processedSeries
                 sessionManager.onProcessingComplete(processedSeries)
+                val ptt = PttCalculator.computePtt(processedSeries)
+                _pttResult.value = ptt
+                _qualityReport.value = QualityAssessment.assessQuality(processedSeries, ptt)
                 
                 // Compute PTT
                 if (processedSeries.isValid) {
-                    val ptt = withContext(Dispatchers.Default) {
-                        PttCalculator.computePtt(processedSeries)
-                    }
-                    _pttResult.value = ptt
                     
                     // Assess quality and generate suggestions
                     val quality = withContext(Dispatchers.Default) {
@@ -179,21 +189,22 @@ class ProcessingViewModel @Inject constructor(
                     }
 
                     // Compute wave pattern hint under high confidence and good SQI
-                    val hint = computeWavePatternHint(profile, quality)
+                    // Physiological elasticity/stiffness labels require clinical validation.
+                    val hint: String? = null
                     _wavePatternHint.value = hint
 
                     // Update trend store and compute personal Vascular Trend Index
-                    _vascularTrend.value = trendStore.maybeRecordAndSummarize(
+                    _vascularTrend.value = if (ptt.isValid && processedSeries.provenance == SignalProvenance.REAL) trendStore.maybeRecordAndSummarize(
                         pttMs = ptt.pttMs,
                         pttConfidencePercent = quality.pttConfidence,
                         combinedSqi = quality.combinedScore,
                         profile = profile
-                    )
+                    ) else null
 
                     // Build and expose session summary
                     _sessionSummary.value = SessionSummary(
                         pttResult = ptt,
-                        pttOutput = null, // Not using PttEngine in this flow (legacy?)
+                        pttOutput = processedSeries.pttOutput,
                         waveProfile = profile,
                         heartRate = hrResult,
                         faceSQI = quality.faceSQI,
@@ -217,22 +228,6 @@ class ProcessingViewModel @Inject constructor(
         }
     }
 
-    private fun computeWavePatternHint(
-        profile: WaveFeatures.VascularWaveProfile,
-        quality: QualityReport
-    ): String? {
-        // Gate on high quality
-        if (quality.combinedScore < 70.0 || quality.pttConfidence < 70.0) return null
-        val rise = profile.meanRiseTimeMs ?: return null
-        val refl = profile.meanReflectionRatio ?: return null
-        // Heuristic, non-diagnostic: shorter rise + lower reflection => more_elastic_like
-        return when {
-            rise <= 120.0 && refl <= 0.90 -> "more_elastic_like"
-            rise >= 180.0 && refl >= 1.05 -> "more_stiff_like"
-            else -> "uncertain"
-        }
-    }
-    
     /**
      * Toggle between raw and filtered signal display.
      */
@@ -266,19 +261,21 @@ class ProcessingViewModel @Inject constructor(
             try {
                 val path = withContext(Dispatchers.IO) {
                     // Get recording stats if available
-                    val recordingStats = sessionManager.lastRecordingResult.value?.stats
-                    val faceFps = recordingStats?.faceStats?.averageFps ?: 30f
-                    val fingerFps = recordingStats?.fingerStats?.averageFps ?: 30f
+                    val recording = sessionManager.lastRecordingResult.value.takeIf { series.provenance == SignalProvenance.REAL }
+                    val recordingStats = recording?.stats
+                    val faceFps = series.nativeFaceRateHz?.toFloat() ?: recordingStats?.faceStats?.averageFps ?: Float.NaN
+                    val fingerFps = series.nativeFingerRateHz?.toFloat() ?: recordingStats?.fingerStats?.averageFps ?: Float.NaN
+                    val recordedFrames = recording?.frames.orEmpty()
                     
                     // Create metadata
                     val metadata = SessionMetadata(
-                        appVersion = "1.0.0",
+                        appVersion = com.vivopulse.app.BuildConfig.VERSION_NAME,
                         deviceManufacturer = android.os.Build.MANUFACTURER,
                         deviceModel = android.os.Build.MODEL,
                         androidVersion = android.os.Build.VERSION.RELEASE,
                         sessionId = UUID.randomUUID().toString(),
-                        startTimestamp = System.currentTimeMillis() - (series.getDurationSeconds() * 1000).toLong(),
-                        endTimestamp = System.currentTimeMillis(),
+                        startTimestamp = recordedFrames.minOfOrNull { it.captureTimestamp } ?: 0L,
+                        endTimestamp = recordedFrames.maxOfOrNull { it.captureTimestamp } ?: 0L,
                         durationSeconds = series.getDurationSeconds(),
                         sampleRateHz = series.sampleRateHz,
                         sampleCount = series.getSampleCount(),
@@ -292,9 +289,15 @@ class ProcessingViewModel @Inject constructor(
                         pttQuality = ptt.getQuality().name,
                         faceFps = faceFps,
                         fingerFps = fingerFps,
-                        driftMsPerSecond = 0.0, // Drift calculation requires clock sync analysis
+                        driftMsPerSecond = Double.NaN, // Unknown; do not infer clock drift from frame spans.
                         harmonicSummaryFace = series.mainHarmonicsFace,
-                        harmonicSummaryFinger = series.mainHarmonicsFinger
+                        harmonicSummaryFinger = series.mainHarmonicsFinger,
+                        measurementProvenance = series.provenance.name,
+                        timingVerified = series.timingVerified,
+                        pttValid = ptt.isValid,
+                        rejectionReasons = series.invalidReasons,
+                        nativeFaceRateHz = series.nativeFaceRateHz,
+                        nativeFingerRateHz = series.nativeFingerRateHz
                     )
                     
                     // Find peaks for marking
@@ -319,7 +322,9 @@ class ProcessingViewModel @Inject constructor(
                             rgb = series.rawFaceRgb?.getOrNull(i),
                             motion = series.faceMotionRms.getOrNull(i),
                             saturation = null,
-                            imu = series.imuRmsG.getOrNull(i)
+                            imu = series.imuRmsG.getOrNull(i),
+                            timestampNs = series.timelineOriginNs?.plus((series.timeMillis[i] * 1e6).toLong()),
+                            interpolated = true
                         )
                     }
                     
@@ -332,7 +337,9 @@ class ProcessingViewModel @Inject constructor(
                             rgb = series.rawFingerRgb?.getOrNull(i),
                             motion = null,
                             saturation = series.fingerSaturationPct.getOrNull(i),
-                            imu = series.imuRmsG.getOrNull(i)
+                            imu = series.imuRmsG.getOrNull(i),
+                            timestampNs = series.timelineOriginNs?.plus((series.timeMillis[i] * 1e6).toLong()),
+                            interpolated = true
                         )
                     }
                     
@@ -389,7 +396,9 @@ class ProcessingViewModel @Inject constructor(
                         threeAState = null,
                         includeTimeFrequency = FeatureFlags.ENABLE_TF_EXPORT,
                         segments = segments,
-                        extras = extras
+                        extras = extras,
+                        sourceFaceSamples = series.sourceFaceData.map { it.timestampNs to it.value },
+                        sourceFingerSamples = series.sourceFingerData.map { it.timestampNs to it.value }
                     )
                 }
                 
@@ -432,51 +441,9 @@ class ProcessingViewModel @Inject constructor(
         
         Log.d(tag, "processRealFrames: ${faceFrames.size} face frames, ${fingerFrames.size} finger frames")
         
-        // Check if we have data from at least one channel
-        if (faceFrames.isEmpty() && fingerFrames.isEmpty()) {
-            Log.w(tag, "No luma data available in any channel, falling back to synthetic")
-            return generateSyntheticData()
-        }
-        
-        // For sequential mode: if one channel is empty, generate synthetic for that channel
-        val faceData = if (faceFrames.isNotEmpty()) {
-            faceFrames.map { frame ->
-                TimestampedValue(
-                    timestampNs = frame.timestampNs,
-                    value = frame.faceLuma ?: 0.0
-                )
-            }
-        } else {
-            Log.w(tag, "No face frames, generating synthetic face data")
-            // Generate synthetic face data matching finger timeline
-            val fingerTimes = fingerFrames.map { it.timestampNs }
-            fingerTimes.mapIndexed { i, ts ->
-                TimestampedValue(
-                    timestampNs = ts,
-                    value = 128.0 + 10.0 * kotlin.math.sin(i * 0.1) // Simple sine wave
-                )
-            }
-        }
-        
-        val fingerData = if (fingerFrames.isNotEmpty()) {
-            fingerFrames.map { frame ->
-                TimestampedValue(
-                    timestampNs = frame.timestampNs,
-                    value = frame.fingerLuma ?: 0.0
-                )
-            }
-        } else {
-            Log.w(tag, "No finger frames, generating synthetic finger data")
-            // Generate synthetic finger data matching face timeline
-            val faceTimes = faceFrames.map { it.timestampNs }
-            faceTimes.mapIndexed { i, ts ->
-                TimestampedValue(
-                    timestampNs = ts,
-                    value = 128.0 + 10.0 * kotlin.math.sin(i * 0.1 + 0.5) // Offset sine wave
-                )
-            }
-        }
-        
+        // Missing channels remain missing. A recording can never become a simulation.
+        val faceData = faceFrames.map { TimestampedValue(it.timestampNs, it.getLuma()!!) }
+        val fingerData = fingerFrames.map { TimestampedValue(it.timestampNs, it.getLuma()!!) }
         val faceRgb = if (faceFrames.isNotEmpty()) {
             faceFrames.mapNotNull { frame ->
                 frame.faceRgb?.let { rgb ->
@@ -495,21 +462,21 @@ class ProcessingViewModel @Inject constructor(
 
         // Extract metrics
         val faceMotion = if (faceFrames.isNotEmpty()) {
-            faceFrames.map { frame ->
-                TimestampedValue(frame.timestampNs, frame.faceMotionRms ?: 0.0)
+            faceFrames.mapNotNull { frame ->
+                frame.faceMotionRms?.let { TimestampedValue(frame.timestampNs, it) }
             }
         } else null
 
         val fingerSaturation = if (fingerFrames.isNotEmpty()) {
-            fingerFrames.map { frame ->
-                TimestampedValue(frame.timestampNs, frame.fingerSaturationPct ?: 0.0)
+            fingerFrames.mapNotNull { frame ->
+                frame.fingerSaturationPct?.let { TimestampedValue(frame.timestampNs, it) }
             }
         } else null
 
         val imuSource = if (fingerFrames.isNotEmpty()) fingerFrames else faceFrames
         val imuRms = if (imuSource.isNotEmpty()) {
-             imuSource.map { frame -> 
-                TimestampedValue(frame.timestampNs, frame.imuRmsG ?: 0.0)
+             imuSource.mapNotNull { frame ->
+                frame.imuRmsG?.let { TimestampedValue(frame.timestampNs, it) }
              }
         } else null
 
@@ -520,7 +487,10 @@ class ProcessingViewModel @Inject constructor(
             fingerRgb = fingerRgb,
             faceMotion = faceMotion,
             fingerSaturation = fingerSaturation,
-            imuRms = imuRms
+            imuRms = imuRms,
+            provenance = SignalProvenance.REAL,
+            timingVerified = recordingResult.timingVerified,
+            hardwarePttCapable = recordingResult.hardwarePttCapable
         )
         
         // Process through pipeline with pre-processed signals
@@ -533,10 +503,12 @@ class ProcessingViewModel @Inject constructor(
      * Uses current simulation configuration.
      */
     private fun generateSyntheticData(): ProcessedSeries {
-        Log.w(tag, "generateSyntheticData(): using simulated PPG for both channels")
+        check(FeatureFlags.isSimulatedModeEnabled()) { "Simulation requires explicit debug mode" }
+        Log.w(tag, "generateSyntheticData(): explicit debug simulation")
         // Use simulated frame source with current config
         val simulator = SimulatedFrameSource(_simulationConfig.value)
-        val rawBuffer = simulator.generateSignals()
+        val rawBuffer = simulator.generateSignals().copy(
+            provenance = SignalProvenance.SYNTHETIC, timingVerified = true, hardwarePttCapable = true)
         
         // Process through same pipeline as real data
         return signalPipeline.process(rawBuffer)

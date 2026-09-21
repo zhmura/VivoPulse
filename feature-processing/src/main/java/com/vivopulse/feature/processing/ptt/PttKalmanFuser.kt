@@ -4,20 +4,19 @@ import kotlin.math.exp
 import kotlin.math.sqrt
 
 /**
- * Scalar Kalman filter for PTT fusion.
+ * Conservative same-window PTT fusion, retaining the original API name.
  * 
- * Treats PTT as a slowly-varying scalar state and fuses measurements
- * from multiple estimation methods (CSP, XCorr, GCC-PHAT, Foot-to-Foot),
- * each with their own uncertainty estimate.
+ * Combines measurements from CSP, XCorr, GCC-PHAT and Foot-to-Foot.
+ * These estimates share input samples, so independent Kalman updates would
+ * overstate precision. The current call evaluates one window independently.
  * 
  * Key advantages over threshold-based switching:
  * - Handles disagreement gracefully via uncertainty weighting
- * - Outlier measurements rejected via Mahalanobis innovation gate
- * - Produces a fused estimate with tracked uncertainty
- * - Temporal smoothing prevents jump artifacts
+ * - Outlier measurements rejected around a robust evidence median
+ * - Does not claim independent evidence from algorithms using the same samples
+ * - The returned uncertainty is a model spread, not a calibrated clinical CI
  * 
- * P1.6 Research upgrade from: "Uncertainty-weighted fusion with a scalar
- * Kalman filter over windows/beats" (research v1, §3).
+ * Class and field names are retained for source compatibility.
  */
 class PttKalmanFuser(
     initialPttMs: Double = 100.0,     // Prior PTT estimate
@@ -40,13 +39,13 @@ class PttKalmanFuser(
     data class FusionResult(
         val pttMs: Double,          // Fused PTT estimate
         val varianceMs2: Double,    // Fused variance (uncertainty²)
-        val confidenceInterval: Double, // ±1.96×SE (95% CI half-width)
+        val confidenceInterval: Double, // 1.96 x conservative model spread; coverage unvalidated
         val methodsUsed: Int,       // Number of methods that contributed
         val methodsRejected: Int,   // Number rejected by innovation gate
         val isStable: Boolean       // True if variance < 100 ms²
     )
     
-    // Kalman state
+    // Last result, exposed for diagnostics; not a substitute for observations.
     private var x: Double = initialPttMs   // State estimate
     private var P: Double = initialVariance // State variance
     private val Q: Double = processNoiseMs2
@@ -58,62 +57,46 @@ class PttKalmanFuser(
      * @return FusionResult with fused PTT and uncertainty
      */
     fun fuse(measurements: List<Measurement>): FusionResult {
-        // Predict step: PTT is slowly varying
-        val xPred = x
-        val PPred = P + Q
-        
-        var xUpdate = xPred
-        var PUpdate = PPred
-        var methodsUsed = 0
-        var methodsRejected = 0
-        
-        // Sequential update for each valid measurement
-        for (m in measurements) {
-            if (m.valueMsOrNull == null || m.varianceMs2.isInfinite() || m.varianceMs2 <= 0) {
-                continue // Skip failed methods
-            }
-            
-            val y = m.valueMsOrNull
-            val R = m.varianceMs2
-            
-            // Innovation
-            val nu = y - xUpdate
-            val S = PUpdate + R // Innovation variance
-            
-            // Outlier gate: reject if innovation is > √chi2Gate sigmas
-            val mahalanobis2 = (nu * nu) / S
-            if (mahalanobis2 > chi2Gate) {
-                methodsRejected++
-                android.util.Log.d("KalmanFuser", "REJECTED ${m.method}: " +
-                    "value=${"%.1f".format(y)}ms, innovation=${"%.1f".format(nu)}ms, " +
-                    "mahal²=${"%.1f".format(mahalanobis2)} > gate=$chi2Gate")
-                continue
-            }
-            
-            // Kalman gain
-            val K = PUpdate / S
-            
-            // Update
-            xUpdate += K * nu
-            PUpdate *= (1.0 - K)
-            
-            methodsUsed++
+        val finite = measurements.filter {
+            it.valueMsOrNull?.isFinite() == true && it.varianceMs2.isFinite() && it.varianceMs2 > 0
         }
-        
-        // Store updated state
-        x = xUpdate
-        P = PUpdate
-        
-        val se = sqrt(PUpdate)
-        val ci95 = 1.96 * se
-        
+        if (finite.isEmpty()) return FusionResult(
+            Double.NaN, Double.POSITIVE_INFINITY, Double.POSITIVE_INFINITY, 0, 0, false
+        )
+        fun median(values: List<Double>): Double {
+            val s = values.sorted()
+            return if (s.size % 2 == 0) (s[s.size / 2 - 1] + s[s.size / 2]) / 2 else s[s.size / 2]
+        }
+        // Gate around evidence rather than the arbitrary 100 ms initialization.
+        // This is order independent and works for zero and signed test delays.
+        val center = median(finite.map { it.valueMsOrNull!! })
+        val mad = median(finite.map { kotlin.math.abs(it.valueMsOrNull!! - center) })
+        val referenceVariance = maxOf(Q, (1.4826 * mad) * (1.4826 * mad))
+        val accepted = finite.filter {
+            val residual = it.valueMsOrNull!! - center
+            residual * residual <= chi2Gate * (it.varianceMs2 + referenceVariance)
+        }
+        if (accepted.isEmpty()) return FusionResult(
+            Double.NaN, Double.POSITIVE_INFINITY, Double.POSITIVE_INFINITY, 0, finite.size, false
+        )
+        val precision = accepted.sumOf { 1.0 / it.varianceMs2 }
+        val estimate = accepted.sumOf { it.valueMsOrNull!! / it.varianceMs2 } / precision
+        val disagreement = accepted.sumOf {
+            val delta = it.valueMsOrNull!! - estimate
+            delta * delta / it.varianceMs2
+        } / precision
+        // Normalized inverse-variance weights give no
+        // 1/N precision gain for repeating correlated estimates of the same data.
+        val variance = accepted.size / precision + disagreement
+        x = estimate
+        P = variance
         return FusionResult(
-            pttMs = xUpdate,
-            varianceMs2 = PUpdate,
-            confidenceInterval = ci95,
-            methodsUsed = methodsUsed,
-            methodsRejected = methodsRejected,
-            isStable = PUpdate < 100.0 // SE < 10ms
+            pttMs = estimate,
+            varianceMs2 = variance,
+            confidenceInterval = 1.96 * sqrt(variance),
+            methodsUsed = accepted.size,
+            methodsRejected = finite.size - accepted.size,
+            isStable = variance < 100.0
         )
     }
     
@@ -136,7 +119,7 @@ class PttKalmanFuser(
          */
         fun cspToVariance(seTauMs: Double): Double {
             return if (seTauMs.isFinite() && seTauMs > 0) {
-                seTauMs * seTauMs
+                maxOf(25.0, seTauMs * seTauMs) // Engineering floor (5 ms), not validated coverage
             } else {
                 Double.POSITIVE_INFINITY
             }

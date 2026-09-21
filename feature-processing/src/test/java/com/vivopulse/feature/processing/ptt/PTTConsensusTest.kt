@@ -22,15 +22,15 @@ class PTTConsensusTest {
         val delaySamples = 8 // 80ms PTT
         
         // Create PPG-like signal (1.2 Hz with harmonics)
-        val finger = DoubleArray(samples) { i ->
+        val face = DoubleArray(samples) { i ->
             1.0 + sin(2.0 * PI * 1.2 * i / fs) +
             0.3 * sin(2.0 * PI * 2.4 * i / fs)
         }
         
-        // Face = delayed finger
-        val face = DoubleArray(samples) { i ->
+        // Positive delay: finger is later than face.
+        val finger = DoubleArray(samples) { i ->
             val delayed = i - delaySamples
-            if (delayed >= 0 && delayed < samples) finger[delayed] else 1.0
+            if (delayed >= 0 && delayed < samples) face[delayed] else 1.0
         }
         
         val result = consensus.estimateConsensusPtt(
@@ -42,9 +42,8 @@ class PTTConsensusTest {
             segment = Window(0, (duration * 1000).toLong())
         )
         
-        // PTT should be somewhere in the ballpark of 80ms
-        // With Kalman fusion from multiple methods, exact value depends on weighting
-        assertTrue("PTT should be reportable (non-zero)", result.pttMsMedian != 0.0)
+        assertEquals("Known signed delay must be recovered", 80.0, result.pttMsMedian, 10.0)
+        assertTrue("Multiple algorithms must contribute", result.methodsUsed >= 2)
         // Validation metrics should be populated
         assertTrue("Kalman CI should be finite", result.kalmanCiMs.isFinite())
         assertTrue("Beat coverage should be non-negative", result.beatCoverage >= 0.0)
@@ -58,14 +57,14 @@ class PTTConsensusTest {
         val samples = (duration * fs).toInt()
         val delaySamples = 10 // 100ms
         
-        val finger = DoubleArray(samples) { i ->
+        val face = DoubleArray(samples) { i ->
             1.0 + sin(2.0 * PI * 1.0 * i / fs) +
             0.5 * sin(2.0 * PI * 2.0 * i / fs)
         }
         
-        val face = DoubleArray(samples) { i ->
+        val finger = DoubleArray(samples) { i ->
             val delayed = i - delaySamples
-            if (delayed >= 0 && delayed < samples) finger[delayed] else 1.0
+            if (delayed >= 0 && delayed < samples) face[delayed] else 1.0
         }
         
         val result = consensus.estimateConsensusPtt(
@@ -77,8 +76,8 @@ class PTTConsensusTest {
             segment = Window(0, (duration * 1000).toLong())
         )
         
-        // Should get a valid consensus PTT (sign depends on which channel leads)
-        assertTrue("PTT should be non-zero", kotlin.math.abs(result.pttMsMedian) > 0)
+        assertEquals("Known signed delay must be recovered", 100.0, result.pttMsMedian, 10.0)
+        assertTrue("Multiple algorithms must contribute", result.methodsUsed >= 2)
         // Stability from multi-window should be reasonable
         assertTrue("Stability should be non-negative", result.delayStabilityScore >= 0)
         // Validation metrics should be populated for sufficient signals

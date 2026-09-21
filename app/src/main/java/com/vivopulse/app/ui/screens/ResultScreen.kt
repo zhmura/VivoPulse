@@ -2,6 +2,8 @@ package com.vivopulse.app.ui.screens
 
 import android.widget.Toast
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.CheckCircle
@@ -81,6 +83,7 @@ fun ResultScreen(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(paddingValues)
+                .verticalScroll(rememberScrollState())
                 .padding(16.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = if (pttResult == null) Arrangement.Center else Arrangement.Top
@@ -96,6 +99,12 @@ fun ResultScreen(
                 )
                 
                 Spacer(modifier = Modifier.height(24.dp))
+                Text(
+                    text = if (series.provenance == com.vivopulse.feature.processing.SignalProvenance.SYNTHETIC)
+                        "SIMULATED DATA — not a measurement. Excluded from personal history."
+                    else "Experimental optical timing. Clinical accuracy has not been established.",
+                    style = MaterialTheme.typography.bodySmall
+                )
                 
                 // PTT Card
                 Card(
@@ -116,7 +125,7 @@ fun ResultScreen(
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             Text(
-                                text = "Pulse Transit Time (PTT)",
+                                text = "Optical pulse delay (dPTT)",
                                 style = MaterialTheme.typography.titleLarge
                             )
                             Icon(
@@ -138,7 +147,7 @@ fun ResultScreen(
                         
                         // PTT Value
                         Text(
-                            text = String.format("%.1f ms", ptt.pttMs),
+                            text = if (ptt.isValid) String.format("%.1f ms", ptt.pttMs) else "Unavailable",
                             style = MaterialTheme.typography.displayMedium
                         )
                         
@@ -158,43 +167,50 @@ fun ResultScreen(
                         Spacer(modifier = Modifier.height(16.dp))
                         
                         // Metrics
-                        MetricRow("Correlation", String.format("%.3f", ptt.correlationScore))
+                        MetricRow("Correlation", if (ptt.isValid) String.format("%.3f", ptt.correlationScore) else "—")
                         Spacer(modifier = Modifier.height(8.dp))
-                        MetricRow("Stability", String.format("%.1f ms", ptt.stabilityMs))
+                        MetricRow("Stability", if (ptt.isValid && ptt.stabilityMs.isFinite()) String.format("%.1f ms", ptt.stabilityMs) else "—")
                         if (ptt.windowCount > 0) {
                             Spacer(modifier = Modifier.height(8.dp))
                             MetricRow("Windows Analyzed", "${ptt.windowCount}")
                         }
                         
-                        // GoodSync Stats (Placeholder for now, assuming ptt object has these fields or we add them)
-                        // For now, we'll just show a placeholder if we can't modify PttResult easily.
-                        // Ideally: MetricRow("GoodSync Windows", "${ptt.goodSyncCount} (${String.format("%.0f", ptt.goodSyncPct)}%)")
                         Spacer(modifier = Modifier.height(8.dp))
-                        val goodSyncDurationMs = ptt.goodSegments.sumOf { (it.window.tEndMs - it.window.tStartMs).toDouble() }
-                        val totalDuration = series.getDurationSeconds()
-                        val share = if (totalDuration > 0) ((goodSyncDurationMs / 1000.0) / totalDuration * 100.0).toInt() else 0
+                        val durationMs = series.getDurationSeconds() * 1000.0
+                        val ranges = ptt.goodSegments.map {
+                            it.window.tStartMs.toDouble().coerceIn(0.0, durationMs.coerceAtLeast(0.0)) to
+                                it.window.tEndMs.toDouble().coerceIn(0.0, durationMs.coerceAtLeast(0.0))
+                        }.filter { (start, end) -> end > start }.sortedBy { it.first }
+                        var coveredUntil = 0.0
+                        var goodSyncDurationMs = 0.0
+                        for ((start, end) in ranges) {
+                            goodSyncDurationMs += (end - maxOf(start, coveredUntil)).coerceAtLeast(0.0)
+                            coveredUntil = maxOf(coveredUntil, end)
+                        }
+                        val share = if (durationMs > 0.0) (goodSyncDurationMs / durationMs * 100.0).toInt().coerceIn(0, 100) else 0
                         MetricRow("GoodSync Share", "${share}%")
                         
                         Spacer(modifier = Modifier.height(16.dp))
                         
                         // Status messages
-                        if (!ptt.isPlausible) {
+                        if (!ptt.isValid) {
                             Text(
-                                text = "⚠️ PTT outside typical range (50-150 ms)",
+                                text = delayRejectionGuidance(series.invalidReasons),
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.error
                             )
                         }
-                        if (!ptt.isStable) {
+                        if (ptt.isValid && !ptt.isStable) {
                             Text(
-                                text = "⚠️ PTT stability > 25 ms (variable)",
+                                text = if (ptt.stabilityMs.isFinite()) "⚠️ PTT stability > 25 ms (variable)"
+                                    else "PTT stability is not available for this recording",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.error
                             )
                         }
-                        if (ptt.isReliable && ptt.isPlausible && ptt.isStable) {
+                        if (ptt.isValid && ptt.isReliable && ptt.isPlausible && ptt.isStable) {
                             Text(
-                                text = "✓ Reliable PTT estimate",
+                                text = "Passed configured signal checks; experimental estimate",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = Color(0xFF4CAF50)
                             )
@@ -268,7 +284,7 @@ fun ResultScreen(
                             
                             Spacer(modifier = Modifier.height(12.dp))
                             
-                            MetricRow("PTT Confidence", String.format("%.0f%%", quality.pttConfidence))
+                            MetricRow("Algorithm quality score", String.format("%.0f / 100", quality.pttConfidence))
                             
                             // Suggestions
                             if (quality.suggestions.isNotEmpty()) {
@@ -384,7 +400,9 @@ fun ResultScreen(
                         Spacer(modifier = Modifier.height(8.dp))
                         MetricRow("Duration", String.format("%.1f s", series.getDurationSeconds()))
                         Spacer(modifier = Modifier.height(4.dp))
-                        MetricRow("Sample Rate", "${series.sampleRateHz.toInt()} Hz")
+                        MetricRow("Processing grid", "${series.sampleRateHz.toInt()} Hz")
+                        Spacer(modifier = Modifier.height(4.dp))
+                        MetricRow("Camera samples / second", "${series.nativeFaceRateHz?.let { String.format("%.1f", it) } ?: "—"} / ${series.nativeFingerRateHz?.let { String.format("%.1f", it) } ?: "—"}")
                         Spacer(modifier = Modifier.height(4.dp))
                         MetricRow("Sample Count", "${series.getSampleCount()}")
                     }
@@ -628,6 +646,16 @@ fun MetricRow(label: String, value: String) {
             color = MaterialTheme.colorScheme.onSurface
         )
     }
+}
+
+private fun delayRejectionGuidance(reasons: List<String>): String = when {
+    "MISSING_CHANNEL" in reasons -> "Both camera channels are required. Record them simultaneously and retry."
+    "UNVERIFIED_TIMEBASE" in reasons -> "The cameras' shared clock could not be verified. This capture cannot provide a pulse delay."
+    "HARDWARE_HR_ONLY" in reasons -> "This camera configuration does not support pulse delay measurement."
+    reasons.any { it in listOf("MOTION", "FACE_MOTION", "WALKING_DELAY_NOT_VALIDATED") } -> "Movement affected the capture. Keep your face and phone still and retry."
+    reasons.any { it in listOf("INSUFFICIENT_DURATION", "LOW_NATIVE_FPS", "FRAME_DROPS", "TIMESTAMP_JITTER", "INTERPOLATION_GAP") } -> "Capture timing or duration is insufficient. Improve lighting and record both channels again."
+    "SATURATION" in reasons -> "The finger image is overexposed. Adjust finger placement and lighting before retrying."
+    else -> "Signal quality is insufficient for a pulse delay. Reposition your finger, improve face lighting, and retry."
 }
 
 

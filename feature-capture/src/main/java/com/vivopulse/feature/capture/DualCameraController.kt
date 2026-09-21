@@ -196,7 +196,7 @@ class DualCameraController(
     val sequentialPrimary: StateFlow<SequentialPrimary> = _sequentialPrimary.asStateFlow()
     
     /** Whether camera FPS supports PTT (≥25Hz). False if fell back to [15,30] HR-only mode. */
-    private val _pttCapable = MutableStateFlow(true)
+    private val _pttCapable = MutableStateFlow(false)
     val pttCapable: StateFlow<Boolean> = _pttCapable.asStateFlow()
     
     private var retryCount = 0
@@ -210,6 +210,12 @@ class DualCameraController(
     
     private var isRecording = false
     private var recordingStartTime = 0L
+    private var bindingGeneration = 0L
+    private var recordingBindingGeneration = -1L
+    private var recordingCaptureMode = "UNKNOWN"
+    private var recordingHardwarePttCapable = false
+    private var recordingFaceTimestampSource: Int? = null
+    private var recordingFingerTimestampSource: Int? = null
     private val recordedFrames = mutableListOf<Frame>()
     private val maxRecordedFrames = 3600
     private var faceFrameBuffer: ByteArray? = null
@@ -511,6 +517,8 @@ class DualCameraController(
         backPreviewView: PreviewView,
         provider: ProcessCameraProvider
     ) {
+        bindingGeneration++
+        _pttCapable.value = false
         val bindingHelper = com.vivopulse.feature.capture.camera.CameraBindingHelper(
             tag = tag,
             executor = analyzerExecutor,
@@ -534,7 +542,7 @@ class DualCameraController(
             backCamera = result.second
             
             // Propagate PTT capability from binding helper
-            _pttCapable.value = bindingHelper.pttCapable
+            _pttCapable.value = bindingHelper.pttCapable && frontCamera != null && backCamera != null
             if (!bindingHelper.pttCapable) {
                 Log.w(PulseLog.HW, "CAMERA_BIND | HR-only mode (PTT disabled, FPS < 25Hz)")
             }
@@ -1104,6 +1112,11 @@ class DualCameraController(
         _goodSyncBlocker.value = "Stabilizing"
         
         recordingStartTime = System.currentTimeMillis()
+        recordingBindingGeneration = bindingGeneration
+        recordingCaptureMode = _cameraMode.value.name
+        recordingHardwarePttCapable = _pttCapable.value
+        recordingFaceTimestampSource = timestampSource(frontCamera)
+        recordingFingerTimestampSource = timestampSource(backCamera)
         isRecording = true
         
         Log.i(PulseLog.SESSION, "SESSION_START | mode=${_cameraMode.value} | seqPrimary=$sequentialPrimary | torch=$torchEnabled")
@@ -1148,7 +1161,30 @@ class DualCameraController(
             "photoGate=$fingerExposureStepDetected | " +
             "goodSync=${"%.1f".format(_goodSyncSeconds.value)}s | blocker=${_goodSyncBlocker.value ?: "none"}")
         
-        return RecordingResult(frames, stats)
+        val unchangedBinding = recordingBindingGeneration == bindingGeneration
+        // REALTIME establishes comparable sensor clocks. It does not calibrate ROI,
+        // exposure or rolling-shutter optical delay; those still require a phantom.
+        val realtime = CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE_REALTIME
+        return RecordingResult(
+            frames = frames,
+            stats = stats,
+            timingVerified = unchangedBinding && recordingHardwarePttCapable &&
+                recordingFaceTimestampSource == realtime && recordingFingerTimestampSource == realtime,
+            hardwarePttCapable = unchangedBinding && recordingHardwarePttCapable,
+            captureMode = recordingCaptureMode,
+            faceTimestampSource = recordingFaceTimestampSource,
+            fingerTimestampSource = recordingFingerTimestampSource
+        )
+    }
+
+    private fun timestampSource(camera: Camera?): Int? = try {
+        camera?.let {
+            Camera2CameraInfo.from(it.cameraInfo)
+                .getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE)
+        }
+    } catch (error: Exception) {
+        Log.w(tag, "Sensor clock source unavailable", error)
+        null
     }
     
     fun setTorchEnabled(enabled: Boolean) {
@@ -1319,5 +1355,11 @@ class DualCameraController(
  */
 data class RecordingResult(
     val frames: List<Frame>,
-    val stats: SessionStats
+    val stats: SessionStats,
+    /** Comparable sensor timebase only; not optical or clinical validation. */
+    val timingVerified: Boolean = false,
+    val hardwarePttCapable: Boolean = false,
+    val captureMode: String = "UNKNOWN",
+    val faceTimestampSource: Int? = null,
+    val fingerTimestampSource: Int? = null
 )

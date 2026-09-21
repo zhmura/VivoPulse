@@ -57,11 +57,10 @@ object QualityAssessment {
         )
         
         // Compute PTT confidence
-        val pttConfidence = SignalQuality.computePttConfidence(
-            faceSQI,
-            fingerSQI,
-            pttResult.correlationScore
-        )
+        // UI/export use percent; PttOutput's algorithmic quality score is a fraction.
+        // It is not a calibrated probability or clinical confidence interval.
+        val pttConfidence = if (pttResult.isValid)
+            (processedSeries.pttOutput?.confidence ?: 0.0).coerceIn(0.0, 1.0) * 100.0 else 0.0
         
         // Combined score (average of channels)
         val combinedScore = (faceSQI.score + fingerSQI.score) / 2.0
@@ -76,8 +75,8 @@ object QualityAssessment {
         )
         
         // Determine if quality is good enough
-        val isGoodQuality = combinedScore >= 70.0 && pttConfidence >= 60.0
-        val shouldRetry = combinedScore < 60.0 || pttConfidence < 50.0
+        val isGoodQuality = pttResult.isValid && combinedScore >= 70.0 && pttConfidence >= 60.0
+        val shouldRetry = !pttResult.isValid || combinedScore < 60.0 || pttConfidence < 50.0
         
         return QualityReport(
             faceSQI = faceSQI,

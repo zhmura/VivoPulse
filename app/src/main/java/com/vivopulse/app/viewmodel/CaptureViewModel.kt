@@ -214,6 +214,8 @@ class CaptureViewModel @Inject constructor(
 
     fun startRecording() {
         if (_isRecording.value) return
+        sessionManager.startNewSession()
+        _lastRecordingResult.value = null
 
         recordingStartTime = System.currentTimeMillis()
         _recordingDuration.value = 0L

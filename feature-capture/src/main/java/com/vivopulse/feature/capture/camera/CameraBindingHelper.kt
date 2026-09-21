@@ -48,7 +48,7 @@ internal class CameraBindingHelper(
     val lastBindingError: Exception? get() = _lastBindingError
     
     /** Whether the bound FPS range supports PTT (≥25Hz). False if we fell back to [15,30]. */
-    private var _pttCapable = true
+    private var _pttCapable = false
     val pttCapable: Boolean get() = _pttCapable
     
     /**
@@ -68,6 +68,8 @@ internal class CameraBindingHelper(
         targetBackId: String? = null
     ): Pair<Camera?, Camera?>? {
         
+        // Capability applies to this binding attempt, never a previous successful mode.
+        _pttCapable = false
         val resolution = getResolutionForIndex(resolutionIndex)
         AppLogger.log(tag, "Attempting camera binding with mode=$currentMode, resolution=$resolution, frontId=$targetFrontId, backId=$targetBackId")
         

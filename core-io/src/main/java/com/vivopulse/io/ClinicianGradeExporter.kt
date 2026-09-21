@@ -14,6 +14,7 @@ import com.vivopulse.io.model.SessionMetadata
 import com.vivopulse.io.model.SignalDataPoint
 import com.vivopulse.io.model.ExportSegment
 import com.vivopulse.io.model.ExportExtras
+import com.vivopulse.io.model.ExportFormatting
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
@@ -27,13 +28,13 @@ import java.util.zip.ZipOutputStream
 import com.vivopulse.signal.TimeFrequencyTooling
 
 /**
- * Clinician-grade export manager.
+ * Research export manager. The class name is retained for API compatibility.
  * 
  * Produces comprehensive encrypted ZIP with:
  * - session.json (full metadata)
  * - face_signal.csv & finger_signal.csv
  * - plots/ directory with PNG visualizations
- * - Validated against JSON schemas
+ * This export format does not establish clinical validity.
  */
 class ClinicianGradeExporter(private val context: Context) {
     
@@ -57,7 +58,9 @@ class ClinicianGradeExporter(private val context: Context) {
         threeAState: ThreeATimeline? = null,
         includeTimeFrequency: Boolean = false,
         segments: List<ExportSegment> = emptyList(),
-        extras: ExportExtras? = null
+        extras: ExportExtras? = null,
+        sourceFaceSamples: List<Pair<Long, Double>> = emptyList(),
+        sourceFingerSamples: List<Pair<Long, Double>> = emptyList()
     ): String? = withContext(Dispatchers.IO) {
         try {
             // Generate filename
@@ -79,9 +82,16 @@ class ClinicianGradeExporter(private val context: Context) {
             ZipOutputStream(zipBytes).use { zip ->
                 // 1. session.json (comprehensive metadata)
                 zip.putNextEntry(ZipEntry("session.json"))
-                val sessionJson = createClinicianJson(metadata, thermalTimeline, threeAState, segments, extras)
+                val sessionJson = createClinicianJson(metadata, thermalTimeline, threeAState, segments, extras,
+                    sourceFaceSamples.isNotEmpty(), sourceFingerSamples.isNotEmpty())
                 zip.write(sessionJson.toByteArray())
                 zip.closeEntry()
+
+                for ((name, samples) in listOf("source_face.csv" to sourceFaceSamples, "source_finger.csv" to sourceFingerSamples)) {
+                    zip.putNextEntry(ZipEntry(name))
+                    zip.write(ExportFormatting.sourceCsv(samples).toByteArray())
+                    zip.closeEntry()
+                }
                 
                 // 1b. device_capabilities.json (extracted from session.json)
                 zip.putNextEntry(ZipEntry("device_capabilities.json"))
@@ -102,7 +112,7 @@ class ClinicianGradeExporter(private val context: Context) {
                         put("events", JSONArray().apply {
                             thermalTimeline.forEach { event ->
                                 put(JSONObject().apply {
-                                    put("time_s", event.timeS)
+                                    put("time_s", ExportJson.value(event.timeS))
                                     put("state", event.state)
                                 })
                             }
@@ -153,10 +163,7 @@ class ClinicianGradeExporter(private val context: Context) {
                 zip.write(generatePeaksOverlayPlot(faceSignal, fingerSignal))
                 zip.closeEntry()
                 
-                // 6. plots/xcorr_curve.png (±300ms around peak)
-                zip.putNextEntry(ZipEntry("plots/xcorr_curve.png"))
-                zip.write(generateXcorrCurvePlot(metadata))
-                zip.closeEntry()
+                // A real cross-correlation curve is not supplied by this API; do not fabricate one.
             }
             
             // Encrypt ZIP
@@ -186,16 +193,19 @@ class ClinicianGradeExporter(private val context: Context) {
     /**
      * Create comprehensive clinician JSON.
      */
-    private fun createClinicianJson(
+    internal fun createClinicianJson(
         metadata: SessionMetadata,
         thermalTimeline: List<ThermalEvent>?,
         threeAState: ThreeATimeline?,
         segments: List<ExportSegment>,
-        extras: ExportExtras?
+        extras: ExportExtras?,
+        sourceFaceAvailable: Boolean = false,
+        sourceFingerAvailable: Boolean = false
     ): String {
         return JSONObject().apply {
-            put("schema_version", "1.1")
-            put("export_type", "clinician_grade")
+            put("schema_version", SessionMetadata.SCHEMA_VERSION)
+            put("export_type", "research_with_plots")
+            ExportJson.addAudit(this, metadata, sourceFaceAvailable, sourceFingerAvailable)
             put("exported_at_iso", SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US).apply {
                 timeZone = TimeZone.getTimeZone("UTC")
             }.format(Date()))
@@ -204,7 +214,7 @@ class ClinicianGradeExporter(private val context: Context) {
             put("device", JSONObject().apply {
                 put("manufacturer", metadata.deviceManufacturer)
                 put("model", metadata.deviceModel)
-                put("android_api", metadata.androidVersion)
+                put("android_version", metadata.androidVersion)
             })
             
             // App info
@@ -216,36 +226,40 @@ class ClinicianGradeExporter(private val context: Context) {
             // Session info
             put("session", JSONObject().apply {
                 put("id", metadata.sessionId)
-                put("start_ts_iso", SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US).apply {
+                put("start_ts_iso", if (metadata.startTimestamp > 0L) SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US).apply {
                     timeZone = TimeZone.getTimeZone("UTC")
-                }.format(Date(metadata.startTimestamp)))
-                put("end_ts_iso", SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US).apply {
+                }.format(Date(metadata.startTimestamp)) else JSONObject.NULL)
+                put("end_ts_iso", if (metadata.endTimestamp > 0L) SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US).apply {
                     timeZone = TimeZone.getTimeZone("UTC")
-                }.format(Date(metadata.endTimestamp)))
-                put("duration_s", metadata.durationSeconds)
+                }.format(Date(metadata.endTimestamp)) else JSONObject.NULL)
+                put("duration_s", ExportJson.value(metadata.durationSeconds))
             })
             
             // Camera metrics
             put("camera", JSONObject().apply {
-                put("fps_face", metadata.faceFps)
-                put("fps_finger", metadata.fingerFps)
-                put("drift_ms_per_second", metadata.driftMsPerSecond)
+                put("fps_face", ExportJson.value(metadata.faceFps))
+                put("fps_finger", ExportJson.value(metadata.fingerFps))
+                put("native_face_rate_hz", ExportJson.value(metadata.nativeFaceRateHz))
+                put("native_finger_rate_hz", ExportJson.value(metadata.nativeFingerRateHz))
+                put("drift_ms_per_second", ExportJson.value(metadata.driftMsPerSecond))
             })
             
             // PTT metrics
             put("ptt", JSONObject().apply {
-                put("ptt_ms_mean", metadata.pttMs)
-                put("ptt_ms_sd", metadata.pttStabilityMs)
-                put("corr_score", metadata.pttCorrelation)
-                put("confidence", metadata.pttConfidence / 100.0)
-                put("quality", metadata.pttQuality)
+                put("valid", metadata.hasReportablePtt)
+                put("ptt_ms_mean", ExportJson.pttValue(metadata, metadata.pttMs))
+                put("ptt_ms_sd", ExportJson.pttValue(metadata, metadata.pttStabilityMs))
+                put("corr_score", ExportJson.pttValue(metadata, metadata.pttCorrelation))
+                put("confidence_0_to_1", ExportJson.pttValue(metadata, metadata.pttConfidence.takeIf { it in 0.0..100.0 }?.div(100.0)))
+                put("confidence_percent", ExportJson.pttValue(metadata, metadata.pttConfidence.takeIf { it in 0.0..100.0 }))
+                put("quality", if (metadata.hasReportablePtt) metadata.pttQuality else "UNAVAILABLE")
             })
             
             // Quality metrics
             put("quality", JSONObject().apply {
-                put("sqi_face", metadata.faceSQI)
-                put("sqi_finger", metadata.fingerSQI)
-                put("sqi_combined", metadata.combinedSQI)
+                put("sqi_face", ExportJson.value(metadata.faceSQI))
+                put("sqi_finger", ExportJson.value(metadata.fingerSQI))
+                put("sqi_combined", ExportJson.value(metadata.combinedSQI))
             })
             
             // Harmonics (Session Level)
@@ -253,16 +267,16 @@ class ClinicianGradeExporter(private val context: Context) {
                 put("harmonics_summary", JSONObject().apply {
                     metadata.harmonicSummaryFace?.let { h ->
                         put("face", JSONObject().apply {
-                            put("fundamental_hz", h.fundamentalHz)
-                            put("h2_h1_ratio", h.h2ToH1Ratio)
-                            put("spectral_entropy", h.spectralEntropy)
+                            put("fundamental_hz", ExportJson.value(h.fundamentalHz))
+                            put("h2_h1_ratio", ExportJson.value(h.h2ToH1Ratio))
+                            put("spectral_entropy", ExportJson.value(h.spectralEntropy))
                         })
                     }
                     metadata.harmonicSummaryFinger?.let { h ->
                         put("finger", JSONObject().apply {
-                            put("fundamental_hz", h.fundamentalHz)
-                            put("h2_h1_ratio", h.h2ToH1Ratio)
-                            put("spectral_entropy", h.spectralEntropy)
+                            put("fundamental_hz", ExportJson.value(h.fundamentalHz))
+                            put("h2_h1_ratio", ExportJson.value(h.h2ToH1Ratio))
+                            put("spectral_entropy", ExportJson.value(h.spectralEntropy))
                         })
                     }
                 })
@@ -272,24 +286,24 @@ class ClinicianGradeExporter(private val context: Context) {
             put("segments", JSONArray().apply {
                 segments.forEach { seg ->
                     put(JSONObject().apply {
-                        put("start_time_s", seg.startTimeS)
-                        put("end_time_s", seg.endTimeS)
-                        put("ptt_ms", seg.pttMs)
-                        put("correlation", seg.correlation)
-                        put("sqi_face", seg.sqiFace)
-                        put("sqi_finger", seg.sqiFinger)
+                        put("start_time_s", ExportJson.value(seg.startTimeS))
+                        put("end_time_s", ExportJson.value(seg.endTimeS))
+                        put("ptt_ms", ExportJson.pttValue(metadata, seg.pttMs))
+                        put("correlation", ExportJson.pttValue(metadata, seg.correlation))
+                        put("sqi_face", ExportJson.value(seg.sqiFace))
+                        put("sqi_finger", ExportJson.value(seg.sqiFinger))
                         
                         // Diagnostics
                         if (seg.pttMeanDenoised != null) {
-                            put("ptt_mean_denoised", seg.pttMeanDenoised)
-                            put("ptt_mean_raw", seg.pttMeanRaw)
+                            put("ptt_mean_denoised", ExportJson.pttValue(metadata, seg.pttMeanDenoised))
+                            put("ptt_mean_raw", ExportJson.pttValue(metadata, seg.pttMeanRaw))
                         }
                         
                         if (seg.harmonicsFace != null) {
                             put("harmonics_face", JSONObject().apply {
-                                put("fundamental_hz", seg.harmonicsFace.fundamentalHz)
-                                put("h2_h1_ratio", seg.harmonicsFace.h2ToH1Ratio)
-                                put("spectral_entropy", seg.harmonicsFace.spectralEntropy)
+                                put("fundamental_hz", ExportJson.value(seg.harmonicsFace.fundamentalHz))
+                                put("h2_h1_ratio", ExportJson.value(seg.harmonicsFace.h2ToH1Ratio))
+                                put("spectral_entropy", ExportJson.value(seg.harmonicsFace.spectralEntropy))
                             })
                         }
                     })
@@ -298,17 +312,18 @@ class ClinicianGradeExporter(private val context: Context) {
             
             // Processing parameters
             put("processing_params", JSONObject().apply {
-                put("filters", "detrend + bandpass(0.7-4.0 Hz) + z-normalize")
-                put("fs", metadata.sampleRateHz)
-                put("roi_face", "forehead_from_ml_kit")
-                put("roi_finger", "center_60pct")
+                put("algorithm_revision", metadata.algorithmRevision)
+                put("processing_grid_hz", ExportJson.value(metadata.sampleRateHz))
+                put("filter_parameters", JSONObject.NULL)
+                put("roi_geometry", JSONObject.NULL)
+                put("configuration_note", "Exact filter parameters and ROI geometry are not supplied to this exporter.")
             })
             
             // 3A state
             threeAState?.let { state ->
                 put("three_a_state", JSONObject().apply {
-                    put("ae_locked_at_s", state.aeLockedAtS)
-                    put("awb_locked_at_s", state.awbLockedAtS)
+                    put("ae_locked_at_s", ExportJson.value(state.aeLockedAtS))
+                    put("awb_locked_at_s", ExportJson.value(state.awbLockedAtS))
                     put("af_mode", state.afMode)
                 })
             }
@@ -318,34 +333,14 @@ class ClinicianGradeExporter(private val context: Context) {
                 put("thermal_events", JSONArray().apply {
                     timeline.forEach { event ->
                         put(JSONObject().apply {
-                            put("time_s", event.timeS)
+                            put("time_s", ExportJson.value(event.timeS))
                             put("state", event.state)
                         })
                     }
                 })
             }
             
-            // Extras
-            extras?.vascularWaveProfile?.let { map ->
-                put("vascularWaveProfile", JSONObject().apply {
-                    map.forEach { (k, v) -> put(k, v) }
-                })
-            }
-            extras?.vascularTrendSummary?.let { map ->
-                put("vascularTrendSummary", JSONObject().apply {
-                    map.forEach { (k, v) -> put(k, v) }
-                })
-            }
-            extras?.biomarkerPanel?.let { map ->
-                put("biomarkerPanel", JSONObject().apply {
-                    map.forEach { (k, v) -> put(k, v) }
-                })
-            }
-            extras?.reactivityProtocol?.let { map ->
-                put("reactivityProtocol", JSONObject().apply {
-                    map.forEach { (k, v) -> put(k, v) }
-                })
-            }
+            ExportJson.addExtras(this, metadata, extras)
         }.toString(2)
     }
     
@@ -426,31 +421,6 @@ class ClinicianGradeExporter(private val context: Context) {
             0, height / 2, width, height / 2,
             "Finger Signal with Peaks"
         )
-        
-        return bitmapToBytes(bitmap)
-    }
-    
-    /**
-     * Generate xcorr curve plot (±300ms).
-     */
-    private fun generateXcorrCurvePlot(metadata: SessionMetadata): ByteArray {
-        // Simplified placeholder - would need actual xcorr curve data
-        val width = 1200
-        val height = 600
-        
-        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-        val canvas = Canvas(bitmap)
-        canvas.drawColor(Color.WHITE)
-        
-        val paint = Paint().apply {
-            color = Color.BLACK
-            textSize = 40f
-            isAntiAlias = true
-        }
-        
-        canvas.drawText("Cross-Correlation Curve", 50f, 50f, paint)
-        canvas.drawText("PTT: ${String.format("%.2f", metadata.pttMs)} ms", 50f, 100f, paint)
-        canvas.drawText("Correlation: ${String.format("%.3f", metadata.pttCorrelation)}", 50f, 150f, paint)
         
         return bitmapToBytes(bitmap)
     }

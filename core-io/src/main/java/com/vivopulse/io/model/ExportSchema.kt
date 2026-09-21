@@ -2,6 +2,7 @@ package com.vivopulse.io.model
 
 import android.os.Build
 import com.vivopulse.signal.HarmonicFeatureExtractor
+import java.util.Locale
 
 /**
  * Session metadata for export.
@@ -29,7 +30,7 @@ data class SessionMetadata(
     val pttMs: Double,
     val pttCorrelation: Double,
     val pttStabilityMs: Double,
-    val pttConfidence: Double,
+    val pttConfidence: Double,          // Percentage 0..100; not a calibrated probability
     val pttQuality: String,
     
     // Camera metrics
@@ -42,13 +43,24 @@ data class SessionMetadata(
     
     // New Harmonic Summaries (Session Level)
     val harmonicSummaryFace: HarmonicFeatureExtractor.HarmonicFeatures? = null,
-    val harmonicSummaryFinger: HarmonicFeatureExtractor.HarmonicFeatures? = null
+    val harmonicSummaryFinger: HarmonicFeatureExtractor.HarmonicFeatures? = null,
+    val measurementProvenance: String = "UNKNOWN",
+    val timingVerified: Boolean = false,
+    val pttValid: Boolean = false,
+    val rejectionReasons: List<String> = emptyList(),
+    val nativeFaceRateHz: Double? = null,
+    val nativeFingerRateHz: Double? = null,
+    val algorithmRevision: String = "measurement-validity-v1"
 ) {
+    /** A stale numerical field must never override missing/failed measurement validity. */
+    val hasReportablePtt: Boolean
+        get() = pttValid && timingVerified && rejectionReasons.isEmpty() && pttMs.isFinite()
+
     companion object {
         /**
          * Current export schema version.
          */
-        const val SCHEMA_VERSION = "1.1" // Bumped for harmonics
+        const val SCHEMA_VERSION = "1.2"
         
         /**
          * Create metadata from device info.
@@ -76,14 +88,14 @@ data class SessionMetadata(
                 faceSQI = 0.0,
                 fingerSQI = 0.0,
                 combinedSQI = 0.0,
-                pttMs = 0.0,
-                pttCorrelation = 0.0,
-                pttStabilityMs = 0.0,
-                pttConfidence = 0.0,
+                pttMs = Double.NaN,
+                pttCorrelation = Double.NaN,
+                pttStabilityMs = Double.NaN,
+                pttConfidence = Double.NaN,
                 pttQuality = "UNKNOWN",
                 faceFps = 0f,
                 fingerFps = 0f,
-                driftMsPerSecond = 0.0
+                driftMsPerSecond = Double.NaN
             )
         }
     }
@@ -119,31 +131,48 @@ data class SignalDataPoint(
     // Detailed metrics
     val motion: Double? = null,
     val saturation: Double? = null,
-    val imu: Double? = null
+    val imu: Double? = null,
+    // Actual monotonic source timestamp, or processing-grid timestamp when interpolated=true.
+    // Null means unknown: never reconstruct an acquisition timestamp from the sample index.
+    val timestampNs: Long? = null,
+    val interpolated: Boolean? = null
 ) {
     /**
      * Convert to CSV row.
      */
     fun toCsvRow(): String {
-        val baseRow = "${String.format("%.3f", timeMs)},${String.format("%.6f", rawValue)},${String.format("%.6f", filteredValue)},${if (isPeak) 1 else 0}"
-        val rgbPart = if (rgb != null) {
-            ",${String.format("%.3f", rgb.first)},${String.format("%.3f", rgb.second)},${String.format("%.3f", rgb.third)}"
-        } else {
-            ",,,"
-        }
-        val metricsPart = ",${String.format("%.4f", motion ?: 0.0)},${String.format("%.2f", saturation ?: 0.0)},${String.format("%.4f", imu ?: 0.0)}"
-        
-        return if (phaseTag != null) {
-            "$baseRow$rgbPart$metricsPart,$phaseTag"
-        } else {
-            "$baseRow$rgbPart$metricsPart,"
-        }
+        return listOf(
+            ExportFormatting.number(timeMs, 3), ExportFormatting.number(rawValue, 6),
+            ExportFormatting.number(filteredValue, 6), if (isPeak) "1" else "0",
+            ExportFormatting.number(rgb?.first, 3), ExportFormatting.number(rgb?.second, 3),
+            ExportFormatting.number(rgb?.third, 3), ExportFormatting.number(motion, 4),
+            ExportFormatting.number(saturation, 4), ExportFormatting.number(imu, 4),
+            ExportFormatting.text(phaseTag), timestampNs?.toString().orEmpty(),
+            interpolated?.toString().orEmpty()
+        ).joinToString(",")
     }
     
     companion object {
         /**
          * CSV header.
          */
-        const val CSV_HEADER = "time_ms,raw_value,filtered_value,is_peak,r,g,b,motion_rms,saturation_pct,imu_rms_g,phase_tag"
+        const val CSV_HEADER = "time_ms,raw_value,filtered_value,is_peak,r,g,b,motion_rms,saturation_fraction,imu_rms_g,phase_tag,timestamp_ns,interpolated"
+    }
+}
+
+/** Locale-independent CSV formatting; missing/nonfinite observations stay missing. */
+object ExportFormatting {
+    fun number(value: Double?, decimals: Int = 6): String =
+        if (value == null || !value.isFinite()) "" else String.format(Locale.US, "%.${decimals}f", value)
+
+    fun text(value: String?): String {
+        val text = value.orEmpty()
+        return if (text.any { it == ',' || it == '"' || it == '\n' || it == '\r' })
+            "\"${text.replace("\"", "\"\"")}\"" else text
+    }
+
+    fun sourceCsv(samples: List<Pair<Long, Double>>): String = buildString {
+        appendLine("timestamp_ns,raw_value,interpolated")
+        samples.forEach { (timestamp, value) -> appendLine("$timestamp,${number(value, 9)},false") }
     }
 }

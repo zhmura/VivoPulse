@@ -1,0 +1,21 @@
+# Explicit scope: pure JVM regressions of the compiled production sources.
+core-signal/src/test/kotlin/com/vivopulse/signal/DspFunctionsTest.kt
+core-signal/src/test/kotlin/com/vivopulse/signal/BandPassFilterTests.kt
+core-signal/src/test/kotlin/com/vivopulse/signal/CrossCorrelationTest.kt
+core-signal/src/test/kotlin/com/vivopulse/signal/HarmonicFeatureExtractorTest.kt
+core-signal/src/test/kotlin/com/vivopulse/signal/PeakDetectorTest.kt
+core-signal/src/test/kotlin/com/vivopulse/signal/RingBufferDoubleTest.kt
+core-signal/src/test/kotlin/com/vivopulse/signal/SignalQualityTest.kt
+core-signal/src/test/kotlin/com/vivopulse/signal/TimeFrequencyToolingTest.kt
+core-signal/src/test/java/com/vivopulse/signal/PosExtractorTest.kt
+feature-processing/src/test/java/com/vivopulse/feature/processing/MeasurementValidityRegressionTest.kt
+feature-processing/src/test/java/com/vivopulse/feature/processing/SignalPipelineTest.kt
+feature-processing/src/test/java/com/vivopulse/feature/processing/SignalPipelineIntegrationTest.kt
+feature-processing/src/test/java/com/vivopulse/feature/processing/tests/PttLiteratureConsistencyTests.kt
+feature-processing/src/test/java/com/vivopulse/feature/processing/timestamp/TimestampSyncTest.kt
+feature-processing/src/test/java/com/vivopulse/feature/processing/timestamp/ResamplerDriftThresholdTest.kt
+feature-processing/src/test/java/com/vivopulse/feature/processing/ptt/CrossCorrTests.kt
+feature-processing/src/test/java/com/vivopulse/feature/processing/ptt/PttSqiTests.kt
+feature-processing/src/test/java/com/vivopulse/feature/processing/ptt/PTTConsensusTest.kt
+feature-processing/src/test/java/com/vivopulse/feature/processing/tests/P1ResearchUpgradeTests.kt
+core-io/src/test/java/com/vivopulse/io/model/ExportSchemaTest.kt

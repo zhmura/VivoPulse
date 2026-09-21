@@ -1,0 +1,70 @@
+JUnit version 4.13.2
+..Stopband low (0.3 Hz): Input power=0.7071067811865476, Output power=0.13196140847635127, Attenuation=0.18662161357711185
+..Stopband high (6 Hz): Input power=0.7071067811865476, Output power=0.2856788076828424, Attenuation=0.4040108443076508
+...Heart rate freq (1.0 Hz): Attenuation=0.7906734449406315
+Heart rate freq (1.5 Hz): Attenuation=0.9156945601980871
+Heart rate freq (2.0 Hz): Attenuation=0.9340650010489298
+......Passband (1.5 Hz): Input power=0.7071067811865474, Output power=0.6474938330117005, Attenuation=0.9156945601980871
+...Window Invariance Max Diff: 0.0032440245703495713
+..Full pipeline test: Mean=-4.3298697960381107E-17, Std=1.0000000000000004, Power=1.0000000000000004
+...Attenuation Low (0.1Hz): 58.63 dB
+Attenuation High (8.0Hz): 24.56 dB
+..CrossCorrelation: xcorr size=401, maxLagSamples=200
+CrossCorrelation: maxIndex=200, lagSamplesInt=0, refinedLagSamples=0.0, lagMs=0.0, maxCorr=1.0
+Zero lag test: lag=0.0ms, lagSamples=0.0, corr=1.0, peakIdx=200
+.CrossCorrelation: xcorr size=401, maxLagSamples=200
+CrossCorrelation: maxIndex=207, lagSamplesInt=7, refinedLagSamples=6.999708848310764, lagMs=69.99708848310763, maxCorr=0.9999936228395797
+Sub-sample test: lag=69.99708848310763ms (expected ~75.0ms), corr=0.9999936228395797
+.CrossCorrelation: xcorr size=401, maxLagSamples=200
+CrossCorrelation: maxIndex=65, lagSamplesInt=-135, refinedLagSamples=-134.57097051313121, lagMs=-1345.7097051313121, maxCorr=0.05178869218176127
+Uncorrelated test: corr=0.05178869218176127
+.CrossCorrelation: xcorr size=401, maxLagSamples=200
+CrossCorrelation: maxIndex=210, lagSamplesInt=10, refinedLagSamples=10.00064628048325, lagMs=100.0064628048325, maxCorr=0.9954591233400029
+Realistic PTT test: PTT=100.0064628048325ms (expected 100.0ms), corr=0.9954591233400029
+.CrossCorrelation: xcorr size=401, maxLagSamples=200
+CrossCorrelation: maxIndex=375, lagSamplesInt=175, refinedLagSamples=174.9720000362703, lagMs=1749.720000362703, maxCorr=0.9993958096144742
+CrossCorrelation: xcorr size=401, maxLagSamples=200
+CrossCorrelation: maxIndex=292, lagSamplesInt=92, refinedLagSamples=92.16656897359408, lagMs=921.6656897359409, maxCorr=0.999531379091805
+CrossCorrelation: xcorr size=401, maxLagSamples=200
+CrossCorrelation: maxIndex=293, lagSamplesInt=93, refinedLagSamples=92.88930813653592, lagMs=928.8930813653591, maxCorr=0.9992733240705723
+CrossCorrelation: xcorr size=401, maxLagSamples=200
+CrossCorrelation: maxIndex=127, lagSamplesInt=-73, refinedLagSamples=-73.138561304063, lagMs=-731.38561304063, maxCorr=0.999492400986055
+CrossCorrelation: xcorr size=401, maxLagSamples=200
+CrossCorrelation: maxIndex=294, lagSamplesInt=94, refinedLagSamples=94.16837050290852, lagMs=941.6837050290851, maxCorr=0.999533489337572
+Varying PTT test: mean=762.1153726904917ms, std=811.3475197149992ms, valid=true
+.CrossCorrelation: xcorr size=401, maxLagSamples=200
+CrossCorrelation: maxIndex=210, lagSamplesInt=10, refinedLagSamples=9.998998424420419, lagMs=99.9899842442042, maxCorr=0.9999846092118101
+CrossCorrelation: xcorr size=401, maxLagSamples=200
+CrossCorrelation: maxIndex=210, lagSamplesInt=10, refinedLagSamples=10.000506523584148, lagMs=100.00506523584149, maxCorr=1.0
+CrossCorrelation: xcorr size=401, maxLagSamples=200
+CrossCorrelation: maxIndex=210, lagSamplesInt=10, refinedLagSamples=10.000506523584148, lagMs=100.00506523584149, maxCorr=0.9999999999999999
+CrossCorrelation: xcorr size=401, maxLagSamples=200
+CrossCorrelation: maxIndex=210, lagSamplesInt=10, refinedLagSamples=10.00050652358414, lagMs=100.0050652358414, maxCorr=1.0
+CrossCorrelation: xcorr size=401, maxLagSamples=200
+CrossCorrelation: maxIndex=210, lagSamplesInt=10, refinedLagSamples=10.00050652358414, lagMs=100.0050652358414, maxCorr=1.0
+Stability test: mean=100.002049037514ms, std=0.00603239665489923ms, windows=5
+..CrossCorrelation: xcorr size=401, maxLagSamples=200
+CrossCorrelation: maxIndex=205, lagSamplesInt=5, refinedLagSamples=5.000103159998626, lagMs=50.00103159998626, maxCorr=0.9999980962204104
+Positive lag test: lag=50.00103159998626ms (expected 50.0ms), corr=0.9999980962204104
+.CrossCorrelation: xcorr size=401, maxLagSamples=200
+CrossCorrelation: maxIndex=192, lagSamplesInt=-8, refinedLagSamples=-8.00030398993561, lagMs=-80.0030398993561, maxCorr=0.9999958015081752
+Negative lag test: lag=-80.0030398993561ms (expected -80.0ms), corr=0.9999958015081752
+.......SQI without motion: 64.02785410095743, with motion: 52.02785410095743
+.Regular signal peak regularity: 98.56201416237955
+.Noisy signal SNR: 0.31842049388186944 dB
+.Poor signal SQI: 36.64239683062865 (SNR=-11.37040589998199 dB, Regularity=97.71305821500974)
+.Moving ROI motion score: 15.841667351211742
+.Poor signals PTT confidence: 43.0
+.Found 10 peaks in 10s signal (expected ~12)
+.Clean signal SNR: 13.052485918029614 dB
+.SQI stable: 57.19577780165004, shaky: 39.19577780165004
+..Good signal SQI: 39.52347434567886 (SNR=6.057504187232636 dB, Regularity=31.679237006926066, Peaks=10)
+..Good signals PTT confidence: 86.0
+..Irregular signal peak regularity: 0.0
+................................Frame Drop Test: Drift=NaN
+.Drop rate test: drops1=0.10101010101010101
+....Zero drift test: drift=NaN, isValid=true
+..........................................
+Time: 1.145
+
+OK (131 tests)

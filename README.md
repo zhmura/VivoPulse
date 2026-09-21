@@ -2,6 +2,10 @@
 
 VivoPulse is an Android application for dual-camera capture, on-device signal processing, and PPG (photoplethysmography) signal analysis.
 
+## Measurement validity and reproducible testing
+
+The measurement pipeline is experimental. It reports optical pulse delay, not validated blood pressure or arterial stiffness. See the [implementation and validation record](docs/MEASUREMENT_VALIDITY_IMPLEMENTATION.md), [research audit](docs/MEASUREMENT_VALIDITY_RESEARCH.md), [synthetic model](docs/SYNTHETIC_MODEL.md) and [runnable benchmark](tools/synthetic-benchmark/README.md). These records supersede historical implementation-status and accuracy claims below. Synthetic success does not establish camera or clinical accuracy.
+
 ## Overview
 
 VivoPulse is designed to capture video from device cameras, extract PPG signals through advanced signal processing, and visualize cardiovascular metrics in real-time. The app is optimized for specific high-performance Android devices and operates completely offline.
@@ -14,11 +18,11 @@ VivoPulse is designed to capture video from device cameras, extract PPG signals 
 - **Device Whitelist**: Optimized for specific high-performance devices
 - **Simulated Mode**: Debug mode with synthetic PPG signals for testing
 - **Data Export**: Export results to CSV or JSON format
-- **Encrypted Storage**: Secure data storage using Android Security libraries
+- **Encrypted Export Archives**: Android Security libraries protect exported ZIP archives; this does not imply every local data store is encrypted
 
 ## Supported Devices
 
-VivoPulse is currently optimized for the following devices:
+The device whitelist includes the following candidates. Inclusion is a software configuration choice, not evidence of validated optical timing or medical accuracy:
 
 ### Google Pixel Series
 - Pixel 6, 6 Pro, 6a
@@ -35,7 +39,7 @@ VivoPulse is currently optimized for the following devices:
 ## System Requirements
 
 - **Minimum SDK**: Android 10 (API 29)
-- **Target SDK**: Android 14 (API 34)
+- **Target SDK**: API 35 (compile SDK 36)
 - **RAM**: 4GB minimum, 6GB+ recommended
 - **Storage**: 100MB for app, additional space for data exports
 
@@ -68,8 +72,8 @@ VivoPulse/
 
 - **Android Studio**: Hedgehog (2023.1.1) or later
 - **JDK**: Java 17
-- **Gradle**: 8.2 (included via wrapper)
-- **Android SDK**: API 29-34
+- **Gradle**: 8.13 (included via wrapper)
+- **Android SDK**: Platform API 36 and the build tools requested by Gradle
 
 ### Quick Build
 
@@ -317,7 +321,7 @@ For detailed calculation methods and validation studies, see:
 
 ### Manual Testing
 
-See **[QA_CHECKLIST.md](QA_CHECKLIST.md)** for comprehensive testing guide including:
+See the [measurement validation record](docs/MEASUREMENT_VALIDITY_IMPLEMENTATION.md) for automated checks and validation scope. Manual device testing should cover:
 - Camera capture scenarios
 - ROI tracking validation
 - Signal quality conditions
@@ -331,28 +335,24 @@ See **[QA_CHECKLIST.md](QA_CHECKLIST.md)** for comprehensive testing guide inclu
 - [ ] Green ROI box on forehead (stable tracking)
 - [ ] Enable Simulated Mode → Processing → ⚙️ Sim → PTT=120ms
 - [ ] Results → Verify PTT ~120ms, Correlation >0.9
-- [ ] Export → ZIP with 3 files created
+- [ ] Export → encrypted archive created with schema 1.2 metadata, processed CSVs and native source CSVs; verify provenance and invalid-result nulls
 - [ ] No crashes or errors
 
 ## Known Limitations
 
-- Camera capture logic not yet implemented (placeholder)
-- Signal processing algorithms are stubs
-- Graph visualization is placeholder
-- Export functionality not yet implemented
-- Face detection integration pending
+- Signal-processing regression tests do not validate physical camera timing, image extraction or clinical accuracy.
+- Concurrent capture and timestamp comparability depend on the actual bound camera pair. Unsupported modes retain no reportable delay.
+- Finger pressure, morphology, exposure, rolling shutter and common optical artifacts can bias otherwise clean signals.
+- Encrypted exports still need a complete, device-tested decrypt/share workflow.
+- See the [validation record](docs/MEASUREMENT_VALIDITY_IMPLEMENTATION.md) for implemented protections and outstanding work.
 
 ## Future Roadmap
 
-1. Implement CameraX dual-camera capture
-2. Integrate OpenCV for ROI extraction
-3. Implement DSP algorithms in core-signal
-4. Add ML Kit face detection for automatic ROI
-5. Implement MPAndroidChart integration
-6. Add data export functionality
-7. Implement encrypted storage for results
-8. Performance optimization and profiling
-9. Expand device whitelist based on testing
+1. Validate each supported camera configuration with a programmed optical reference.
+2. Collect synchronized reference PPG/ECG, contact-pressure and motion measurements.
+3. Evaluate repeatability, bias, rejection coverage and uncertainty on held-out sessions/devices.
+4. Extend deterministic simulation with reference-data replay and broader parameter/seed sweeps.
+5. Complete Android device testing, export sharing and capture-metadata audit coverage.
 
 ## Troubleshooting
 

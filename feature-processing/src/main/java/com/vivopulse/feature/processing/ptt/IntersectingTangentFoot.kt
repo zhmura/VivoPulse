@@ -145,26 +145,31 @@ object IntersectingTangentFoot {
         // Match beats by nearest timing (within 50% of typical RR)
         val maxMismatchSec = 0.3 // 300ms tolerance for beat matching
         
-        for (faceFoot in faceFeet) {
+        val orderedFinger = fingerFeet.filter { it.valid && it.footTimeSec.isFinite() }.sortedBy { it.footTimeSec }
+        var nextFinger = 0
+        for (faceFoot in faceFeet.sortedBy { it.footTimeSec }) {
             if (!faceFoot.valid) continue
             
             // Find nearest valid finger foot
             var bestMatch: FootResult? = null
+            var bestIndex = -1
             var bestDist = Double.MAX_VALUE
-            for (fingerFoot in fingerFeet) {
-                if (!fingerFoot.valid) continue
+            for (index in nextFinger until orderedFinger.size) {
+                val fingerFoot = orderedFinger[index]
                 val dist = abs(faceFoot.footTimeSec - fingerFoot.footTimeSec)
                 if (dist < bestDist && dist < maxMismatchSec) {
                     bestDist = dist
                     bestMatch = fingerFoot
+                    bestIndex = index
                 }
             }
             
             if (bestMatch != null) {
-                // PTT = finger foot time - face foot time (finger is closer to heart)
+                // Positive optical delay means the finger pulse occurs later.
                 val pttMs = (bestMatch.footTimeSec - faceFoot.footTimeSec) * 1000.0
-                if (pttMs > 0 && pttMs < 500) { // Physiological range
+                if (pttMs.isFinite() && abs(pttMs) < maxMismatchSec * 1000.0) {
                     ptts.add(pttMs)
+                    nextFinger = bestIndex + 1
                 }
             }
         }

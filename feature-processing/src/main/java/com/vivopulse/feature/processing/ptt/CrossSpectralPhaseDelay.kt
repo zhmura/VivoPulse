@@ -6,13 +6,13 @@ import kotlin.math.*
 /**
  * Cross-Spectral Phase-slope delay estimator (CSP).
  * 
- * Estimates time delay τ from the linear relationship between
- * cross-spectral phase and frequency: φ_xy(f) ≈ -2πfτ + φ₀
+ * Estimates time delay τ from the zero-intercept relationship between
+ * cross-spectral phase and frequency: φ_xy(f) ≈ -2πfτ.
  * 
- * Key advantages over NCC/GCC-PHAT:
- * - Robust to amplitude distortion (uses phase, not amplitude)
+ * Characteristics:
+ * - Uses phase at harmonics with power support in both channels
  * - Sub-sample resolution without ad-hoc interpolation
- * - Produces a principled uncertainty estimate (SE_τ) from coherence
+ * - Reports a regression residual spread, not calibrated measurement uncertainty
  * - Exploits quasi-periodicity via HR-harmonic bin selection
  * 
  * P1.4 Research upgrade from: "Coherence-weighted cross-spectral
@@ -25,7 +25,7 @@ object CrossSpectralPhaseDelay {
      */
     data class CspResult(
         val delayMs: Double,           // Estimated delay in ms
-        val standardErrorMs: Double,   // SE of delay estimate in ms
+        val standardErrorMs: Double,   // Regression residual spread; not a validated clinical SE
         val meanCoherence: Double,     // Mean γ²(f) at selected bins
         val nBins: Int,                // Number of frequency bins used
         val harmonicsUsed: Int         // Number of HR harmonics found
@@ -59,8 +59,8 @@ object CrossSpectralPhaseDelay {
         
         // 1. Compute Welch cross-spectral estimates
         val welch = WelchEstimator.crossSpectral(face, finger, fs, segmentLength)
-        if (welch.nSegments == 0) {
-            android.util.Log.d("CSP", "estimateDelay: early exit — Welch produced 0 segments")
+        if (welch.nSegments < 3) {
+            android.util.Log.d("CSP", "estimateDelay: need at least three Welch segments for coherence")
             return CspResult(0.0, Double.MAX_VALUE, 0.0, 0, 0)
         }
         
@@ -75,6 +75,12 @@ object CrossSpectralPhaseDelay {
         // 3. Select HR-harmonic bins
         val fHR = hrBpm / 60.0 // Hz
         val binBandwidth = 0.15 // Hz, search radius around each harmonic
+        // Coherence alone does not establish spectral support: leakage from a
+        // shared sinusoid can have near-unit coherence at absent harmonics.
+        // Require each channel to supply at least -30 dB relative pulse-band PSD.
+        val pulseBins = freqs.indices.filter { freqs[it] in 0.5..minOf(8.0, fs / 2.0) }
+        val minimumPowerX = (pulseBins.maxOfOrNull { welch.psdX[it] } ?: 0.0) * 1e-3
+        val minimumPowerY = (pulseBins.maxOfOrNull { welch.psdY[it] } ?: 0.0) * 1e-3
         
         // Collect (frequency, phase, weight) tuples for bins near HR harmonics
         val omegaList = mutableListOf<Double>()
@@ -90,7 +96,8 @@ object CrossSpectralPhaseDelay {
             for (i in freqs.indices) {
                 if (abs(freqs[i] - fTarget) <= binBandwidth) {
                     val gamma2 = coherence[i]
-                    if (gamma2 >= gammaMin) {
+                    if (gamma2 >= gammaMin && welch.psdX[i] > minimumPowerX &&
+                        welch.psdY[i] > minimumPowerY) {
                         omegaList.add(2.0 * PI * freqs[i])
                         phiList.add(phase[i])
                         weightList.add(gamma2) // coherence-weighted
@@ -111,7 +118,7 @@ object CrossSpectralPhaseDelay {
         // 4. Unwrap phase (simple sequential unwrapping)
         val phiUnwrapped = unwrapPhase(phiList.toDoubleArray())
         
-        // 5. Weighted least-squares: τ = Σ(w·ω·φ) / Σ(w·ω²)
+        // 5. Weighted least-squares: τ = -Σ(w·ω·φ) / Σ(w·ω²)
         // Model: φ(ω) = -ω·τ  (ignoring intercept for simplicity)
         val omega = omegaList.toDoubleArray()
         val w = weightList.toDoubleArray()
@@ -147,9 +154,13 @@ object CrossSpectralPhaseDelay {
         
         val meanCoherence = w.average()
         
-        // Plausibility check: PTT should be in [10, 400] ms range
+        // A signed numerical delay; physiological interpretation is a separate
+        // protocol decision. Reject non-finite/out-of-search-range estimates.
         val tauMs = tauSec * 1000.0
         val seTauMs = seTauSec * 1000.0
+        if (!tauMs.isFinite() || !seTauMs.isFinite() || abs(tauMs) > 500.0) {
+            return CspResult(0.0, Double.MAX_VALUE, meanCoherence, omega.size, harmonicsFound)
+        }
         
         return CspResult(
             delayMs = tauMs,
